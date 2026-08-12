@@ -1,0 +1,25 @@
+# Internal deploy scripts (contains credentials)
+deploy*.py
+check_*.py
+verify*.py
+patch_*.py
+redeploy_*.py
+fix_perms.py
+switch_upstream.py
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+logs/
+work/
+output/
+deploy*.py
+check_*.py
+verify*.py
+patch_*.py
+redeploy_*.py
+fix_perms.py
+switch_upstream.py
+start.bat
