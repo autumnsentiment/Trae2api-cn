@@ -54,8 +54,8 @@ MODEL_ALIASES = {
     "claude-3.5-sonnet": "glm-5.2",
     "claude3.5": "glm-5.2",
     "aws_sdk_claude37_sonnet": "glm-5.2",
-    "mimo-v2.5-pro": "glm-5.2",
-    "mimo-v2.5": "glm-5.2",
+    "mimo-v2.5-pro": "mimo-v2.5-pro",
+    "mimo-v2.5": "mimo-v2.5",
     "claude-haiku-4-5": "glm-5.1",
     "glm-5.1": "glm-5.1",
     "qwen-3.7-plus": "qwen-3.7-plus",
@@ -293,7 +293,7 @@ def _resolve_mode(model: str) -> tuple[str, str, str]:
     auto = not m or m == "auto"
     if auto:
         return ("code", "auto", "")
-    return ("code", "manual", model)
+    return ("code", "manual", convert_model_name(model))
 
 
 def _web_account_key() -> str:
