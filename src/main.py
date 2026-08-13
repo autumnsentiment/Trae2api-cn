@@ -350,6 +350,16 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
   <button class="btn btn-secondary" onclick="saveSettings()">保存设置</button>
 </div>
 <div id="settings-msg" class="msg"></div>
+<hr>
+<div class="section-title">模型列表</div>
+<div class="form-group">
+  <label>刷新 /v1/models（TRAE_FETCH_MODEL_LIST=true 时从上游拉取，否则返回内置列表）</label>
+</div>
+<div class="btn-group">
+  <button class="btn btn-secondary" onclick="refreshModels()">获取模型列表</button>
+</div>
+<pre id="models-out" style="margin-top:12px;padding:12px;background:#252836;border-radius:6px;font-size:12px;max-height:220px;overflow:auto;white-space:pre-wrap;color:#c8cbd6;display:none"></pre>
+<div id="models-msg" class="msg"></div>
 </div>
 <script>
 const state = {{ traceId: null, win: null }};
@@ -394,6 +404,21 @@ async function postJSON(url,payload){{
     var d=await r.json();
     return d;
   }}catch(e){{ return {{success:false,error:String(e)}}; }}
+}}
+async function refreshModels(){{
+  var el=document.getElementById('models-out');
+  var msg=document.getElementById('models-msg');
+  el.style.display='block';
+  el.textContent='加载中...';
+  try{{
+    var r=await fetch('/v1/models?refresh=true');
+    var d=await r.json();
+    el.textContent=JSON.stringify(d.data.map(m=>m.id),null,2);
+    showMsg('models-msg','成功获取 '+d.data.length+' 个模型',true);
+  }}catch(e){{
+    el.textContent=String(e);
+    showMsg('models-msg',String(e),false);
+  }}
 }}
 async function logout(){{
   var d=await postJSON('/api/logout',{{}});
@@ -746,9 +771,10 @@ async def status():
 
 
 @app.get("/v1/models")
-async def models():
+async def models(request: Request):
+    force = request.query_params.get("refresh", "").lower() in ("1", "true", "yes")
     try:
-        items = await trae_client.get_models()
+        items = await trae_client.get_models(force=force)
     except Exception as e:
         return _openai_error(502, str(e), "api_error")
     return {"object": "list", "data": items}
@@ -770,8 +796,8 @@ async def chat_completions(req: Request):
 
 
 @app.get("/v1")
-async def v1_index():
-    return await models()
+async def v1_index(request: Request):
+    return await models(request)
 
 
 # ---- Web login endpoints ----

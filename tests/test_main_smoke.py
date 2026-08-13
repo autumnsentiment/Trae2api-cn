@@ -96,6 +96,19 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(body["object"], "list")
         self.assertTrue(body["data"])
 
+    def test_get_v1_models_with_refresh(self):
+        response = self.client.get("/v1/models?refresh=true", headers=AUTH_HEADERS)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["object"], "list")
+        self.assertGreaterEqual(len(body["data"]), 1)
+
+    def test_web_login_has_model_refresh_button(self):
+        response = self.client.get("/web/login")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("refreshModels", response.text)
+        self.assertIn("获取模型列表", response.text)
+
     def test_healthz_without_auth(self):
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, 200)
@@ -134,7 +147,7 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertIn("\u767b\u5f55\u6210\u529f", response.text)
         status = self.client.get("/v1/status").json()
         self.assertTrue(status["has_token"])
-        self.assertEqual(status["source"], "env")
+        self.assertEqual(status["source"], "web-login")
 
 
 if __name__ == "__main__":

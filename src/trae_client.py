@@ -751,21 +751,36 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
     raise RuntimeError("Trae ide chat failed: " + " | ".join(errors))
 
 
-async def get_models() -> list[dict]:
-    """返回模型列表；默认使用内置模型表，TRAE_FETCH_MODEL_LIST=true 时先尝试上游。"""
-    created = int(time.time())
-    static = [
+_MODEL_LIST_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_MODEL_LIST_CACHE_TTL = float(os.environ.get("TRAE_MODEL_LIST_CACHE_TTL", "300"))
+
+
+def _static_model_list(created: int) -> list[dict]:
+    """内置模型表；无配置时兜底返回 auto。"""
+    items = [
         {"id": mid, "object": "model", "created": created, "owned_by": "trae"}
         for mid in sorted(SUPPORTED_MODELS)
     ]
-    if not static:
-        static = [{"id": "auto", "object": "model", "created": created, "owned_by": "trae"}]
+    return items or [{"id": "auto", "object": "model", "created": created, "owned_by": "trae"}]
+
+
+async def get_models(force: bool = False) -> list[dict]:
+    """返回模型列表。
+
+    默认使用内置模型表。TRAE_FETCH_MODEL_LIST=true 时尝试从上游获取，
+    结果缓存 TRAE_MODEL_LIST_CACHE_TTL 秒；force=True 时跳过缓存强制刷新。
+    """
+    created = int(time.time())
+    cache_key = auth.get_user_id() or auth.get_token()[:16] or "default"
 
     if os.environ.get("TRAE_FETCH_MODEL_LIST", "").lower() != "true":
-        return static
+        return _static_model_list(created)
 
-    auth_module = auth
-    await auth_module.maybe_refresh()
+    cached = _MODEL_LIST_CACHE.get(cache_key)
+    if not force and cached and time.time() - cached[0] < _MODEL_LIST_CACHE_TTL:
+        return cached[1]
+
+    await auth.maybe_refresh()
     base = os.environ.get("TRAE_API_HOST", "") or auth.get_auth().host or "https://trae-api-cn.mchost.guru"
     base = base.rstrip("/")
     url = f"{base}/api/ide/v1/model_list?type=chat"
@@ -782,8 +797,13 @@ async def get_models() -> list[dict]:
                 name = "claude-3-7-sonnet"
             elif name == "claude3.5":
                 name = "claude-3-5-sonnet"
-            out.append({"id": name, "object": "model", "created": created, "owned_by": "trae"})
-        return out or static
+            if name:
+                out.append({"id": name, "object": "model", "created": created, "owned_by": "trae"})
+        items = out or _static_model_list(created)
+        _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
+        return items
     except Exception as e:
         logger.warning("trae-client: model_list failed, using static list: %s", e)
-        return static
+        items = _static_model_list(created)
+        _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
+        return items
