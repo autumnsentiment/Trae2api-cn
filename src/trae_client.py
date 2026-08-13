@@ -240,12 +240,21 @@ def build_web_headers(token: str) -> dict[str, str]:
         "X-Trae-Client-Type": "web",
         "X-Preferenced-Language": psd.get("appLanguage") or os.environ.get("TRAE_WEB_LANGUAGE", "zh-CN"),
         "x-user-region": psd.get("userRegion") or os.environ.get("TRAE_WEB_USER_REGION", "CN"),
-        "Referer": "https://solo.trae.cn/",
+        "Origin": web_origin(),
+        "Referer": web_origin() + "/",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
         ),
     }
+
+
+def web_origin() -> str:
+    """Return the browser Origin/Referer matching the current web upstream."""
+    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).lower()
+    if "core-normal.trae.cn" in base or "trae-api-cn" in base or "mchost.guru" in base:
+        return "https://solo.trae.cn"
+    return "https://solo.trae.ai"
 
 
 def _web_common_params(psd: dict, mode: str, session_id: str = "") -> str:

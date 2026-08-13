@@ -366,13 +366,18 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
 </div>
 <script>
 const state = {{ traceId: null, win: null }};
+let currentCodeVerifier = '';
 function uuid() {{ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){{var r=Math.random()*16|0;return(c==='x'?r:(r&3|8)).toString(16)}}) }}
 function randomHex(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('') }}
 function randomDigits(n) {{ var s='';while(s.length<n)s+=Math.floor(Math.random()*1e10).toString();return s.slice(0,n) }}
-function buildAuthUrl() {{
+function randomBase64Url(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return btoa(String.fromCharCode.apply(null,a)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
+async function sha256Base64Url(str) {{ var buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(str));var b=String.fromCharCode.apply(null,new Uint8Array(buf));return btoa(b).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
+async function buildChallenge() {{ currentCodeVerifier=randomBase64Url(32);return await sha256Base64Url(currentCodeVerifier) }}
+async function buildAuthUrl() {{
   // Trae 授权页强制要求回调为 http://127.0.0.1:<port>/authorize，
   // 因此必须由本机 web_login.py 监听并转发凭据到服务器。
   var cb = 'http://127.0.0.1:{listener_port}/authorize';
+  var challenge = await buildChallenge();
   var mid = randomHex(32), did = randomDigits(19), tid = state.traceId;
   var p = new URLSearchParams({{
     login_version:'1',auth_from:'solo',login_channel:'native_ide',plugin_version:'2.3.24254',
@@ -400,7 +405,7 @@ async function startAuth() {{
     return;
   }}
   state.traceId = uuid();
-  var url = buildAuthUrl();
+  var url = await buildAuthUrl();
   var w = window.open(url, 'trae-relay-oauth', 'width=560,height=760');
   if (!w) {{ showMsg('auth-msg','浏览器已拦截，请允许弹窗',false); return; }}
   state.win = w;
@@ -887,7 +892,7 @@ async def web_auth(request: Request):
         "host": body.get("host") or "",
         "expired_at": body.get("expiredAt") or body.get("expired_at") or body.get("tokenExpires") or "",
         "refresh_expired_at": body.get("refreshExpiredAt") or body.get("refresh_expired_at") or body.get("refreshExpires") or "",
-        "client_id": body.get("clientId") or body.get("client_id") or "",
+        "client_id": body.get("clientId") or body.get("client_id") or body.get("clientID") or "",
         "web_id": body.get("webId") or body.get("web_id") or "",
         "biz_user_id": body.get("bizUserId") or body.get("biz_user_id") or "",
         "user_unique_id": body.get("userUniqueId") or body.get("user_unique_id") or "",

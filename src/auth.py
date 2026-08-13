@@ -222,7 +222,9 @@ def init_auth() -> AuthState:
         state.expired_at = auth_data.get("expiredAt") or auth_data.get("TokenExpireAt") or ""
         state.refresh_expired_at = auth_data.get("refreshExpiredAt") or auth_data.get("RefreshExpireAt") or ""
         state.host = auth_data.get("host") or os.environ.get("TRAE_API_HOST", "") or DEFAULT_BASE_URLS.get(edition, "")
-        state.client_id = os.environ.get("TRAE_CLIENT_ID", "") or _safe_read_env_value("TRAE_CLIENT_ID")
+        if edition == "cn" and (not state.host or "mchost.guru" in state.host):
+            state.host = "https://api.trae.cn"
+        state.client_id = auth_data.get("clientID") or auth_data.get("ClientID") or auth_data.get("clientId") or os.environ.get("TRAE_CLIENT_ID", "") or _safe_read_env_value("TRAE_CLIENT_ID")
         _extract_provider_specific_from_auth(state, auth_data)
         _load_env_overrides(state)
         state.log_summary()

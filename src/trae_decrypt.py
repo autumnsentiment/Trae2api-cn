@@ -1,12 +1,10 @@
-"""
-trae_decrypt.py - Trae "tc" 加密格式解密
+"""trae_decrypt.py - Trae "tc" encrypted storage format decryption
 
-从 Trae CN / SOLO CN 的 storage.json 中解密认证数据。
+Decrypt auth data from Trae CN / SOLO CN storage.json.
+Data format: [6B Header][32B RandomBytes][N EncryptedData]
+Decrypted:  [64B SHA-512 Hash][PKCS7 padded plaintext JSON]
 
-数据格式: [6B Header][32B RandomBytes][N EncryptedData]
-解密后:   [64B SHA-512 Hash][N Plaintext JSON]
-
-密钥派生: SHA-512(RandomBytes) → XOR 盐值 → SHA-512 → Key(16B) + IV(16B)
+Key derivation: SHA-512(RandomBytes) -> XOR salt -> SHA-512 -> Key(16B) + IV(16B)
 """
 
 import base64
@@ -16,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# 四个硬编码 64 字节盐值（从 Trae CN 前端 JS 逆向得到）
+# Four hard-coded 64-byte salts (from Trae CN frontend JS reverse engineering)
 SALT_A = bytes([
     82, 9, 106, 213, 48, 54, 165, 56, 191, 64, 163, 158, 129, 243, 215, 251,
     124, 227, 57, 130, 155, 47, 255, 135, 52, 142, 67, 68, 196, 222, 233, 203,
@@ -53,7 +51,7 @@ def _xor_bytes(a: bytes, b: bytes, length: int) -> bytes:
 
 
 def _detect_enc_type(header: bytes) -> str:
-    """检测加密类型"""
+    """Detect encryption type."""
     # AES: 0x74 0x63 0x05 0x10 0x00 0x00 ("tc" prefix)
     if header[:2] == b"tc" and header[2:6] == b"\x05\x10\x00\x00":
         return "AES"
@@ -64,30 +62,38 @@ def _detect_enc_type(header: bytes) -> str:
 
 
 def _derive_key_and_iv(random_bytes: bytes, enc_type: str) -> tuple[bytes, bytes]:
-    """派生 AES-128-CBC 的 Key 和 IV"""
+    """Derive AES-128-CBC key and IV."""
     if enc_type == "AES_PRIVATE":
         salt = _xor_bytes(SALT_C, SALT_D, 64)
     else:
         salt = _xor_bytes(SALT_A, SALT_B, 64)
 
-    # SHA-512(RandomBytes) → hashOfRandom (64 bytes)
+    # SHA-512(RandomBytes) -> hashOfRandom (64 bytes)
     hash_of_random = hashlib.sha512(random_bytes).digest()
 
-    # SHA-512(hashOfRandom + salt) → finalHash (64 bytes)
-    combined = hash_of_random + salt
-    final_hash = hashlib.sha512(combined).digest()
+    # SHA-512(hashOfRandom + salt) -> finalHash (64 bytes)
+    final_hash = hashlib.sha512(hash_of_random + salt).digest()
 
-    # 前 16 字节为 AES Key，后 16 字节为 IV
+    # First 16 bytes are the AES key, next 16 are the IV
     return final_hash[:16], final_hash[16:32]
 
 
+def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data:
+        return data
+    pad = data[-1]
+    if 1 <= pad <= 16 and data.endswith(bytes([pad]) * pad):
+        return data[:-pad]
+    return data
+
+
 def decrypt_storage_value(base64_value: str) -> str:
-    """解密单个 tc 格式加密值，返回明文字符串"""
+    """Decrypt a single tc-format encrypted value, returning plaintext string."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
     buffer = base64.b64decode(base64_value)
 
-    # 解析结构: [6B Header][32B RandomBytes][N EncryptedData]
+    # Parse structure: [6B Header][32B RandomBytes][N EncryptedData]
     header = buffer[:6]
     random_bytes = buffer[6:38]
     encrypted_data = buffer[38:]
@@ -98,24 +104,24 @@ def decrypt_storage_value(base64_value: str) -> str:
 
     aes_key, iv = _derive_key_and_iv(random_bytes, enc_type)
 
-    # AES-128-CBC 解密
+    # AES-128-CBC decrypt
     cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
 
-    # 验证哈希: [64B SHA-512 Hash][N Plaintext JSON]
+    # Validate hash: [64B SHA-512 Hash][PKCS7 padded plaintext JSON]
     stored_hash = decrypted[:64]
-    plaintext = decrypted[64:]
-    computed_hash = hashlib.sha512(plaintext).digest()
+    body = _pkcs7_unpad(decrypted[64:])
+    computed_hash = hashlib.sha512(body).digest()
 
     if stored_hash != computed_hash:
         raise ValueError("Hash verification failed - decryption may be incorrect")
 
-    return plaintext.decode("utf-8")
+    return body.decode("utf-8")
 
 
 def decrypt_auth_data(data_dir: str | Path) -> dict:
-    """从 Trae 的 storage.json 中解密认证数据"""
+    """Decrypt auth data from a Trae storage.json directory."""
     storage_path = Path(data_dir) / "globalStorage" / "storage.json"
 
     if not storage_path.exists():
@@ -127,17 +133,17 @@ def decrypt_auth_data(data_dir: str | Path) -> dict:
     if not encrypted_auth:
         raise KeyError(f"{STORAGE_KEY} not found in storage.json")
 
-    # 如果以 '{' 开头，是明文 JSON（SG 国际版）
+    # Plain JSON (SG international edition)
     if encrypted_auth.strip().startswith("{"):
         return json.loads(encrypted_auth)
 
-    # 否则是 tc 加密格式
+    # tc encrypted format
     decrypted = decrypt_storage_value(encrypted_auth)
     return json.loads(decrypted)
 
 
 def get_trae_cn_data_dir() -> str:
-    """获取 Trae CN 国内版数据目录"""
+    """Trae CN (China) data directory."""
     appdata = os.environ.get("APPDATA", "")
     if not appdata:
         appdata = str(Path.home() / "AppData" / "Roaming")
@@ -145,7 +151,7 @@ def get_trae_cn_data_dir() -> str:
 
 
 def get_trae_solo_cn_data_dir() -> str:
-    """获取 TRAE SOLO CN 数据目录"""
+    """TRAE SOLO CN data directory."""
     appdata = os.environ.get("APPDATA", "")
     if not appdata:
         appdata = str(Path.home() / "AppData" / "Roaming")
@@ -153,7 +159,7 @@ def get_trae_solo_cn_data_dir() -> str:
 
 
 def get_trae_sg_data_dir() -> str:
-    """获取 Trae 国际版数据目录"""
+    """Trae international edition data directory."""
     appdata = os.environ.get("APPDATA", "")
     if not appdata:
         appdata = str(Path.home() / "AppData" / "Roaming")
@@ -161,7 +167,7 @@ def get_trae_sg_data_dir() -> str:
 
 
 def get_trae_solo_sg_data_dir() -> str:
-    """获取 TRAE SOLO 国际版数据目录"""
+    """TRAE SOLO international edition data directory."""
     appdata = os.environ.get("APPDATA", "")
     if not appdata:
         appdata = str(Path.home() / "AppData" / "Roaming")
@@ -169,7 +175,7 @@ def get_trae_solo_sg_data_dir() -> str:
 
 
 def try_auto_discover() -> tuple[Optional[dict], Optional[str]]:
-    """自动遍历所有已知版本，返回第一个可用的 (auth_data, edition_name)"""
+    """Iterate all known editions, returning the first usable (auth_data, edition_name)."""
     editions = [
         ("cn", get_trae_cn_data_dir()),
         ("solo", get_trae_solo_cn_data_dir()),
@@ -180,6 +186,6 @@ def try_auto_discover() -> tuple[Optional[dict], Optional[str]]:
         try:
             auth = decrypt_auth_data(data_dir)
             return auth, edition
-        except Exception as e:
+        except Exception:
             continue
     return None, None

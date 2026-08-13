@@ -11,6 +11,7 @@ services:
       - "${RELAY_PORT:-8000}:8000"
     volumes:
       - ./.env:/app/.env
+      - ./data:/app/data
       # CLI 模式可选：把宿主机 Linux 版 traecli 挂载进容器
       # - /usr/local/bin/traecli:/usr/local/bin/traecli:ro
       # - /root/.trae:/home/app/.trae:ro
