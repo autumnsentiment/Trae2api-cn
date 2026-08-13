@@ -538,6 +538,9 @@ async def run_web_session(messages, model, stream: bool):
                     async for chunk in translate_web_events(event_iter, model, FORWARD_USAGE):
                         yield chunk
                 finally:
+                    # Actively interrupt the upstream session so it stops
+                    # occupying a running slot, then close local resources.
+                    await trae_client.stop_web_session(client, session_id, message_id)
                     await client.aclose()
                     if trae_client.unregister_web_lease(session_id):
                         trae_client.release_web_slot(account_id)
@@ -550,10 +553,16 @@ async def run_web_session(messages, model, stream: bool):
             result = await collect_nonstream_web(event_iter, model)
             return JSONResponse(content=result)
         finally:
+            await trae_client.stop_web_session(client, session_id, message_id)
             await client.aclose()
             if trae_client.unregister_web_lease(session_id):
                 trae_client.release_web_slot(account_id)
     except Exception:
+        if session_id:
+            try:
+                await trae_client.stop_web_session(client, session_id, message_id)
+            except Exception:
+                pass
         await client.aclose()
         if session_id:
             if trae_client.unregister_web_lease(session_id):
@@ -917,4 +926,3 @@ async def api_polling(request: Request):
     enabled = bool(body.get("enabled", False))
     auth.set_polling(enabled)
     return JSONResponse({"success": True, "enabled": enabled})
-

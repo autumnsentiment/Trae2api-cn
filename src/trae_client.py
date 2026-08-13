@@ -91,8 +91,10 @@ _SESSION_CACHE: dict[str, str] = {}
 
 _WEB_SLOTS: dict[str, asyncio.Semaphore] = {}
 _WEB_LEASES: dict[str, dict] = {}
+_WEB_MODEL_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
 _WEB_PARALLEL_LIMIT = int(os.environ.get("TRAE_WEB_PARALLEL_LIMIT", "2"))
 _WEB_IDLE_TIMEOUT = float(os.environ.get("TRAE_WEB_IDLE_TIMEOUT", "60"))
+_WEB_MODEL_CACHE_TTL = float(os.environ.get("TRAE_WEB_MODEL_CACHE_TTL", "300"))
 _WORKSPACE_PREFIXES = ["User", "home", "workspace", "data"]
 _WORKSPACE_DIRS = ["projects", "workspace", "dev", "code", "work"]
 
@@ -351,14 +353,42 @@ def idle_web_leases() -> list[dict]:
     return [lease for lease in _WEB_LEASES.values() if now - lease["last_activity"] >= _WEB_IDLE_TIMEOUT]
 
 
+
+async def stop_web_session(client: httpx.AsyncClient, session_id: str, message_id: str) -> None:
+    """Actively interrupt an upstream web session so it stops occupying a running slot."""
+    if not session_id or not message_id:
+        return
+    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    token = auth.get_token()
+    if not token:
+        return
+    try:
+        resp = await client.post(
+            f"{base}/chat_sessions/{session_id}/stop",
+            headers=build_web_headers(token),
+            json={"chat_session_id": session_id, "user_message_id": message_id},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("trae-client: stop web session %s returned %s", session_id, resp.status_code)
+    except Exception as e:
+        logger.warning("trae-client: stop web session %s failed: %s", session_id, e)
+
+
 async def reap_idle_web_sessions() -> int:
     count = 0
     for lease in idle_web_leases():
         session_id = lease["session_id"]
         account_id = lease["account_id"]
         client = lease.get("client")
+        message_id = lease.get("message_id") or ""
         logger.warning("trae-client: reaping idle web session %s (account %s)", session_id, account_id)
         if unregister_web_lease(session_id):
+            if client is not None:
+                try:
+                    await stop_web_session(client, session_id, message_id)
+                except Exception:
+                    pass
             if client is not None:
                 try:
                     await client.aclose()
@@ -367,6 +397,88 @@ async def reap_idle_web_sessions() -> int:
             release_web_slot(account_id)
             count += 1
     return count
+
+
+
+def _build_web_model_config(raw: dict) -> dict:
+    """Keep the model object the web frontend would send as custom_model."""
+    cfg = dict(raw)
+    features = cfg.get("features")
+    if isinstance(features, str):
+        try:
+            cfg["features"] = json.loads(features)
+        except Exception:
+            cfg["features"] = {}
+    name = cfg.get("name") or ""
+    cfg["config_name"] = cfg.get("config_name") or name
+    cfg["config_source"] = cfg.get("config_source") or 1
+    cfg["provider"] = cfg.get("provider") or ""
+    cfg["multimodal"] = bool(cfg.get("multimodal"))
+    cfg["ak"] = cfg.get("ak") or ""
+    cfg["sk"] = cfg.get("sk") or ""
+    cfg["base_url"] = cfg.get("base_url") or ""
+    cfg["auth_type"] = cfg.get("auth_type") or 0
+    cfg["use_remote_service"] = not bool(cfg.get("client_connect"))
+    return cfg
+
+
+async def _fetch_web_model_configs() -> dict[str, dict]:
+    """Fetch the same model list used by the Trae web client."""
+    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    token = auth.get_token()
+    if not token:
+        return {}
+    url = f"{base}/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true"
+    try:
+        async with httpx.AsyncClient(headers=build_web_headers(token), timeout=30) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning("trae-client: web model list returned %s", resp.status_code)
+                return {}
+            data = resp.json()
+    except Exception as e:
+        logger.warning("trae-client: web model list failed: %s", e)
+        return {}
+    out: dict[str, dict] = {}
+    for group in data.get("data", {}).get("list", []):
+        for raw in group.get("models", []):
+            name = (raw.get("name") or "").strip()
+            if name:
+                out[name] = _build_web_model_config(raw)
+    return out
+
+
+async def _get_web_custom_model(model_name: str) -> Optional[dict]:
+    """Return custom_model for a manual web model selection."""
+    if not model_name:
+        return None
+    account_key = auth.get_user_id() or auth.get_token()[:16] or "default"
+    now = time.time()
+    cached = _WEB_MODEL_CACHE.get(account_key)
+    if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
+        configs = await _fetch_web_model_configs()
+        cached = (now, configs)
+        _WEB_MODEL_CACHE[account_key] = cached
+    cfg = cached[1].get(model_name)
+    if cfg is not None:
+        return cfg
+    lowered = model_name.lower()
+    if lowered in ("mimo-v2.5", "mimo-v2.5-pro", "minimax-m25", "qwen36-35b"):
+        return {
+            "name": model_name,
+            "model_name": model_name,
+            "config_name": model_name,
+            "display_model_name": model_name,
+            "display_name": model_name,
+            "config_source": 3,
+            "provider": "custom_openai_compatible",
+            "multimodal": lowered.startswith("mimo"),
+            "is_preset": False,
+            "use_remote_service": True,
+            "ak": "", "sk": "", "base_url": "", "region": None, "auth_type": 0,
+            "features": {},
+        }
+    return None
 
 
 async def create_web_session(
@@ -382,18 +494,23 @@ async def create_web_session(
 
     mode, strategy, model_name = _resolve_mode(model)
     psd = auth.get_psd()
+    initial_message = {
+        "chat_session_id": "",
+        "content": [],
+        "query": query,
+        "model_name": model_name,
+        "agent_type": "solo_agent_remote",
+        "model_selection_strategy": strategy,
+        "common_params": _web_common_params(psd, mode),
+    }
+    if strategy != "auto":
+        custom_model = await _get_web_custom_model(model_name)
+        if custom_model:
+            initial_message["custom_model"] = custom_model
     body = {
         "mode": mode,
         "environment_id": "default",
-        "initial_message": {
-            "chat_session_id": "",
-            "content": [],
-            "query": query,
-            "model_name": model_name,
-            "agent_type": "solo_agent_remote",
-            "model_selection_strategy": strategy,
-            "common_params": _web_common_params(psd, mode),
-        },
+        "initial_message": initial_message,
         "env": "remote",
         "auto_create_project": False,
         "origin": "web",
