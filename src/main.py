@@ -383,8 +383,9 @@ async function buildAuthUrl() {{
     login_version:'1',auth_from:'solo',login_channel:'native_ide',plugin_version:'2.3.24254',
     auth_type:'local',client_id:'{html_mod.escape(client_id)}',redirect:'0',login_trace_id:tid,
     auth_callback_url:cb,machine_id:mid,device_id:did,x_device_id:did,x_machine_id:mid,
-    x_device_brand:'Mac14,7',x_device_type:'mac',x_os_version:'macOS 26.4.1',x_env:'',
-    x_app_version:'0.1.7',x_app_type:'stable',hide_saas_login:'true'
+    x_device_brand:'ASUS TUF Gaming A15 FA507RM_FA507RM',x_device_type:'windows',x_os_version:'Windows 10 Pro',x_env:'',
+    x_app_version:'3.3.65',x_app_type:'stable',hide_saas_login:'true',
+    code_challenge:challenge,code_challenge_method:'S256'
   }});
   return '{auth_url}?'+p.toString();
 }}
