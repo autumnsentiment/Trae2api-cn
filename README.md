@@ -74,6 +74,7 @@ docker compose up -d --build
 - 自定义上游 URL 和端口
 - 手动添加凭证
 - 登出
+- 获取模型列表：一键刷新 /v1/models（TRAE_FETCH_MODEL_LIST=true 时从上游拉取）
 
 ## 开源协议
 
