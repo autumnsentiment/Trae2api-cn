@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 import dotenv
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.responses import FileResponse
 
@@ -55,7 +55,7 @@ TRAE_AUTH_URL = os.environ.get("TRAE_AUTH_URL", "https://www.trae.cn/authorizati
 TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID", "ono9krqynydwx5")
 LOCAL_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
 PUBLIC_PATHS = {"/healthz", "/v1/status", "/web/login", "/authorize", "/api/web-auth"}
-PUBLIC_PATHS = {"/healthz", "/v1/status", "/web/login", "/web/login/download", "/authorize", "/api/web-auth", "/api/logout", "/api/accounts", "/api/accounts/switch", "/api/accounts/remove", "/api/settings", "/api/polling"}
+PUBLIC_PATHS = {"/healthz", "/v1/status", "/v1/models", "/web/login", "/web/login/download", "/authorize", "/api/web-auth", "/api/logout", "/api/accounts", "/api/accounts/switch", "/api/accounts/remove", "/api/settings", "/api/polling"}
 WEB_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "web_login.py"
 
 
@@ -288,14 +288,17 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
 <hr>
 <div class="section-title">授权登录</div>
 <p style="font-size:13px;color:#9aa0b0;margin-bottom:8px;line-height:1.5">
-  1. 在本机运行 <code>python web_login.py</code>，默认监听 127.0.0.1:{listener_port}。<br>
-  2. 确保浏览器已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener" style="color:#8ab4f8">trae.cn</a><br>
-  3. 点击下方按钮完成授权。
+  1. 点击下方按钮后会自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。<br>
+  2. 若未检测到，请先下载 <code>web_login.py</code>（或一键 <code>start_auth.bat</code>）并在<b>本机</b>运行，再重试。<br>
+  3. 确保浏览器已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener" style="color:#8ab4f8">trae.cn</a>，授权完成后凭据自动写入服务器。
 </p>
 <div class="btn-group">
   <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">使用 Trae 网页授权登录</button>
   <a class="btn btn-ghost" href="https://www.trae.cn" target="_blank" rel="noopener">访问 trae.cn</a>
-  <a class="btn btn-ghost" href="/web/login/download" download>下载 web_login.py</a>
+</div>
+<div class="btn-group">
+  <a class="btn btn-secondary" href="/web/login/download" download>下载本机授权助手 web_login.py</a>
+  <a class="btn btn-ghost" href="/web/login/download?as=bat" download id="bat-link" style="display:none">下载一键启动 start_auth.bat</a>
 </div>
 <div id="loading" class="loading">等待授权中...</div>
 <div id="auth-msg" class="msg"></div>
@@ -367,6 +370,8 @@ function uuid() {{ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g
 function randomHex(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('') }}
 function randomDigits(n) {{ var s='';while(s.length<n)s+=Math.floor(Math.random()*1e10).toString();return s.slice(0,n) }}
 function buildAuthUrl() {{
+  // Trae 授权页强制要求回调为 http://127.0.0.1:<port>/authorize，
+  // 因此必须由本机 web_login.py 监听并转发凭据到服务器。
   var cb = 'http://127.0.0.1:{listener_port}/authorize';
   var mid = randomHex(32), did = randomDigits(19), tid = state.traceId;
   var p = new URLSearchParams({{
@@ -378,16 +383,32 @@ function buildAuthUrl() {{
   }});
   return '{auth_url}?'+p.toString();
 }}
-function startAuth() {{
+async function checkLocalListener() {{
+  try {{
+    var ctrl = new AbortController();
+    var timer = setTimeout(function(){{ ctrl.abort(); }}, 1200);
+    var r = await fetch('http://127.0.0.1:{listener_port}/healthz', {{signal: ctrl.signal, cache: 'no-store'}});
+    clearTimeout(timer);
+    return r.ok;
+  }} catch(e) {{ return false; }}
+}}
+async function startAuth() {{
+  var ok = await checkLocalListener();
+  if (!ok) {{
+    showMsg('auth-msg', '未检测到本机授权助手，请先下载并双击运行 web_login.py（需 Python）或 start_auth.bat：', false);
+    document.getElementById('bat-link').style.display='inline-flex';
+    return;
+  }}
   state.traceId = uuid();
   var url = buildAuthUrl();
   var w = window.open(url, 'trae-relay-oauth', 'width=560,height=760');
-  if (!w) {{ showMsg('auth-msg','浏览器被拦截，请允许弹窗',false); return; }}
+  if (!w) {{ showMsg('auth-msg','浏览器已拦截，请允许弹窗',false); return; }}
   state.win = w;
   document.getElementById('loading').style.display='block';
   document.getElementById('auth-btn').disabled=true;
   var poll = setInterval(function(){{ if(w.closed){{ clearInterval(poll);document.getElementById('loading').style.display='none';document.getElementById('auth-btn').disabled=false; }} }},700);
 }}
+
 window.addEventListener('message',function(ev){{
   if (!ev.data||ev.data.type!=='trae-relay-web-login') return;
   if (state.traceId&&ev.data.loginTraceId!==state.traceId) return;
@@ -413,6 +434,9 @@ async function refreshModels(){{
   try{{
     var r=await fetch('/v1/models?refresh=true');
     var d=await r.json();
+    if(!r.ok || !d || !Array.isArray(d.data)){{
+      throw new Error((d && d.error && d.error.message) || ('HTTP '+r.status));
+    }}
     el.textContent=JSON.stringify(d.data.map(m=>m.id),null,2);
     showMsg('models-msg','成功获取 '+d.data.length+' 个模型',true);
   }}catch(e){{
@@ -480,13 +504,11 @@ body {{ font:16px -apple-system,sans-serif;background:#0f1117;color:#e8eaed;padd
 </div>
 <script>
 (function(){{
-  try {{
-    if (!window.opener) return;
-    var msg = {{ type:'trae-relay-web-login', success:{'true' if success else 'false'}, error:null, loginTraceId:'{safe_trace}' }};
-    if (!{str(success).lower()}) msg.error = '{safe_msg}';
-    window.opener.postMessage(msg, '*');
-  }} catch(e){{}}
-  setTimeout(function(){{ window.close(); }}, {800 if success else 4000});
+  // 授权回调由 Trae 授权页直接跳转到服务器 /authorize。
+  // 成功后回到控制台自动刷新，失败则停留展示错误。
+  if ({str(success).lower()}) {{
+    setTimeout(function(){{ window.location.href = '/web/login'; }}, 1200);
+  }}
 }})();
 </script>
 </body>
@@ -807,8 +829,18 @@ async def web_login():
     return _web_login_html()
 
 
+START_AUTH_BAT = Path(__file__).resolve().parent.parent / "start_auth.bat"
+
 @app.get("/web/login/download", response_class=FileResponse)
-async def web_login_download():
+async def web_login_download(as_param: str = Query("", alias="as")):
+    if as_param == "bat":
+        if not START_AUTH_BAT.exists():
+            return JSONResponse({"success": False, "error": "start_auth.bat not found"}, status_code=404)
+        return FileResponse(
+            START_AUTH_BAT,
+            media_type="application/octet-stream",
+            filename="start_auth.bat",
+        )
     if not WEB_LOGIN_SCRIPT.exists():
         return JSONResponse({"success": False, "error": "web_login.py not found"}, status_code=404)
     return FileResponse(

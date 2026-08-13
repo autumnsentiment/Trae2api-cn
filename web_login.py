@@ -194,7 +194,11 @@ function showMsg(id,text,ok){{ var el=document.getElementById(id);el.textContent
         parsed = urllib.parse.urlparse(self.path)
         params = dict(urllib.parse.parse_qsl(parsed.query))
 
-        if parsed.path == "/authorize":
+        if parsed.path == "/healthz":
+            self._send_json({"status": "ok", "relay": self.relay_url, "port": self.server.server_address[1]})
+        elif parsed.path == "/relay-url":
+            self._send_json({"relay": self.relay_url})
+        elif parsed.path == "/authorize":
             self._handle_authorize(params)
         elif parsed.path in ("/", "/index.html", ""):
             self._send_html(self._index_page())
@@ -202,6 +206,26 @@ function showMsg(id,text,ok){{ var el=document.getElementById(id);el.textContent
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found")
+
+    def _send_json(self, obj: dict):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def _handle_authorize(self, query: dict):
         creds = parse_oauth_params(query)
@@ -242,6 +266,8 @@ function showMsg(id,text,ok){{ var el=document.getElementById(id);el.textContent
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -272,7 +298,8 @@ def main():
 
     if not args.no_open:
         try:
-            webbrowser.open(f"http://127.0.0.1:{port}")
+            # Trae 授权完成后回调到本机 /authorize；打开 relay 控制台方便用户点授权。
+            webbrowser.open(f"{relay}/web/login")
         except Exception:
             pass
 

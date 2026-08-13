@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src ./src
 
 COPY web_login.py .
+COPY start_auth.bat .
 
 RUN chown -R relay:relay /app /home/app
 RUN chown -R relay:relay /app /home/app && chmod -R u+rwX,go+rX /app

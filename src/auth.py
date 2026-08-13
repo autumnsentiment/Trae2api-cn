@@ -678,6 +678,7 @@ def list_accounts() -> list[dict]:
 
 
 def add_account(creds: dict, label: str = '') -> str:
+    global _active_account
     token = creds.get('token') or ''
     if not token:
         raise ValueError('token is required')
@@ -722,6 +723,7 @@ def add_account(creds: dict, label: str = '') -> str:
 
 
 def remove_account(account_id: str) -> bool:
+    global _active_account
     with _STORE_LOCK:
         if account_id not in _accounts:
             return False
@@ -743,6 +745,7 @@ def remove_account(account_id: str) -> bool:
 
 
 def switch_account(account_id: str) -> bool:
+    global _active_account
     with _STORE_LOCK:
         if account_id not in _accounts:
             return False
@@ -766,6 +769,7 @@ def clear_active_auth() -> None:
 
 
 def logout_active() -> bool:
+    global _active_account
     with _STORE_LOCK:
         aid = _active_account
         if aid in _accounts:
@@ -804,6 +808,7 @@ def get_polling_status() -> dict:
 
 
 def next_polling_account() -> None:
+    global _active_account
     if not _poll_enabled:
         return
     with _STORE_LOCK:
