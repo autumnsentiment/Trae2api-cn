@@ -370,9 +370,10 @@ let currentCodeVerifier = '';
 function uuid() {{ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){{var r=Math.random()*16|0;return(c==='x'?r:(r&3|8)).toString(16)}}) }}
 function randomHex(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('') }}
 function randomDigits(n) {{ var s='';while(s.length<n)s+=Math.floor(Math.random()*1e10).toString();return s.slice(0,n) }}
-function randomBase64Url(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return btoa(String.fromCharCode.apply(null,a)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
-async function sha256Base64Url(str) {{ var buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(str));var b=String.fromCharCode.apply(null,new Uint8Array(buf));return btoa(b).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
-async function buildChallenge() {{ currentCodeVerifier=randomBase64Url(32);return await sha256Base64Url(currentCodeVerifier) }}
+function randomBase64Url(n) {{ var a=new Uint8Array(n); if(window.crypto&&crypto.getRandomValues){{ crypto.getRandomValues(a) }} else {{ for(var i=0;i<n;i++)a[i]=Math.floor(Math.random()*256) }} return btoa(String.fromCharCode.apply(null,a)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
+function sha256Hex(ascii) {{ function rr(v,a){{return (v>>>a)|(v<<(32-a))}} var maxWord=Math.pow(2,32); var words=[], h=sha256Hex.h=sha256Hex.h||[], k=sha256Hex.k=sha256Hex.k||[]; var pc=k.length; var comp={{}}; for(var cand=2;pc<64;cand++){{ if(!comp[cand]){{ for(var x=0;x<313;x+=cand)comp[x]=cand; h[pc]=(Math.pow(cand,.5)*maxWord)|0; k[pc++]=(Math.pow(cand,1/3)*maxWord)|0 }} }} ascii+='\u0080'; while(ascii.length%64-56)ascii+='\u0000'; for(var i=0;i<ascii.length;i++){{ var j=ascii.charCodeAt(i); if(j>>8)return ''; words[i>>2]|=j<<((3-i)%4)*8 }} words[words.length]=(ascii.length*8/maxWord)|0; words[words.length]=ascii.length*8; for(var w0=0;w0<words.length;){{ var w=words.slice(w0,w0+=16); var old=h.slice(0,8); h=h.slice(0,8); for(i=0;i<64;i++){{ var w15=w[i-15],w2=w[i-2]; var a=h[0],e=h[4]; var t1=h[7]+(rr(e,6)^rr(e,11)^rr(e,25))+((e&h[5])^((~e)&h[6]))+k[i]+(w[i]=(i<16)?w[i]:(w[i-16]+(rr(w15,7)^rr(w15,18)^(w15>>>3))+w[i-7]+(rr(w2,17)^rr(w2,19)^(w2>>>10)))|0); var t2=(rr(a,2)^rr(a,13)^rr(a,22))+((a&h[1])^(a&h[2])^(h[1]&h[2])); h=[(t1+t2)|0].concat(h); h[4]=(h[4]+t1)|0 }} for(i=0;i<8;i++)h[i]=(h[i]+old[i])|0 }} var out=''; for(i=0;i<8;i++){{ for(var b=3;b+1;b--){{ var by=(h[i]>>(b*8))&255; out+=((by<16)?'0':'')+by.toString(16) }} }} return out }}
+function sha256Base64Url(str) {{ var hex=sha256Hex(str); var bytes=new Uint8Array(32); for(var i=0;i<32;i++)bytes[i]=parseInt(hex.substr(i*2,2),16); var b=String.fromCharCode.apply(null,bytes); return btoa(b).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
+function buildChallenge() {{ currentCodeVerifier=randomBase64Url(32); return sha256Base64Url(currentCodeVerifier) }}
 async function buildAuthUrl() {{
   // Trae 授权页强制要求回调为 http://127.0.0.1:<port>/authorize，
   // 因此必须由本机 web_login.py 监听并转发凭据到服务器。
@@ -399,6 +400,7 @@ async function checkLocalListener() {{
   }} catch(e) {{ return false; }}
 }}
 async function startAuth() {{
+  try {{
   var ok = await checkLocalListener();
   if (!ok) {{
     showMsg('auth-msg', '未检测到本机授权助手，请先下载并双击运行 web_login.py（需 Python）或 start_auth.bat：', false);
@@ -413,6 +415,7 @@ async function startAuth() {{
   document.getElementById('loading').style.display='block';
   document.getElementById('auth-btn').disabled=true;
   var poll = setInterval(function(){{ if(w.closed){{ clearInterval(poll);document.getElementById('loading').style.display='none';document.getElementById('auth-btn').disabled=false; }} }},700);
+  }} catch(e) {{ showMsg('auth-msg',String(e),false); document.getElementById('loading').style.display='none'; document.getElementById('auth-btn').disabled=false; }}
 }}
 
 window.addEventListener('message',function(ev){{
