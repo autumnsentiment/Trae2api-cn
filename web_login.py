@@ -38,27 +38,58 @@ def json_loads_safe(value: str) -> dict:
 
 
 def parse_oauth_params(query: dict) -> dict:
+    """解析 Trae 授权回调参数。
+
+    Trae 网页授权页实际上会走两套流程：
+      1. 新流程 (code_challenge): callback 会带 authCodeInfo / code 等参数
+      2. 老流程 (refreshToken): callback 直接带 refreshToken=xxx
+    对于老流程，本地不会拥有 Cloud-IDE-JWT，需要拿到
+    refreshToken 后通过 oauth/ExchangeToken 向 api.trae.cn 兑换 Cloud-IDE-JWT。
+    """
     user_jwt = json_loads_safe(query.get("userJwt", ""))
     token = user_jwt.get("Token") or user_jwt.get("token") or ""
-    if not token:
-        return {}
-    refresh = user_jwt.get("RefreshToken") or user_jwt.get("refreshToken") or query.get("refreshToken") or ""
+    refresh = user_jwt.get("RefreshToken") or user_jwt.get("refreshToken") or query.get("refreshToken") or query.get("data") or ""
     token_exp = user_jwt.get("TokenExpireAt") or user_jwt.get("tokenExpireAt") or ""
     refresh_exp = user_jwt.get("RefreshExpireAt") or user_jwt.get("refreshExpireAt") or query.get("refreshExpireAt") or ""
     user_info = json_loads_safe(query.get("userInfo", ""))
-    user_id = user_info.get("UserID") or user_info.get("userId") or user_info.get("userID") or ""
-    region = user_info.get("Region") or user_info.get("region") or "CN"
+    user_id = user_info.get("UserID") or user_info.get("userId") or user_info.get("userID") or query.get("userId") or ""
+    region = user_info.get("Region") or user_info.get("region") or query.get("region") or "CN"
     ai_region = user_info.get("AIRegion") or user_info.get("aiRegion") or region
-    client_id = user_jwt.get("ClientID") or user_jwt.get("clientId") or ""
+    client_id = user_jwt.get("ClientID") or user_jwt.get("clientId") or query.get("clientID") or query.get("clientId") or query.get("client_id") or ""
     uid = user_id or ""
+    host = query.get("host") or user_info.get("Host") or user_info.get("host") or ""
+
+    # 老流程：回调只带了 refreshToken，通过 oauth/ExchangeToken 兑换
+    # Cloud-IDE-JWT 和用户信息。
+    if not token and refresh:
+        exchange = exchange_refresh_token(
+            refresh_token=refresh,
+            client_id=client_id or "ono9krqynydwx5",
+            host=host,
+        )
+        if exchange.get("token"):
+            token = exchange["token"]
+            refresh = exchange.get("refreshToken") or refresh
+            token_exp = exchange.get("expiredAt") or token_exp
+            refresh_exp = exchange.get("refreshExpiredAt") or refresh_exp
+            client_id = exchange.get("clientId") or client_id
+            host = exchange.get("host") or host
+            user_id = exchange.get("userId") or user_id
+            user_info = exchange.get("userInfo") or user_info
+            region = exchange.get("region") or region
+            ai_region = exchange.get("aiRegion") or region
+
+    if not token:
+        return {}
+
     return {
         "token": token,
         "refreshToken": refresh,
-        "userId": uid,
+        "userId": user_id or "",
         "tenantId": user_info.get("TenantID") or user_info.get("tenantId") or "",
         "region": region,
         "aiRegion": ai_region,
-        "host": query.get("host", ""),
+        "host": host,
         "expiredAt": str(token_exp) if token_exp else "",
         "refreshExpiredAt": str(refresh_exp) if refresh_exp else "",
         "clientId": client_id,
@@ -71,6 +102,71 @@ def parse_oauth_params(query: dict) -> dict:
         "userRegion": query.get("userRegion") or user_info.get("UserRegion") or user_info.get("userRegion") or "",
         "userIdentity": user_info.get("UserIdentity") or user_info.get("userIdentity") or "",
         "screenName": user_info.get("ScreenName") or user_info.get("screenName") or "",
+    }
+
+def exchange_refresh_token(refresh_token: str, client_id: str, host: str = "") -> dict:
+    """使用 refreshToken 向 Trae CN 兑换 Cloud-IDE-JWT。
+
+    这与 Trae 官网的实现一致:
+      POST https://api.trae.cn/cloudide/api/v3/trae/oauth/ExchangeToken
+      {"ClientID":..., "RefreshToken":..., "ClientSecret":"-", "UserID":""}
+    """
+    if not refresh_token:
+        return {}
+    base = host or "https://api.trae.cn"
+    base = base.rstrip("/")
+    url = base + "/cloudide/api/v3/trae/oauth/ExchangeToken"
+    payload = {
+        "ClientID": client_id,
+        "RefreshToken": refresh_token,
+        "ClientSecret": "-",
+        "UserID": "",
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        print(f"[web_login] ExchangeToken HTTP {e.code}: {body[:500]}")
+        return {}
+    except Exception as e:
+        print(f"[web_login] ExchangeToken failed: {e}")
+        return {}
+
+    result = json_loads_safe(body)
+    data = result.get("Result") or result.get("result") or result
+    if not isinstance(data, dict):
+        print(f"[web_login] ExchangeToken unexpected result: {body[:500]}")
+        return {}
+
+    token = data.get("Token") or data.get("token") or data.get("AccessToken") or data.get("accessToken") or ""
+    if not token:
+        print(f"[web_login] ExchangeToken missing Token: {body[:500]}")
+        return {}
+
+    refresh2 = data.get("RefreshToken") or data.get("refreshToken") or refresh_token
+    user_info = json_loads_safe(str(data.get("UserInfo") or data.get("userInfo") or ""))
+    return {
+        "token": token,
+        "refreshToken": refresh2,
+        "expiredAt": str(data.get("TokenExpireAt") or data.get("tokenExpireAt") or ""),
+        "refreshExpiredAt": str(data.get("RefreshExpireAt") or data.get("refreshExpireAt") or ""),
+        "clientId": data.get("ClientID") or data.get("clientId") or client_id,
+        "host": host or base,
+        "userId": user_info.get("UserID") or user_info.get("userId") or data.get("UserID") or data.get("userId") or "",
+        "userInfo": user_info,
+        "region": user_info.get("Region") or user_info.get("region") or data.get("Region") or data.get("region") or "CN",
+        "aiRegion": user_info.get("AIRegion") or user_info.get("aiRegion") or data.get("AIRegion") or data.get("aiRegion") or "",
     }
 
 

@@ -69,20 +69,47 @@ def _json_loads_safe(value: str) -> dict:
 
 
 def _parse_oauth_params(query: dict) -> dict:
-    """从 Trae 授权回调 query 参数中解析凭证。"""
+    """解析 Trae 授权回调参数。
+
+    Trae 网页授权页实际会走两套流程：
+      1. 新流程 (code_challenge): callback 会带 authCodeInfo / code 等参数
+      2. 老流程 (refreshToken): callback 直接带 refreshToken=xxx
+    对于老流程，本地不会拥有 Cloud-IDE-JWT，需要拿到 refreshToken 后通过
+    oauth/ExchangeToken 向 api.trae.cn 兑换 Cloud-IDE-JWT。
+    """
     user_jwt = _json_loads_safe(query.get("userJwt", ""))
     token = user_jwt.get("Token") or user_jwt.get("token") or ""
-    if not token:
-        return {}
-    refresh = user_jwt.get("RefreshToken") or user_jwt.get("refreshToken") or query.get("refreshToken") or ""
+    refresh = user_jwt.get("RefreshToken") or user_jwt.get("refreshToken") or query.get("refreshToken") or query.get("data") or ""
     token_exp = user_jwt.get("TokenExpireAt") or user_jwt.get("tokenExpireAt") or ""
     refresh_exp = user_jwt.get("RefreshExpireAt") or user_jwt.get("refreshExpireAt") or query.get("refreshExpireAt") or ""
 
     user_info = _json_loads_safe(query.get("userInfo", ""))
-    user_id = user_info.get("UserID") or user_info.get("userId") or user_info.get("userID") or ""
-    region = user_info.get("Region") or user_info.get("region") or "CN"
+    user_id = user_info.get("UserID") or user_info.get("userId") or user_info.get("userID") or query.get("userId") or ""
+    region = user_info.get("Region") or user_info.get("region") or query.get("region") or "CN"
     ai_region = user_info.get("AIRegion") or user_info.get("aiRegion") or region
-    client_id = user_jwt.get("ClientID") or user_jwt.get("clientId") or ""
+    client_id = user_jwt.get("ClientID") or user_jwt.get("clientId") or query.get("clientID") or query.get("clientId") or query.get("client_id") or ""
+    host = query.get("host") or user_info.get("Host") or user_info.get("host") or ""
+
+    if not token and refresh:
+        exchange = _exchange_refresh_token(
+            refresh_token=refresh,
+            client_id=client_id or TRAE_CLIENT_ID,
+            host=host,
+        )
+        if exchange.get("token"):
+            token = exchange["token"]
+            refresh = exchange.get("refresh_token") or refresh
+            token_exp = exchange.get("expired_at") or token_exp
+            refresh_exp = exchange.get("refresh_expired_at") or refresh_exp
+            client_id = exchange.get("client_id") or client_id
+            host = exchange.get("host") or host
+            user_id = exchange.get("user_id") or user_id
+            user_info = exchange.get("user_info") or user_info
+            region = exchange.get("region") or region
+            ai_region = exchange.get("ai_region") or region
+
+    if not token:
+        return {}
 
     uid = user_id or ""
     return {
@@ -92,7 +119,7 @@ def _parse_oauth_params(query: dict) -> dict:
         "tenant_id": user_info.get("TenantID") or user_info.get("tenantId") or "",
         "region": region,
         "ai_region": ai_region,
-        "host": query.get("host", ""),
+        "host": host,
         "expired_at": str(token_exp) if token_exp else "",
         "refresh_expired_at": str(refresh_exp) if refresh_exp else "",
         "client_id": client_id,
@@ -105,6 +132,63 @@ def _parse_oauth_params(query: dict) -> dict:
         "user_region": query.get("userRegion") or user_info.get("UserRegion") or user_info.get("userRegion") or "",
         "user_identity": user_info.get("UserIdentity") or user_info.get("userIdentity") or "",
         "screen_name": user_info.get("ScreenName") or user_info.get("screenName") or "",
+    }
+
+async def _exchange_refresh_token(refresh_token: str, client_id: str, host: str = "") -> dict:
+    """使用 refreshToken 向 Trae CN 兑换 Cloud-IDE-JWT。
+
+    与 Trae 官网实现一致:
+      POST https://api.trae.cn/cloudide/api/v3/trae/oauth/ExchangeToken
+      {"ClientID":..., "RefreshToken":..., "ClientSecret":"-", "UserID":""}
+    """
+    if not refresh_token:
+        return {}
+    base = host or "https://api.trae.cn"
+    base = base.rstrip("/")
+    url = base + "/cloudide/api/v3/trae/oauth/ExchangeToken"
+    payload = {
+        "ClientID": client_id,
+        "RefreshToken": refresh_token,
+        "ClientSecret": "-",
+        "UserID": "",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(url, json=payload)
+            body = resp.text
+            status = resp.status_code
+    except Exception as e:
+        logger.warning("ExchangeToken failed: %s", e)
+        return {}
+
+    if status != 200:
+        logger.warning("ExchangeToken HTTP %s: %s", status, body[:500])
+        return {}
+
+    result = _json_loads_safe(body)
+    data = result.get("Result") or result.get("result") or result
+    if not isinstance(data, dict):
+        logger.warning("ExchangeToken unexpected result: %s", body[:500])
+        return {}
+
+    token = data.get("Token") or data.get("token") or data.get("AccessToken") or data.get("accessToken") or ""
+    if not token:
+        logger.warning("ExchangeToken missing Token: %s", body[:500])
+        return {}
+
+    refresh2 = data.get("RefreshToken") or data.get("refreshToken") or refresh_token
+    user_info = _json_loads_safe(str(data.get("UserInfo") or data.get("userInfo") or ""))
+    return {
+        "token": token,
+        "refresh_token": refresh2,
+        "expired_at": str(data.get("TokenExpireAt") or data.get("tokenExpireAt") or ""),
+        "refresh_expired_at": str(data.get("RefreshExpireAt") or data.get("refreshExpireAt") or ""),
+        "client_id": data.get("ClientID") or data.get("clientId") or client_id,
+        "host": host or base,
+        "user_id": user_info.get("UserID") or user_info.get("userId") or data.get("UserID") or data.get("userId") or "",
+        "user_info": user_info,
+        "region": user_info.get("Region") or user_info.get("region") or data.get("Region") or data.get("region") or "CN",
+        "ai_region": user_info.get("AIRegion") or user_info.get("aiRegion") or data.get("AIRegion") or data.get("aiRegion") or "",
     }
 
 
