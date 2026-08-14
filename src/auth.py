@@ -630,16 +630,30 @@ def _bootstrap_account_store() -> None:
         record['label'] = old.get('label') or record['label']
         _accounts[aid] = record
         _active_account = aid
-    elif not _active_account or _active_account not in _accounts:
+    if current.token:
+        # Store the valid env/authorize token in memory even if persistence failed.
+        pass
+    elif _active_account and _active_account in _accounts:
+        # Always load the selected account; treat as usable as long as it has a token.
+        _switch_record(_accounts[_active_account])
+    else:
+        # Prefer a valid account, but fall back to any account with a token so a
+        # fresh deploy with an expired-at field still becomes usable.
         for aid, rec in _accounts.items():
             if _record_valid(rec):
                 _active_account = aid
                 _switch_record(rec)
                 break
         else:
-            _active_account = next(iter(_accounts), '')
-            if _active_account:
-                _switch_record(_accounts[_active_account])
+            for aid, rec in _accounts.items():
+                if rec.get('token'):
+                    _active_account = aid
+                    _switch_record(rec)
+                    break
+            else:
+                _active_account = next(iter(_accounts), '')
+                if _active_account:
+                    _switch_record(_accounts[_active_account])
     _save_accounts()
 
 

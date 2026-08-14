@@ -41,6 +41,7 @@ IDE_ENDPOINTS = [
 
 # 外部模型名 -> Trae CN 内部模型名（基于最新 Trae CN 模型映射）
 MODEL_ALIASES = {
+    # OpenAI / Claude 外部名 -> Trae CN 内部模型名
     "auto": "glm-5.2",
     "glm-5.2": "glm-5.2",
     "claude-opus-4-7": "glm-5.2",
@@ -54,29 +55,45 @@ MODEL_ALIASES = {
     "claude-3.5-sonnet": "glm-5.2",
     "claude3.5": "glm-5.2",
     "aws_sdk_claude37_sonnet": "glm-5.2",
-    "mimo-v2.5-pro": "mimo-v2.5-pro",
-    "mimo-v2.5": "mimo-v2.5",
     "claude-haiku-4-5": "glm-5.1",
     "glm-5.1": "glm-5.1",
-    "qwen-3.7-plus": "qwen-3.7-plus",
+    "glm-5": "glm-5",
+    "glm-4.7": "glm-4.7",
+    "glm-4.6": "glm-4.6",
+    # Trae 真实模型名直通（保持原始大小写，web 上游按 config_name 精确匹配）
+    "DeepSeek-V4-Pro": "DeepSeek-V4-Pro",
+    "DeepSeek-V4-Flash": "DeepSeek-V4-Flash",
+    "DeepSeek-V4-Flash-Official": "DeepSeek-V4-Flash-Official",
+    "deepseek-v4-pro": "DeepSeek-V4-Pro",
+    "deepseek-v4-flash": "DeepSeek-V4-Flash",
     "kimi-k2.6": "kimi-k2.6",
+    "kimi-k3": "kimi-k3",
+    "kimi-k2.7-code": "kimi-k2.7-code",
+    "kimi-k2": "kimi-k2",
+    "qwen-3.7-plus": "qwen-3.7-plus",
+    "qwen-3.6-plus": "qwen-3.6-plus",
+    "qwen3.8-max": "qwen3.8-max",
+    "qwen3-coder": "qwen3-coder",
+    "minimax-m3": "minimax-m3",
+    "minimax-m2.7": "minimax-m2.7",
+    "minimax-m2.1": "minimax-m2.1",
+    "mimo-v2.5-pro": "mimo-v2.5-pro",
+    "mimo-v2.5": "mimo-v2.5",
+    "minimax-m25": "minimax-m25",
+    "qwen36-35b": "qwen36-35b",
+    "Doubao-Seed-2.1-Pro": "Doubao-Seed-2.1-Pro",
+    "Doubao-Seed-2.1-Turbo": "Doubao-Seed-2.1-Turbo",
+    "Doubao-Seed-Code": "Doubao-Seed-Code",
+    "doubao-seed-2.1-pro": "Doubao-Seed-2.1-Pro",
+    "doubao-seed-2.1-turbo": "Doubao-Seed-2.1-Turbo",
+    "doubao-seed-code": "Doubao-Seed-Code",
     "gpt-4o": "DeepSeek-V4-Pro",
     "gpt-4o-latest": "DeepSeek-V4-Pro",
     "gpt-4.1": "DeepSeek-V4-Pro",
     "deepseek-v3": "DeepSeek-V4-Pro",
     "deepseek-r1": "DeepSeek-V4-Pro",
-    "deepseek-v4-pro": "DeepSeek-V4-Pro",
-    "glm-5": "glm-5",
-    "qwen-3.6-plus": "qwen-3.6-plus",
-    "minimax-m3": "minimax-m3",
     "gpt-4o-mini": "DeepSeek-V4-Flash",
-    "deepseek-v4-flash": "DeepSeek-V4-Flash",
-    "glm-4.7": "glm-4.7",
-    "kimi-k2": "kimi-k2",
-    "qwen3-coder": "qwen3-coder",
-    "minimax-m2.7": "minimax-m2.7",
-    "glm-4.6": "glm-4.6",
-    "minimax-m2.1": "minimax-m2.1",
+    "deepseek-v4-flash-official": "DeepSeek-V4-Flash-Official",
     "work": "work",
 }
 
@@ -139,8 +156,13 @@ def get_current_device() -> DeviceInfo:
 
 
 def convert_model_name(model: str) -> str:
-    """把 OpenAI/Claude 风格模型名转成 Trae CN 内部模型名。"""
-    m = (model or "").strip().lower()
+    """Map OpenAI/Claude-style names to Trae CN internal names.
+
+    Preserve exact case for known upstream model names (the web upstream
+    matches custom_model.config_name precisely)."""
+    if not model:
+        return model
+    m = model.strip().lower()
     return _ALIAS_LOOKUP.get(m, model)
 
 
@@ -458,7 +480,13 @@ async def _fetch_web_model_configs() -> dict[str, dict]:
 
 
 async def _get_web_custom_model(model_name: str) -> Optional[dict]:
-    """Return custom_model for a manual web model selection."""
+    """Return custom_model for a manual web model selection.
+
+    Lookup priority:
+      1. exact config name (e.g. DeepSeek-V4-Flash-Official)
+      2. case-insensitive config/display name (e.g. "DeepSeek-V4-Flash 正式版")
+      3. legacy synthetic fallbacks for custom-openai models
+    """
     if not model_name:
         return None
     account_key = auth.get_user_id() or auth.get_token()[:16] or "default"
@@ -468,10 +496,25 @@ async def _get_web_custom_model(model_name: str) -> Optional[dict]:
         configs = await _fetch_web_model_configs()
         cached = (now, configs)
         _WEB_MODEL_CACHE[account_key] = cached
-    cfg = cached[1].get(model_name)
+
+    configs = cached[1]
+    cfg = configs.get(model_name)
     if cfg is not None:
         return cfg
+
     lowered = model_name.lower()
+    for name, candidate in configs.items():
+        if name.lower() == lowered:
+            return candidate
+    for name, candidate in configs.items():
+        display = (candidate.get("display_name") or candidate.get("display_model_name") or "").strip()
+        if display and (display.lower() == lowered or display == model_name):
+            return candidate
+    for name, candidate in configs.items():
+        display = (candidate.get("display_name") or "").strip()
+        if display and lowered in (display.lower(), display.replace(" ", "-").lower()):
+            return candidate
+
     if lowered in ("mimo-v2.5", "mimo-v2.5-pro", "minimax-m25", "qwen36-35b"):
         return {
             "name": model_name,
@@ -774,16 +817,34 @@ def _static_model_list(created: int) -> list[dict]:
 
 
 async def get_models(force: bool = False) -> list[dict]:
-    """返回模型列表。
+    """Return the model list for /v1/models.
 
-    默认使用内置模型表。TRAE_FETCH_MODEL_LIST=true 时尝试从上游获取，
-    结果缓存 TRAE_MODEL_LIST_CACHE_TTL 秒；force=True 时跳过缓存强制刷新。
+    With TRAE_FETCH_MODEL_LIST=true it fetches real upstream model names;
+    otherwise it returns the built-in aliases.  The web upstream model list
+    (config names) is always merged into the built-in list so new models such
+    as DeepSeek-V4-Flash 正式版 / DeepSeek-V4-Flash-Official show up without a
+    code change.
     """
     created = int(time.time())
     cache_key = auth.get_user_id() or auth.get_token()[:16] or "default"
 
+    # Always include the built-in aliases.
+    items = _static_model_list(created)
+
     if os.environ.get("TRAE_FETCH_MODEL_LIST", "").lower() != "true":
-        return _static_model_list(created)
+        try:
+            configs = await _fetch_web_model_configs()
+        except Exception as e:
+            logger.warning("trae-client: web model list fetch failed: %s", e)
+            configs = {}
+        merged = {m["id"]: m for m in items}
+        for name, cfg in configs.items():
+            if name and name not in merged:
+                merged[name] = {"id": name, "object": "model", "created": created, "owned_by": "trae"}
+            display = cfg.get("display_name") or cfg.get("display_model_name") or ""
+            if display and display not in merged:
+                merged[display] = {"id": display, "object": "model", "created": created, "owned_by": "trae"}
+        return sorted(merged.values(), key=lambda m: m["id"].lower())
 
     cached = _MODEL_LIST_CACHE.get(cache_key)
     if not force and cached and time.time() - cached[0] < _MODEL_LIST_CACHE_TTL:
