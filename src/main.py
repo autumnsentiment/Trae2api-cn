@@ -455,16 +455,11 @@ function uuid() {{ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g
 function randomHex(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('') }}
 function randomDigits(n) {{ var s='';while(s.length<n)s+=Math.floor(Math.random()*1e10).toString();return s.slice(0,n) }}
 function randomBase64Url(n) {{ var a=new Uint8Array(n); if(window.crypto&&crypto.getRandomValues){{ crypto.getRandomValues(a) }} else {{ for(var i=0;i<n;i++)a[i]=Math.floor(Math.random()*256) }} return btoa(String.fromCharCode.apply(null,a)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
-function _sha256Bytes(ascii) {{ var K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]; var i; var h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a,h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19; ascii=unescape(encodeURIComponent(ascii)); var msg=[]; for(i=0;i<ascii.length;i++)msg.push(ascii.charCodeAt(i)); msg.push(0x80); while(msg.length%64!==56)msg.push(0); var bitlen=ascii.length*8; var hi=Math.floor(bitlen/4294967296), lo=bitlen>>>0; for(i=3;i>=0;i--)msg.push((hi>>>(i*8))&255); for(i=3;i>=0;i--)msg.push((lo>>>(i*8))&255); for(var o=0;o<msg.length;o+=64) {{ var w=new Array(64); for(i=0;i<16;i++)w[i]=(msg[o+i*4]<<24)|(msg[o+i*4+1]<<16)|(msg[o+i*4+2]<<8)|(msg[o+i*4+3]); for(i=16;i<64;i++) {{ var s0=((w[i-15]>>>7)|(w[i-15]<<25))^((w[i-15]>>>18)|(w[i-15]<<14))^(w[i-15]>>>3); var s1=((w[i-2]>>>17)|(w[i-2]<<15))^((w[i-2]>>>19)|(w[i-2]<<13))^(w[i-2]>>>10); w[i]=(w[i-16]+s0+w[i-7]+s1)>>>0 }} var a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7; for(i=0;i<64;i++) {{ var S1=((e>>>6)|(e<<26))^((e>>>11)|(e<<21))^((e>>>25)|(e<<7)); var ch=(e&f)^((~e)&g); var t1=(h+S1+ch+K[i]+w[i])>>>0; var S0=((a>>>2)|(a<<30))^((a>>>13)|(a<<19))^((a>>>22)|(a<<10)); var maj=(a&b)^(a&c)^(b&c); var t2=(S0+maj)>>>0; h=g; g=f; f=e; e=(d+t1)>>>0; d=c; c=b; b=a; a=(t1+t2)>>>0 }} h0=(h0+a)>>>0; h1=(h1+b)>>>0; h2=(h2+c)>>>0; h3=(h3+d)>>>0; h4=(h4+e)>>>0; h5=(h5+f)>>>0; h6=(h6+g)>>>0; h7=(h7+h)>>>0 }} return [h0,h1,h2,h3,h4,h5,h6,h7] }}
-function sha256Hex(str) {{ var hb=_sha256Bytes(str); var out=''; for(var i=0;i<8;i++) {{ var v=hb[i]; for(var b=3;b>=0;b--) {{ var by=(v>>>(b*8))&255; out+=((by<16)?'0':'')+by.toString(16) }} }} return out }}
-function sha256Base64Url(str) {{ var hb=_sha256Bytes(str); var bytes=new Uint8Array(32); for(var i=0;i<8;i++) {{ bytes[i*4]=(hb[i]>>>24)&255; bytes[i*4+1]=(hb[i]>>>16)&255; bytes[i*4+2]=(hb[i]>>>8)&255; bytes[i*4+3]=hb[i]&255 }} var s=''; for(var i=0;i<32;i++)s+=String.fromCharCode(bytes[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
-
 function buildChallenge() {{ currentCodeVerifier=randomBase64Url(32); return sha256Base64Url(currentCodeVerifier) }}
 async function buildAuthUrl() {{
   // Trae 授权页强制要求回调为 http://127.0.0.1:<port>/authorize，
   // 因此必须由本机 web_login.py 监听并转发凭据到服务器。
   var cb = 'http://127.0.0.1:{listener_port}/authorize';
-  var challenge = await buildChallenge();
   var mid = randomHex(32), did = randomDigits(19), tid = state.traceId;
   var p = new URLSearchParams({{
     login_version:'1',auth_from:'solo',login_channel:'native_ide',plugin_version:'2.3.24254',
@@ -472,7 +467,6 @@ async function buildAuthUrl() {{
     auth_callback_url:cb,machine_id:mid,device_id:did,x_device_id:did,x_machine_id:mid,
     x_device_brand:'ASUS TUF Gaming A15 FA507RM_FA507RM',x_device_type:'windows',x_os_version:'Windows 10 Pro',x_env:'',
     x_app_version:'3.3.65',x_app_type:'stable',hide_saas_login:'true',
-    code_challenge:challenge,code_challenge_method:'S256'
   }});
   return '{auth_url}?'+p.toString();
 }}
