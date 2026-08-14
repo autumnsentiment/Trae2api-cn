@@ -68,7 +68,7 @@ def _json_loads_safe(value: str) -> dict:
         return {}
 
 
-def _parse_oauth_params(query: dict) -> dict:
+async def _parse_oauth_params(query: dict) -> dict:
     """解析 Trae 授权回调参数。
 
     Trae 网页授权页实际会走两套流程：
@@ -91,7 +91,7 @@ def _parse_oauth_params(query: dict) -> dict:
     host = query.get("host") or user_info.get("Host") or user_info.get("host") or ""
 
     if not token and refresh:
-        exchange = _exchange_refresh_token(
+        exchange = await _exchange_refresh_token(
             refresh_token=refresh,
             client_id=client_id or TRAE_CLIENT_ID,
             host=host,
@@ -947,7 +947,7 @@ async def web_login_download(as_param: str = Query("", alias="as")):
 
 @app.get("/authorize", response_class=HTMLResponse)
 async def oauth_callback(request: Request):
-    parsed = _parse_oauth_params(dict(request.query_params))
+    parsed = await _parse_oauth_params(dict(request.query_params))
     trace_id = request.query_params.get("loginTraceID") or request.query_params.get("login_trace_id") or ""
     if not parsed.get("token"):
         return HTMLResponse(
