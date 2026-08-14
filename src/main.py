@@ -52,7 +52,7 @@ WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru
 
 # Web login auth
 TRAE_AUTH_URL = os.environ.get("TRAE_AUTH_URL", "https://www.trae.cn/authorization")
-TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID", "ono9krqynydwx5")
+TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID") or "ono9krqynydwx5"
 LOCAL_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
 PUBLIC_PATHS = {"/healthz", "/v1/status", "/web/login", "/authorize", "/api/web-auth"}
 PUBLIC_PATHS = {"/healthz", "/v1/status", "/v1/models", "/web/login", "/web/login/download", "/authorize", "/api/web-auth", "/api/logout", "/api/accounts", "/api/accounts/switch", "/api/accounts/remove", "/api/settings", "/api/polling"}
