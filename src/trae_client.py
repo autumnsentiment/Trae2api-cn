@@ -31,6 +31,8 @@ IDE_VERSION_CODE = os.environ.get("TRAE_IDE_VERSION_CODE", "20260401")
 IDE_VERSION_CODE_NUM = int(os.environ.get("TRAE_IDE_VERSION_CODE_NUM", "20260401") or 20260401)
 IDE_APP_ID = os.environ.get("TRAE_APP_ID", "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8")
 TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID", "ono9krqynydwx5")
+TRAE_UG_API_HOST = os.environ.get("TRAE_UG_API_HOST", "https://api.trae.cn")
+TRAE_PAY_API_HOST = os.environ.get("TRAE_PAY_API_HOST", "https://api.trae.cn")
 
 # 按优先级依次尝试的 IDE 版上游端点（参考 laojichao/trae-local-api）
 IDE_ENDPOINTS = [
@@ -252,6 +254,187 @@ def build_headers() -> dict[str, str]:
         "User-Agent": "",
     }
 
+
+# Cache of checkin device ids per account. The upstream checkin API is
+# device-scoped and rate limits the claim endpoint per account (code 9074).
+# Keeping one stable id per account avoids looking like a new device each
+# time, while allowing a delayed retry when the account was recently used.
+_CHECKIN_DEVICE_IDS: dict[str, str] = {}
+_CHECKIN_LAST_CLAIM: dict[str, float] = {}
+
+def checkin_device_id_for(token: str) -> str:
+    """Return a stable, account-bound device id for the daily-checkin API.
+
+    A deterministic id per JWT is used so the account keeps a consistent
+    device fingerprint across restarts. Upstream requires a 16-digit id.
+    """
+    if not token:
+        return ""
+    if token in _CHECKIN_DEVICE_IDS:
+        return _CHECKIN_DEVICE_IDS[token]
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    did = str(int(digest, 16) % 10**16).zfill(16)
+    _CHECKIN_DEVICE_IDS[token] = did
+    return did
+
+def build_checkin_headers(token: str) -> dict[str, str]:
+    """Build headers for the client daily-checkin API."""
+    return {
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "Content-Type": "application/json",
+        "x-device-id": checkin_device_id_for(token),
+        "x-device-brand": "ASUS TUF Gaming A15 FA507RM_FA507RM",
+        "x-device-type": "windows",
+    }
+
+async def fetch_checkin_credits_status(token: str = "") -> dict:
+    """Query daily checkin credits status, returns the original JSON data."""
+    return await _post_checkin("/trae/api/v2/ug/checkin_credits/status", token)
+
+async def claim_checkin_credits(token: str = "") -> dict:
+    """Claim today's checkin credits. Server returns code=0 even if already checked.
+
+    Upstream limits claim requests per account/device with business code 9074
+    ("operation too frequent"). The real client responds by trying again after
+    a short delay, so we do the same here before returning the result.
+    """
+    if not token:
+        token = auth.get_token()
+    data = await _post_checkin("/trae/api/v2/ug/checkin_credits/claim", token)
+    code = data.get("code")
+    # 9074 = too frequent; 9095 = already checked in today (a no-op success).
+    if code == 9074:
+        now = time.time()
+        last = _CHECKIN_LAST_CLAIM.get(token, 0)
+        wait = 8.0
+        if now - last < wait:
+            await asyncio.sleep(wait - (now - last) + 1.0)
+        else:
+            await asyncio.sleep(2.0)
+        _CHECKIN_LAST_CLAIM[token] = time.time()
+        data = await _post_checkin("/trae/api/v2/ug/checkin_credits/claim", token)
+    return data
+
+async def _post_checkin(path: str, token: str = "") -> dict:
+    if not token:
+        token = auth.get_token()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
+    base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
+    url = f"{base}{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json={}, headers=build_checkin_headers(token))
+        text = resp.text
+        if resp.status_code != 200:
+            raise RuntimeError(f"Trae checkin [{resp.status_code}]: {text[:500]}")
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Trae checkin invalid json: {e}") from e
+
+        # Upstream uses business codes in a 200 response. Distinguish "already
+        # checked in today" (a successful no-op) from genuine rate limiting so
+        # the UI and account polling can report the real state.
+        code = data.get("code")
+        if code == 9095:
+            # "already checked in today" is a successful no-op, not a failure.
+            data = dict(data)
+            data["checked_in"] = True
+            data["success"] = True
+            data["message"] = data.get("message") or "??????????"
+        elif code == 9074:
+            # Preserve the upstream code so retry paths can react to rate
+            # limiting; everything else is passed through as-is.
+            data = dict(data)
+            data["_error_code"] = code
+        return data
+
+async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
+    """Fetch account credits/entitlement usage from the IDE pay API.
+
+    req_source=1 returns general IDE credits, req_source=2 returns work-specific credits.
+    This returns the same data the Trae CN client shows for total account
+    credits (not the daily-checkin bonus credits field).
+    """
+    if not token:
+        token = auth.get_token()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
+    base = os.environ.get("TRAE_PAY_API_HOST", TRAE_PAY_API_HOST).rstrip("/")
+    url = f"{base}/trae/api/v2/pay/ide_user_ent_usage"
+    payload = {"require_usage": True, "req_source": req_source}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json=payload, headers=build_checkin_headers(token))
+        text = resp.text
+        if resp.status_code != 200:
+            raise RuntimeError(f"Trae pay credits [{resp.status_code}]: {text[:500]}")
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Trae pay credits invalid json: {e}") from e
+        if data.get("code") is not None and data.get("code") != 0:
+            raise RuntimeError(f"Trae pay credits: {data.get('message') or data}")
+        return data
+
+def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> dict:
+    """Parse total account credits from the entitlement pack list.
+
+    Only counts packs with product_type=2 (actual credits), skipping
+    product_type=0 (feature flag packs) that have no credits_limit.
+
+    When available_endpoint_filter is set, only packs with that value
+    for entitlement_base_info.available_endpoint are counted:
+      - 0 = general IDE credits
+      - 1 = work-specific credits
+    This is needed because req_source=2 returns ALL packs (same as req_source=0),
+    not just work-specific packs.
+    """
+    packs = data.get("user_entitlement_pack_list") or []
+    total_limit = 0
+    used = 0
+    unlimited = False
+    for pack in packs:
+        bi = pack.get("entitlement_base_info") or {}
+        ae = bi.get("available_endpoint", -1)
+        # If filtering by endpoint, skip packs that don't match
+        if available_endpoint_filter is not None and ae != available_endpoint_filter:
+            continue
+        usage = pack.get("usage") or {}
+        quota = bi.get("quota") or {}
+        limit = quota.get("credits_limit")
+        if limit is None:
+            continue  # skip feature-only packs (product_type=0)
+        amount = usage.get("credits_amount") or 0
+        if limit == -1:
+            unlimited = True
+            total_limit = -1
+        elif isinstance(limit, (int, float)):
+            total_limit += int(limit)
+        if isinstance(amount, (int, float)):
+            used += int(amount)
+    remaining = None if unlimited else max(total_limit - used, 0)
+    return {
+        "total_limit": total_limit,
+        "used": used,
+        "remaining": remaining,
+        "unlimited": unlimited,
+        "is_credits_billing": bool(data.get("is_credits_billing")),
+        "packs": len(packs),
+    }
+
+
+async def fetch_account_work_credits(token: str = "") -> dict:
+    """Fetch work-specific account credits.
+
+    req_source=2 returns ALL packs (same as req_source=0), not just work.
+    So we fetch req_source=0 and filter by available_endpoint=1 in parse.
+    Returns the raw API response for downstream parse_account_credits(data, ae_filter=1).
+    """
+    return await fetch_account_credits(token, req_source=0)
+
+async def fetch_account_total_credits(token: str = "") -> dict:
+    """Fetch all account credits (all packs, both general and work)."""
+    return await fetch_account_credits(token, req_source=0)
 
 def build_web_headers(token: str) -> dict[str, str]:
     """构造参考 OmniRoute 网页版 remote 会话的请求头。"""

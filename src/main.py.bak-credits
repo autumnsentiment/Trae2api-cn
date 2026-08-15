@@ -16,7 +16,6 @@ import html as html_mod
 import json
 import logging
 import os
-import time
 import secrets
 import uuid as uuid_mod
 from contextlib import asynccontextmanager
@@ -52,22 +51,12 @@ FORWARD_USAGE = (os.environ.get("FORWARD_USAGE", "true") or "true").lower() == "
 CHECKIN_INTERVAL = float(os.environ.get("TRAE_CHECKIN_INTERVAL_SECONDS", "60") or "60")
 WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
 
-# Last request usage tracking (in-memory, for web UI display)
-_LAST_USAGE: dict = {
-    "account_id": "",
-    "model": "",
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0,
-    "timestamp": 0,
-}
-
 # Web login auth
 TRAE_AUTH_URL = os.environ.get("TRAE_AUTH_URL", "https://www.trae.cn/authorization")
 TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID") or "ono9krqynydwx5"
 LOCAL_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
 PUBLIC_PATHS = {"/healthz", "/v1/status", "/web/login", "/authorize", "/api/web-auth"}
-PUBLIC_PATHS = {"/healthz", "/v1/status", "/v1/models", "/web/login", "/web/login/download", "/authorize", "/api/web-auth", "/api/logout", "/api/accounts", "/api/accounts/switch", "/api/accounts/remove", "/api/settings", "/api/polling", "/api/polling-mode", "/api/checkin/status", "/api/checkin/claim", "/api/checkin/accounts", "/api/checkin/claim-all", "/api/checkin/claim-credits", "/api/checkin/account", "/api/checkin/work-credits", "/api/usage/last"}
+PUBLIC_PATHS = {"/healthz", "/v1/status", "/v1/models", "/web/login", "/web/login/download", "/authorize", "/api/web-auth", "/api/logout", "/api/accounts", "/api/accounts/switch", "/api/accounts/remove", "/api/settings", "/api/polling", "/api/checkin/status", "/api/checkin/claim", "/api/checkin/accounts", "/api/checkin/claim-all", "/api/checkin/account"}
 PUBLIC_PATH_PREFIXES = ("/api/checkin", "/api/accounts")
 WEB_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "web_login.py"
 
@@ -269,23 +258,6 @@ def _web_login_html() -> str:
       <code>{polling.get('account_count', 0)}</code>
     </div>"""
 
-    # 最近一次请求的扣费记录（内存中，无历史）
-    last_usage = _LAST_USAGE
-    if last_usage.get("account_id"):
-        last_html = f"""
-    <div class="status-row" id="last-usage-row">
-      <span class="label">最近请求</span>
-      <code id="last-usage-text">账号: {html_mod.escape(str(last_usage.get("account_id",""))[-12:])} | 模型: {html_mod.escape(last_usage.get("model",""))} | 扣费: {last_usage.get("prompt_tokens",0)}+{last_usage.get("completion_tokens",0)}={last_usage.get("total_tokens",0)} tokens</code>
-    </div>"""
-    else:
-        last_html = """
-    <div class="status-row" id="last-usage-row" style="display:none">
-      <span class="label">最近请求</span>
-      <code id="last-usage-text"></code>
-    </div>"""
-
-    status_html = status_html + last_html
-
     # 账号列表
     rows = ""
     for acc in accounts:
@@ -298,28 +270,8 @@ def _web_login_html() -> str:
         label = acc.get("label") or acc.get("user_id") or aid
         uid = acc.get("user_id") or aid
         expires = (acc.get("expires") or "")[:16]
-        acct_credits = acc.get("account_credits") or {}
-        if acct_credits.get("unlimited"):
-            credits_text = "\u2606 \u65e0\u9650"
-        elif acct_credits.get("remaining") is not None:
-            credits_text = f"\u5269{acct_credits['remaining']}/\u603b{acct_credits.get('total_limit','?')}"
-        else:
-            credits_text = "-"
-        work_acct = acc.get("work_credits") or {}
-        if work_acct.get("unlimited"):
-            work_credits_text = "☆ 无限"
-        elif work_acct.get("remaining") is not None:
-            work_credits_text = f"剩{work_acct['remaining']}/总{work_acct.get('total_limit','?')}"
-        else:
-            work_credits_text = "-"
-        total = acc.get("total_credits") or {}
-        if total.get("unlimited"):
-            total_credits_text = "☆ 无限"
-        elif total.get("remaining") is not None:
-            total_credits_text = f"剩{total['remaining']}/总{total.get('total_limit','?')}"
-        else:
-            total_credits_text = "-"
         credits = acc.get("credits")
+        credits_text = "-" if credits is None else str(credits)
         checked_in = acc.get("checked_in")
         if checked_in is True:
             checkin_badge = '<span class="badge badge-ok">已签到</span>'
@@ -332,9 +284,7 @@ def _web_login_html() -> str:
           <td><code>{html_mod.escape(uid)}</code></td>
           <td>{st} {act}</td>
           <td style="font-size:12px;color:#9aa0b0">{html_mod.escape(expires)}</td>
-          <td><span id="credits-{html_mod.escape(aid)}" style="font-size:12px">{credits_text}</span></td>
-          <td><span id="work-credits-{html_mod.escape(aid)}" style="font-size:12px">{work_credits_text}</span></td>
-          <td><span id="total-credits-{html_mod.escape(aid)}" style="font-size:12px">{total_credits_text}</span></td>
+          <td><span id="credits-{html_mod.escape(aid)}">{credits_text}</span></td>
           <td><span id="checkin-{html_mod.escape(aid)}">{checkin_badge}</span></td>
           <td>
             <button class="btn btn-ghost btn-sm" onclick="checkinAccount('{html_mod.escape(aid)}')">签到</button>
@@ -351,7 +301,7 @@ def _web_login_html() -> str:
             <span id="checkin-msg" class="msg" style="margin-top:0;padding:5px 10px"></span>
           </div>
           <table class="acct-table">
-            <thead><tr><th>标签</th><th>用户ID</th><th>状态</th><th>有效期</th><th>通用积分</th><th>Work积分</th><th>总积分</th><th>签到</th><th>操作</th></tr></thead>
+            <thead><tr><th>标签</th><th>用户ID</th><th>状态</th><th>有效期</th><th>积分</th><th>签到</th><th>操作</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </div>"""
@@ -365,8 +315,6 @@ def _web_login_html() -> str:
     settings_web = settings.get("web_base_url") or WEB_BASE
     settings_port = settings.get("relay_port") or PORT
     poll_checked = 'checked' if polling.get("enabled") else ''
-    poll_mode_rr = 'checked' if polling.get('mode', 'round-robin') == 'round-robin' else ''
-    poll_mode_cp = 'checked' if polling.get('mode') == 'credit-priority' else ''
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -510,15 +458,6 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
   <input type="checkbox" id="poll-toggle" {poll_checked} onchange="togglePolling()">
   <label for="poll-toggle" style="cursor:pointer">启用轮询（每次请求自动切换下一个有效账号）</label>
 </div>
-<div class="check-row" style="margin-top:4px">
-  <span class="label" style="margin-right:8px">轮询模式:</span>
-  <label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;cursor:pointer">
-    <input type="radio" name="poll-mode" value="round-robin" onchange="togglePolling()" {poll_mode_rr}> 顺序轮询
-  </label>
-  <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-    <input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}> 积分优先
-  </label>
-</div>
 <p id="poll-status" style="font-size:12px;color:#9aa0b0;margin-top:4px">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
 <hr>
 <div class="section-title">自定义 URL / 端口</div>
@@ -596,20 +535,6 @@ async function startAuth() {{
   }} catch(e) {{ showMsg('auth-msg',String(e),false); document.getElementById('loading').style.display='none'; document.getElementById('auth-btn').disabled=false; }}
 }}
 
-async function refreshLastUsage() {{
-  try {{
-    var r = await fetch('/api/usage/last');
-    var d = await r.json();
-    if (d && d.success && d.usage && d.usage.account_id) {{
-      var row = document.getElementById('last-usage-row');
-      var text = document.getElementById('last-usage-text');
-      if (row) row.style.display = '';
-      if (text) text.textContent = '账号: ' + String(d.usage.account_id).slice(-12) + ' | 模型: ' + d.usage.model + ' | 扣费: ' + (d.usage.prompt_tokens||0) + '+' + (d.usage.completion_tokens||0) + '=' + (d.usage.total_tokens||0) + ' tokens';
-    }}
-  }} catch(e) {{}}
-}}
-setInterval(refreshLastUsage, 5000);
-refreshLastUsage();
 window.addEventListener('message',function(ev){{
   if (!ev.data||ev.data.type!=='trae-relay-web-login') return;
   if (state.traceId&&ev.data.loginTraceId!==state.traceId) return;
@@ -661,11 +586,9 @@ async function removeAccount(id){{
 }}
 async function togglePolling(){{
   var on=document.getElementById('poll-toggle').checked;
-  var mode=document.querySelector('input[name=poll-mode]:checked');
-  var modeVal=mode?mode.value:'round-robin';
-  var d=await postJSON('/api/polling',{{enabled:on,mode:modeVal}});
+  var d=await postJSON('/api/polling',{{enabled:on}});
   if(d.success) location.reload();
-  else showMsg('auth-msg',d.error||'操作失败',false);
+  else showMsg('auth-msg',d.error||'设置失败',false);
 }}
 async function saveSettings(){{
   var web=document.getElementById('settings-web').value.trim();
@@ -684,27 +607,8 @@ async function checkinRefreshAll(){{
     for(var i=0;i<accounts.length;i++){{
       var a=accounts[i];
       var creditsEl=document.getElementById('credits-'+a.id);
-      var workCreditsEl=document.getElementById('work-credits-'+a.id);
-      var totalCreditsEl=document.getElementById('total-credits-'+a.id);
       var checkinEl=document.getElementById('checkin-'+a.id);
-      if(creditsEl){{
-        var gc=a.account_credits||{{}};
-        if(gc.unlimited) creditsEl.textContent='☆ 无限';
-        else if(gc.remaining!==undefined) creditsEl.textContent='剩'+gc.remaining+'/总'+gc.total_limit;
-        else creditsEl.textContent='-';
-      }}
-      if(workCreditsEl){{
-        var wc=a.work_credits||{{}};
-        if(wc.unlimited) workCreditsEl.textContent='☆ 无限';
-        else if(wc.remaining!==undefined) workCreditsEl.textContent='剩'+wc.remaining+'/总'+wc.total_limit;
-        else workCreditsEl.textContent='-';
-      }}
-      if(totalCreditsEl){{
-        var tc=a.total_credits||{{}};
-        if(tc.unlimited) totalCreditsEl.textContent='☆ 无限';
-        else if(tc.remaining!==undefined) totalCreditsEl.textContent='剩'+tc.remaining+'/总'+tc.total_limit;
-        else totalCreditsEl.textContent='-';
-      }}
+      if(creditsEl) creditsEl.textContent=(a.credits===undefined||a.credits===null)?'-':a.credits;
       if(checkinEl){{
         var checked=a.checked_in;
         checkinEl.innerHTML=checked===true?'<span class="badge badge-ok">已签到</span>':(checked===false?'<span class="badge badge-active">未签到</span>':'<span class="badge badge-none">未知</span>');
@@ -720,27 +624,8 @@ async function checkinAccount(id){{
     var d=await r.json();
     if(!d||!d.success){{ throw new Error((d&&d.error)||('HTTP '+r.status)); }}
     var creditsEl=document.getElementById('credits-'+id);
-    var workCreditsEl=document.getElementById('work-credits-'+id);
-    var totalCreditsEl=document.getElementById('total-credits-'+id);
     var checkinEl=document.getElementById('checkin-'+id);
-    if(creditsEl){{
-      var gc=d.account_credits||{{}};
-      if(gc.unlimited) creditsEl.textContent='☆ 无限';
-      else if(gc.remaining!==undefined) creditsEl.textContent='剩'+gc.remaining+'/总'+gc.total_limit;
-      else creditsEl.textContent='-';
-    }}
-    if(workCreditsEl){{
-      var wc=d.work_credits||{{}};
-      if(wc.unlimited) workCreditsEl.textContent='☆ 无限';
-      else if(wc.remaining!==undefined) workCreditsEl.textContent='剩'+wc.remaining+'/总'+wc.total_limit;
-      else workCreditsEl.textContent='-';
-    }}
-    if(totalCreditsEl){{
-      var tc=d.total_credits||{{}};
-      if(tc.unlimited) totalCreditsEl.textContent='☆ 无限';
-      else if(tc.remaining!==undefined) totalCreditsEl.textContent='剩'+tc.remaining+'/总'+tc.total_limit;
-      else totalCreditsEl.textContent='-';
-    }}
+    if(creditsEl) creditsEl.textContent=(d.credits===undefined||d.credits===null)?'-':d.credits;
     if(checkinEl) checkinEl.innerHTML=d.checked_in===true?'<span class="badge badge-ok">已签到</span>':'<span class="badge badge-active">未签到</span>';
     showMsg('checkin-msg','签到成功',true);
   }}catch(e){{ showMsg('checkin-msg',String(e),false); }}
@@ -756,27 +641,8 @@ async function checkinClaimAll(){{
     for(var i=0;i<accounts.length;i++){{
       var a=accounts[i];
       var creditsEl=document.getElementById('credits-'+a.id);
-      var workCreditsEl=document.getElementById('work-credits-'+a.id);
-      var totalCreditsEl=document.getElementById('total-credits-'+a.id);
       var checkinEl=document.getElementById('checkin-'+a.id);
-      if(creditsEl){{
-        var gc=a.account_credits||{{}};
-        if(gc.unlimited) creditsEl.textContent='☆ 无限';
-        else if(gc.remaining!==undefined) creditsEl.textContent='剩'+gc.remaining+'/总'+gc.total_limit;
-        else creditsEl.textContent='-';
-      }}
-      if(workCreditsEl){{
-        var wc=a.work_credits||{{}};
-        if(wc.unlimited) workCreditsEl.textContent='☆ 无限';
-        else if(wc.remaining!==undefined) workCreditsEl.textContent='剩'+wc.remaining+'/总'+wc.total_limit;
-        else workCreditsEl.textContent='-';
-      }}
-      if(totalCreditsEl){{
-        var tc=a.total_credits||{{}};
-        if(tc.unlimited) totalCreditsEl.textContent='☆ 无限';
-        else if(tc.remaining!==undefined) totalCreditsEl.textContent='剩'+tc.remaining+'/总'+tc.total_limit;
-        else totalCreditsEl.textContent='-';
-      }}
+      if(creditsEl) creditsEl.textContent=(a.credits===undefined||a.credits===null)?'-':a.credits;
       if(checkinEl) checkinEl.innerHTML=a.checked_in===true?'<span class="badge badge-ok">已签到</span>':'<span class="badge badge-active">未签到</span>';
     }}
     showMsg('checkin-msg','轮询签到完成',true);
@@ -853,34 +719,11 @@ def _sse_headers() -> dict:
     }
 
 
-def _track_usage_from_result(result: dict, model: str) -> None:
-    """Extract usage from non-stream response and record."""
-    usage = result.get("usage") or {}
-    account_id = auth.get_user_id() or auth.get_token()[:16] or "default"
-    _record_usage(account_id, model, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-
-def _track_usage_from_chunk(chunk: str, model: str) -> None:
-    """Parse SSE chunk for usage and record."""
-    if not chunk.startswith("data: "):
-        return
-    try:
-        data = json.loads(chunk[len("data: "):].strip())
-    except Exception:
-        return
-    usage = data.get("usage")
-    if not usage:
-        return
-    account_id = auth.get_user_id() or auth.get_token()[:16] or "default"
-    _record_usage(account_id, model, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-
 async def run_cli_chat(messages, model, stream: bool):
     """本地 Trae CLI 子进程上游。"""
     event_iter = cli_client.stream_cli_chat(messages, model)
     if not stream:
         result = await collect_nonstream_cli(event_iter, model)
-        _track_usage_from_result(result, model)
         return JSONResponse(content=result)
 
     first, rest = await _peek_async(event_iter)
@@ -898,7 +741,6 @@ async def run_cli_chat(messages, model, stream: bool):
             async for item in rest:
                 yield item
         async for chunk in translate_cli_stream(chain(), model, FORWARD_USAGE):
-            _track_usage_from_chunk(chunk, model)
             yield chunk
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
@@ -918,7 +760,6 @@ async def run_web_session(messages, model, stream: bool):
             async def gen():
                 try:
                     async for chunk in translate_web_events(event_iter, model, FORWARD_USAGE):
-                        _track_usage_from_chunk(chunk, model)
                         yield chunk
                 finally:
                     # Actively interrupt the upstream session so it stops
@@ -934,7 +775,6 @@ async def run_web_session(messages, model, stream: bool):
             )
         try:
             result = await collect_nonstream_web(event_iter, model)
-            _track_usage_from_result(result, model)
             return JSONResponse(content=result)
         finally:
             await trae_client.stop_web_session(client, session_id, message_id)
@@ -964,7 +804,6 @@ async def run_ide_chat(messages, model, stream: bool):
         async def gen():
             try:
                 async for chunk in translate_ide_stream(response, model, FORWARD_USAGE):
-                    _track_usage_from_chunk(chunk, model)
                     yield chunk
             finally:
                 ide_resp.close()
@@ -975,7 +814,6 @@ async def run_ide_chat(messages, model, stream: bool):
         )
     try:
         result = await collect_nonstream_ide(response, model)
-        _track_usage_from_result(result, model)
         return JSONResponse(content=result)
     finally:
         ide_resp.close()
@@ -1004,19 +842,6 @@ async def _run_web_with_retry(messages, model, stream: bool):
                 raise
         raise RuntimeError("All web accounts busy: Trae parallel limit reached")
     return await run_web_session(messages, model, stream)
-
-
-def _record_usage(account_id: str, model: str, prompt_tokens: int, completion_tokens: int) -> None:
-    """Record last request usage for web UI display."""
-    global _LAST_USAGE
-    _LAST_USAGE = {
-        "account_id": account_id,
-        "model": model,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "timestamp": time.time(),
-    }
 
 
 async def handle_chat(req: Request):
@@ -1100,35 +925,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Trae CN Relay", version="1.1.0", lifespan=lifespan)
 
-
-@app.get("/api/usage/last")
-async def api_usage_last():
-    """Return the last recorded request usage for the web UI."""
-    return JSONResponse({"success": True, "usage": _LAST_USAGE})
-
-
-@app.get("/api/checkin/work-credits/{account_id}")
-async def api_checkin_work_credits(account_id: str):
-    """Fetch work-specific account credits for one account.
-
-    Work credits = total (all packs) - general (req_source=1).
-    """
-    rec = auth.get_account_record(account_id)
-    token = rec.get("token") or ""
-    if not token:
-        return JSONResponse({"success": False, "error": "account not found or token missing"}, status_code=404)
-    try:
-        # Fetch general and total
-        raw_ac = await trae_client.fetch_account_credits(token)
-        general = trae_client.parse_account_credits(raw_ac)
-        raw_total = await trae_client.fetch_account_total_credits(token)
-        total = trae_client.parse_account_credits(raw_total)
-        work = _sub_credits(total, general)
-        merged = {**rec.get("checkin", {}), "work_credits": work, "total_credits": total, "account_credits": general}
-        auth.set_account_checkin(account_id, merged)
-        return JSONResponse({"success": True, "id": account_id, "credits": work, "raw_total": raw_total, "raw_general": raw_ac})
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=502)
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -1355,16 +1151,8 @@ async def api_checkin_accounts():
             row["credits"] = data.get("credits")
             row["checked_in"] = data.get("checked_in")
             row["checkin_enable"] = data.get("enable")
-            try:
-                full = await _fetch_full_credits(token)
-                row.update(full)
-                merged = {**data, **full}
-                auth.set_account_checkin(aid, merged)
-            except Exception:
-                # fall back to cached
-                for k in ("account_credits", "work_credits", "total_credits"):
-                    if k in cached:
-                        row[k] = cached[k]
+            merged = {**data, "account_credits": cached.get("account_credits")} if cached.get("account_credits") else data
+            auth.set_account_checkin(aid, merged)
         except Exception as e:
             row["error"] = str(e)
         return row
@@ -1389,50 +1177,6 @@ async def api_checkin_accounts():
                 "checkin": rec.get("checkin") or {},
             }
     return JSONResponse({"success": True, "active": active_id, "accounts": results})
-
-def _sub_credits(total: dict | None, general: dict | None) -> dict | None:
-    """Calculate work-specific credits = total - general."""
-    if not total or not general:
-        return None
-    if total.get("unlimited") or general.get("unlimited"):
-        return {"total_limit": -1, "used": 0, "remaining": None, "unlimited": True}
-    t_limit = total.get("total_limit") or 0
-    g_limit = general.get("total_limit") or 0
-    t_used = total.get("used") or 0
-    g_used = general.get("used") or 0
-    wt = max(t_limit - g_limit, 0)
-    wu = max(t_used - g_used, 0)
-    return {
-        "total_limit": wt,
-        "used": wu,
-        "remaining": max(wt - wu, 0),
-        "unlimited": False,
-    }
-
-async def _fetch_full_credits(token: str) -> dict:
-    """Fetch general credits and the combined (all-packs) credits for one token.
-
-    Upstream semantics:
-      - req_source=1 returns only general IDE packs (account_credits).
-      - req_source=0/2 returns all packs, i.e. the actual TOTAL credits.
-    So total_credits = req_source=0 result, and work_credits = total - general.
-    """
-    try:
-        raw_ac = await trae_client.fetch_account_credits(token)  # req_source=1: general only
-        account_credits = trae_client.parse_account_credits(raw_ac)
-    except Exception:
-        account_credits = None
-    try:
-        raw_total = await trae_client.fetch_account_total_credits(token)  # req_source=0: all packs
-        total_credits = trae_client.parse_account_credits(raw_total)
-    except Exception:
-        total_credits = None
-    work_credits = _sub_credits(total_credits, account_credits)
-    return {
-        "account_credits": account_credits,
-        "work_credits": work_credits,
-        "total_credits": total_credits,
-    }
 
 @app.post("/api/checkin/claim-all")
 async def api_checkin_claim_all():
@@ -1464,23 +1208,12 @@ async def api_checkin_claim_all():
         # don't burn upstream frequency budget on needless claim requests.
         try:
             status = await trae_client.fetch_checkin_credits_status(token)
+            auth.set_account_checkin(aid, status)
             row["credits"] = status.get("credits")
             row["checked_in"] = status.get("checked_in")
-            row["checkin"] = status
         except Exception as e:
             row["status_error"] = str(e)
             row["checked_in"] = rec.get("checkin", {}).get("checked_in")
-            row["checkin"] = rec.get("checkin") or {}
-
-        # Fetch full credits for display and persist them together with the
-        # latest checkin status so cached credits never get wiped by a claim.
-        try:
-            full = await _fetch_full_credits(token)
-            row.update(full)
-            auth.set_account_checkin(aid, {**row["checkin"], **full})
-        except Exception:
-            if row["checkin"]:
-                auth.set_account_checkin(aid, row["checkin"])
 
         if row.get("checked_in") is True:
             row["success"] = True
@@ -1508,14 +1241,9 @@ async def api_checkin_claim_all():
             await asyncio.sleep(0.5)
             try:
                 status = await trae_client.fetch_checkin_credits_status(token)
+                auth.set_account_checkin(aid, status)
                 row["credits"] = status.get("credits")
                 row["checked_in"] = status.get("checked_in")
-                try:
-                    full = await _fetch_full_credits(token)
-                    row.update(full)
-                    auth.set_account_checkin(aid, {**status, **full})
-                except Exception:
-                    auth.set_account_checkin(aid, status)
             except Exception as e:
                 row["refresh_error"] = str(e)
         except Exception as e:
@@ -1523,121 +1251,6 @@ async def api_checkin_claim_all():
             row["skipped"] = False
             row["error"] = str(e)
         results.append(row)
-    return JSONResponse({"success": True, "accounts": results, "interval": CHECKIN_INTERVAL})
-
-@app.post("/api/checkin/claim-credits")
-async def api_checkin_claim_credits():
-    """Credit-ordered polling checkin.
-
-    First fetches total entitlement credits for every account, sorts
-    accounts by remaining credits descending (higher credits first),
-    then processes them one by one with the standard interval.
-    """
-    results = []
-    raw_accounts = list(auth.get_accounts_raw())
-    enriched = []
-
-    for aid, rec in raw_accounts:
-        token = rec.get("token") or ""
-        label = rec.get("label") or rec.get("user_id") or aid
-        row = {
-            "id": aid,
-            "label": label,
-            "user_id": rec.get("user_id", ""),
-            "is_active": aid == auth.get_active_account_id(),
-        }
-        if not token:
-            row["success"] = False
-            row["error"] = "No token"
-            row["credits_sort"] = -1
-            enriched.append(row)
-            continue
-
-        checked_in = rec.get("checkin", {}).get("checked_in")
-        try:
-            status = await trae_client.fetch_checkin_credits_status(token)
-            auth.set_account_checkin(aid, status)
-            row["checked_in"] = status.get("checked_in")
-            row["checkin"] = status
-        except Exception as e:
-            row["status_error"] = str(e)
-            row["checked_in"] = checked_in
-
-        credits_sort = 0
-        try:
-            full = await _fetch_full_credits(token)
-            row.update(full)
-            parsed = full.get("account_credits") or {}
-            # Prefer total credits for the "credit-priority" sort key so work
-            # and general entitlements both count toward account priority.
-            total_parsed = full.get("total_credits") or {}
-            credits_sort = total_parsed.get("remaining") or total_parsed.get("total_limit") or parsed.get("remaining") or parsed.get("total_limit") or 0
-            if total_parsed.get("unlimited") or parsed.get("unlimited"):
-                credits_sort = 999999999
-            auth.set_account_checkin(aid, {**(rec.get("checkin") or {}), **full})
-        except Exception:
-            row["account_credits"] = None
-            credits_sort = 0
-
-        row["credits_sort"] = credits_sort
-        enriched.append(row)
-
-    # Sort by credits descending (richer accounts first)
-    enriched.sort(key=lambda x: x.get("credits_sort", 0), reverse=True)
-
-    index = 0
-    for row in enriched:
-        if row.get("error"):
-            results.append(row)
-            continue
-        if row.get("checked_in") is True:
-            row["success"] = True
-            row["skipped"] = True
-            row["data"] = {"code": 0, "message": "already checked in, skipped"}
-            results.append(row)
-            continue
-        if index > 0:
-            await asyncio.sleep(CHECKIN_INTERVAL)
-        index += 1
-
-        token = None
-        for aid2, rec2 in raw_accounts:
-            if aid2 == row["id"]:
-                token = rec2.get("token")
-                break
-
-        try:
-            data = await trae_client.claim_checkin_credits(token)
-            code = data.get("code")
-            if code == 9074:
-                await asyncio.sleep(max(CHECKIN_INTERVAL, 60))
-                data = await trae_client.claim_checkin_credits(token)
-            row["success"] = True
-            row["skipped"] = False
-            row["data"] = data
-            await asyncio.sleep(0.5)
-            try:
-                status = await trae_client.fetch_checkin_credits_status(token)
-                row["checked_in"] = status.get("checked_in")
-                row["credits"] = status.get("credits")
-                try:
-                    full = await _fetch_full_credits(token)
-                    row.update(full)
-                    auth.set_account_checkin(row["id"], {**status, **full})
-                except Exception:
-                    auth.set_account_checkin(row["id"], status)
-            except Exception:
-                pass
-        except Exception as e:
-            row["success"] = False
-            row["error"] = str(e)
-
-        results.append(row)
-
-    for r in results:
-        if "credits_sort" in r:
-            del r["credits_sort"]
-
     return JSONResponse({"success": True, "accounts": results, "interval": CHECKIN_INTERVAL})
 
 @app.post("/api/checkin/account/{account_id}")
@@ -1656,47 +1269,16 @@ async def api_checkin_account(account_id: str):
             data = await trae_client.claim_checkin_credits(token)
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=502)
-    # Refresh all credit types and return
     credits = None
     checked_in = None
-    account_credits = None
-    work_credits = None
-    total_credits = None
     try:
         status = await trae_client.fetch_checkin_credits_status(token)
+        auth.set_account_checkin(account_id, status)
         credits = status.get("credits")
         checked_in = status.get("checked_in")
-        try:
-            raw_ac = await trae_client.fetch_account_credits(token)
-            account_credits = trae_client.parse_account_credits(raw_ac)
-        except Exception:
-            pass
-        try:
-            raw_wc = await trae_client.fetch_account_work_credits(token)
-            work_credits = trae_client.parse_account_credits(raw_wc, available_endpoint_filter=1)
-        except Exception:
-            pass
-        # Calculate total_credits
-        gc = account_credits or {}
-        wc = work_credits or {}
-        if gc.get("unlimited") or wc.get("unlimited"):
-            total_credits = {"total_limit": -1, "used": (gc.get("used") or 0) + (wc.get("used") or 0), "remaining": None, "unlimited": True}
-        else:
-            gt = gc.get("total_limit") or 0
-            wt = wc.get("total_limit") or 0
-            gu = gc.get("used") or 0
-            wu = wc.get("used") or 0
-            total_credits = {"total_limit": gt + wt, "used": gu + wu, "remaining": max((gt - gu) + (wt - wu), 0), "unlimited": False}
-        # Save merged data
-        merged = {**status, "account_credits": account_credits}
-        if work_credits:
-            merged["work_credits"] = work_credits
-        if total_credits:
-            merged["total_credits"] = total_credits
-        auth.set_account_checkin(account_id, merged)
     except Exception:
         pass
-    return JSONResponse({"success": True, "data": data, "credits": credits, "checked_in": checked_in, "account_credits": account_credits, "work_credits": work_credits, "total_credits": total_credits})
+    return JSONResponse({"success": True, "data": data, "credits": credits, "checked_in": checked_in})
 
 @app.post("/api/checkin/claim")
 async def api_checkin_claim():
@@ -1769,25 +1351,6 @@ async def api_settings(request: Request):
     return JSONResponse({"success": True, "note": "端口变更需重启容器生效"})
 
 
-@app.get("/api/polling")
-async def api_get_polling():
-    polling = auth.get_polling_status()
-    return JSONResponse({"success": True, "enabled": polling.get("enabled", False), "mode": polling.get("mode", "round-robin")})
-
-
-@app.post("/api/polling-mode")
-async def api_polling_mode(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
-    mode = (body.get("mode") or "").strip()
-    if not mode:
-        return JSONResponse({"success": False, "error": "mode is required"}, status_code=400)
-    if mode not in ("round-robin", "credit-priority"):
-        return JSONResponse({"success": False, "error": "mode must be round-robin or credit-priority"}, status_code=400)
-    auth.set_polling_mode(mode)
-    return JSONResponse({"success": True, "mode": mode})
 @app.post("/api/polling")
 async def api_polling(request: Request):
     try:
@@ -1796,8 +1359,4 @@ async def api_polling(request: Request):
         return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
     enabled = bool(body.get("enabled", False))
     auth.set_polling(enabled)
-    mode = (body.get("mode") or "").strip()
-    if mode in ("round-robin", "credit-priority"):
-        auth.set_polling_mode(mode)
-    polling = auth.get_polling_status()
-    return JSONResponse({"success": True, "enabled": enabled, "mode": polling.get("mode", "round-robin")})
+    return JSONResponse({"success": True, "enabled": enabled})

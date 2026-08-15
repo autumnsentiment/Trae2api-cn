@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import time as _time
 from pathlib import Path
 from typing import Optional
 
@@ -175,17 +176,52 @@ def get_trae_solo_sg_data_dir() -> str:
 
 
 def try_auto_discover() -> tuple[Optional[dict], Optional[str]]:
-    """Iterate all known editions, returning the first usable (auth_data, edition_name)."""
+    """Iterate all known editions, preferring a token that is still valid.
+
+    On machines that have both Trae CN and TRAE SOLO CN installed, the first
+    decrypted directory may contain an expired token while another edition is
+    still logged in.  Prefer the edition with a valid token instead of blindly
+    returning the first one.
+    """
     editions = [
         ("cn", get_trae_cn_data_dir()),
         ("solo", get_trae_solo_cn_data_dir()),
         ("sg", get_trae_sg_data_dir()),
         ("solo-sg", get_trae_solo_sg_data_dir()),
     ]
+
+    def _still_valid(auth: dict) -> bool:
+        token = auth.get("token") or ""
+        if not token:
+            return False
+        raw = str(auth.get("expiredAt") or auth.get("TokenExpireAt") or "").strip()
+        if not raw:
+            return True  # No expiry info: assume usable, keep legacy behavior.
+        try:
+            ts = float(raw)
+            if ts > 1e12:
+                ts /= 1000.0
+        except ValueError:
+            from datetime import datetime, timezone
+
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts = dt.timestamp()
+            except Exception:
+                return True
+        return ts - _time.time() > 300  # 5-minute buffer
+
+    discovered: list[tuple[dict, str]] = []
     for edition, data_dir in editions:
         try:
             auth = decrypt_auth_data(data_dir)
-            return auth, edition
+            discovered.append((auth, edition))
+            if _still_valid(auth):
+                return auth, edition
         except Exception:
             continue
+    if discovered:
+        return discovered[0]
     return None, None

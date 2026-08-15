@@ -97,6 +97,7 @@ _STORE_LOCK = threading.RLock()
 _accounts: dict[str, dict] = {}
 _active_account: str = ""
 _poll_enabled: bool = False
+_polling_mode: str = "round-robin"  # "round-robin" | "credit-priority"
 _rotation_cursor: int = 0
 _settings: dict = {}
 
@@ -600,6 +601,8 @@ def _save_accounts() -> None:
             'accounts': _accounts,
             'active': _active_account,
             'poll_enabled': _poll_enabled,
+            'polling_mode': _polling_mode,
+            'rotation_cursor': _rotation_cursor,
             'settings': _settings,
         }
         ACCOUNTS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), 'utf-8')
@@ -608,7 +611,7 @@ def _save_accounts() -> None:
 
 
 def _bootstrap_account_store() -> None:
-    global _accounts, _active_account, _poll_enabled, _settings, _auth
+    global _accounts, _active_account, _poll_enabled, _settings, _aut, _polling_mode, _rotation_cursor
     try:
         if ACCOUNTS_PATH.exists():
             data = json.loads(ACCOUNTS_PATH.read_text('utf-8'))
@@ -616,6 +619,8 @@ def _bootstrap_account_store() -> None:
             _active_account = data.get('active', '') or ''
             _poll_enabled = bool(data.get('poll_enabled', False))
             _settings = data.get('settings', {}) or {}
+            _polling_mode = data.get('polling_mode', 'round-robin') or 'round-robin'
+            _rotation_cursor = data.get('rotation_cursor', 0) or 0
     except Exception as e:
         logger.warning('auth: could not load account store: %s', e)
 
@@ -676,10 +681,39 @@ def _switch_record(record: dict) -> None:
     _auth = _record_to_state(record)
 
 
+def get_accounts_raw() -> list[tuple[str, dict]]:
+    """Return (account_id, record) pairs without exposing secrets in the API layer."""
+    with _STORE_LOCK:
+        return [(aid, dict(rec)) for aid, rec in _accounts.items()]
+
+
+def get_active_account_id() -> str:
+    with _STORE_LOCK:
+        return _active_account
+
+
+def set_account_checkin(account_id: str, data: dict) -> None:
+    """Persist checkin/credits cache for one account."""
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return
+        rec['checkin'] = dict(data or {})
+        rec['checkin_updated_at'] = time.time()
+        _save_accounts()
+
+
+def get_account_record(account_id: str) -> dict:
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        return dict(rec) if rec else {}
+
+
 def list_accounts() -> list[dict]:
     with _STORE_LOCK:
         result = []
         for aid, rec in _accounts.items():
+            checkin = rec.get('checkin') or {}
             result.append({
                 'id': aid,
                 'user_id': rec.get('user_id', aid),
@@ -689,6 +723,13 @@ def list_accounts() -> list[dict]:
                 'is_active': aid == _active_account,
                 'is_valid': _record_valid(rec),
                 'expires': rec.get('expired_at', ''),
+                'credits': checkin.get('credits'),
+                'checked_in': checkin.get('checked_in'),
+                'checkin_enable': checkin.get('enable'),
+                'checkin_updated_at': rec.get('checkin_updated_at', 0),
+                'account_credits': checkin.get('account_credits'),
+                'work_credits': checkin.get('work_credits'),
+                'total_credits': checkin.get('total_credits'),
             })
         return result
 
@@ -820,17 +861,30 @@ def get_polling_status() -> dict:
             'enabled': _poll_enabled,
             'active_account': _active_account,
             'account_count': len(_accounts),
+            'mode': _polling_mode,
         }
 
 
 def next_polling_account() -> None:
-    global _active_account
+    global _active_account, _rotation_cursor
     if not _poll_enabled:
         return
     with _STORE_LOCK:
         ids = [aid for aid, rec in _accounts.items() if _record_valid(rec)]
         if not ids:
             return
+
+        # Credit-priority: sort by remaining credits descending (more credits = higher priority)
+        if _polling_mode == "credit-priority":
+            def _credits_sort_key(aid: str) -> tuple:
+                rec = _accounts.get(aid, {})
+                ac = (rec.get("checkin") or {}).get("account_credits") or {}
+                if ac.get("unlimited"):
+                    return (-999999999, aid)
+                remaining = ac.get("remaining") or 0
+                return (-remaining, aid)
+            ids.sort(key=_credits_sort_key)
+
         n = len(ids)
         for i in range(n):
             idx = (_rotation_cursor + i) % n
@@ -839,11 +893,9 @@ def next_polling_account() -> None:
                 _rotation_cursor = (idx + 1) % n
                 _active_account = aid
                 _switch_record(_accounts[aid])
-                logger.info('auth: polling switched to account %s', aid)
+                logger.info("auth: polling switched to account %s (mode=%s)", aid, _polling_mode)
                 return
         _rotation_cursor = (_rotation_cursor + 1) % n
-
-
 def get_settings() -> dict:
     with _STORE_LOCK:
         return {
@@ -887,3 +939,19 @@ def set_relay_settings(web_base_url: str = '', port: int = 0) -> None:
     except Exception as e:
         logger.warning('auth: could not save relay settings: %s', e)
 
+
+
+def set_polling_mode(mode: str) -> None:
+    """Set the polling rotation strategy."""
+    global _polling_mode
+    if mode not in ("round-robin", "credit-priority"):
+        raise ValueError(f"Invalid polling mode: {mode}")
+    with _STORE_LOCK:
+        _polling_mode = mode
+        _save_accounts()
+    logger.info("auth: polling mode set to %s", mode)
+
+
+def get_polling_mode() -> str:
+    with _STORE_LOCK:
+        return _polling_mode
