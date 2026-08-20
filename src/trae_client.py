@@ -9,6 +9,8 @@ trae_client.py - Trae API 客户端
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -22,7 +24,8 @@ from typing import Any, AsyncIterator, Optional
 
 import httpx
 
-from . import auth
+from . import auth, raw_client
+from .model_limits import clamp_max_completion_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,7 @@ MODEL_ALIASES = {
     # OpenAI / Claude 外部名 -> Trae CN 内部模型名
     "auto": "glm-5.2",
     "glm-5.2": "glm-5.2",
+    "glm-5.3": "glm-5.3",
     "claude-opus-4-7": "glm-5.2",
     "claude-opus-4-6": "glm-5.2",
     "claude-opus-4-5": "glm-5.2",
@@ -106,8 +110,6 @@ SUPPORTED_MODELS = set(_ALIAS_LOOKUP.keys()) | set(_ALIAS_LOOKUP.values())
 
 # 设备信息（参考 trae2api config/device.go）
 _DEVICE_BRANDS = ["92L3", "91C9", "814S", "8P15V", "35G4", "65G4", "55G4"]
-_SESSION_CACHE: dict[str, str] = {}
-
 _WEB_SLOTS: dict[str, asyncio.Semaphore] = {}
 _WEB_LEASES: dict[str, dict] = {}
 _WEB_MODEL_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
@@ -116,6 +118,34 @@ _WEB_IDLE_TIMEOUT = float(os.environ.get("TRAE_WEB_IDLE_TIMEOUT", "60"))
 _WEB_MODEL_CACHE_TTL = float(os.environ.get("TRAE_WEB_MODEL_CACHE_TTL", "300"))
 _WORKSPACE_PREFIXES = ["User", "home", "workspace", "data"]
 _WORKSPACE_DIRS = ["projects", "workspace", "dev", "code", "work"]
+_TOOL_OPTION_KEYS = ("tools", "tool_choice", "parallel_tool_calls")
+
+
+def _tool_protocol_requested(
+    options: Optional[dict], messages: Optional[list[dict]] = None
+) -> bool:
+    options = options or {}
+    if bool(options.get("_tool_protocol_requested")) or any(
+        key in options for key in _TOOL_OPTION_KEYS
+    ):
+        return True
+    return any(
+        isinstance(message, dict)
+        and (
+            message.get("role") == "tool"
+            or (
+                message.get("role") == "assistant"
+                and isinstance(message.get("tool_calls"), list)
+                and bool(message["tool_calls"])
+            )
+        )
+        for message in (messages or [])
+    )
+
+
+def _requested_session_id(options: Optional[dict]) -> str:
+    options = options or {}
+    return str(options.get("session_id") or options.get("sessionId") or "").strip()
 
 
 @dataclass
@@ -174,20 +204,19 @@ def is_model_supported(model: str) -> bool:
 
 
 def generate_session_id_from_messages(messages: list[dict]) -> str:
-    """根据首条消息内容生成稳定会话 ID（和 trae2api 一致）。"""
-    if not messages:
-        return str(uuid.uuid4())
-    first = messages[0]
-    key = f"{first.get('role','')}: {_content_to_text(first.get('content',''))}"
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    if digest in _SESSION_CACHE:
-        return _SESSION_CACHE[digest]
-    sid = str(uuid.uuid4())
-    _SESSION_CACHE[digest] = sid
-    return sid
+    """Return a fresh stateless chat session id.
+
+    OpenAI callers send the full history on every turn. Reusing an id derived
+    from prompt text can merge unrelated callers that happen to start alike.
+    Callers that need a stable upstream id should pass ``session_id``.
+    """
+    del messages
+    return str(uuid.uuid4())
 
 
 def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -198,6 +227,11 @@ def _content_to_text(content: Any) -> str:
             elif isinstance(c, str):
                 parts.append(c)
         return "\n".join(parts)
+    if isinstance(content, dict):
+        for key in ("text", "content", "value", "data"):
+            candidate = content.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
     return str(content)
 
 
@@ -227,15 +261,23 @@ def _rfc3339_zh_time() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", now) + "，" + weekdays[now.tm_wday]
 
 
-def build_headers() -> dict[str, str]:
-    """构造与 trae2api/laojichao 兼容的 IDE 请求头。"""
+def build_headers(
+    token_override: str = "", user_id_override: str = ""
+) -> dict[str, str]:
+    """构造与 trae2api/laojichao 兼容的 IDE 请求头。
+
+    A relay session may pin its credential for a complete tool chain.  The
+    optional overrides keep that request independent from global account
+    rotation while retaining the historic call signature for other callers.
+    """
     device = get_current_device()
-    token = auth.get_token()
+    token = token_override or auth.get_token()
+    user_id = user_id_override or auth.get_user_id()
     return {
         "Content-Type": "application/json",
         "Authorization": f"Cloud-IDE-JWT {token}",
         "X-Cloudide-Token": token,
-        "x-uid": auth.get_user_id(),
+        "x-uid": user_id,
         "x-app-id": IDE_APP_ID,
         "x-device-id": device.device_id,
         "x-machine-id": device.machine_id,
@@ -256,66 +298,91 @@ def build_headers() -> dict[str, str]:
 
 
 # Cache of checkin device ids per account. The upstream checkin API is
-# device-scoped and rate limits the claim endpoint per account (code 9074).
-# Keeping one stable id per account avoids looking like a new device each
-# time, while allowing a delayed retry when the account was recently used.
+# device-scoped and rate limits the claim endpoint (code 9074). A JWT is
+# refreshed periodically, so the raw token is not a stable device identity;
+# derive the id from the immutable user id carried in the JWT instead.
 _CHECKIN_DEVICE_IDS: dict[str, str] = {}
-_CHECKIN_LAST_CLAIM: dict[str, float] = {}
 
-def checkin_device_id_for(token: str) -> str:
-    """Return a stable, account-bound device id for the daily-checkin API.
+CHECKIN_OS_VERSION = os.environ.get("TRAE_CHECKIN_OS_VERSION", "Windows 10 Pro")
+CHECKIN_APP_VERSION = os.environ.get("TRAE_CHECKIN_APP_VERSION", "3.3.65")
 
-    A deterministic id per JWT is used so the account keeps a consistent
-    device fingerprint across restarts. Upstream requires a 16-digit id.
+
+def _checkin_identity(token: str, account_id: str = "") -> str:
+    """Return an account-stable identity without retaining or logging a token."""
+    if account_id:
+        return str(account_id)
+    if not token:
+        return ""
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+            data = payload.get("data")
+            if isinstance(data, dict) and data.get("id"):
+                return str(data["id"])
+            for key in ("user_id", "userId", "sub"):
+                if payload.get(key):
+                    return str(payload[key])
+    except (ValueError, TypeError, UnicodeError, binascii.Error, json.JSONDecodeError):
+        pass
+    # Non-JWT credentials are uncommon, but remain deterministic for the
+    # lifetime of that credential instead of producing an empty header.
+    return token
+
+
+def checkin_device_id_for(token: str, account_id: str = "") -> str:
+    """Return a stable, account-bound 16-digit device id.
+
+    The daily-checkin endpoint binds a device to an account and rejects a
+    changing/random fingerprint with business code 9074. Using the JWT's
+    stable ``data.id`` (or an explicit account id) survives token refreshes
+    while keeping different accounts on different device ids.
     """
     if not token:
         return ""
-    if token in _CHECKIN_DEVICE_IDS:
-        return _CHECKIN_DEVICE_IDS[token]
-    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    identity = _checkin_identity(token, account_id)
+    if identity in _CHECKIN_DEVICE_IDS:
+        return _CHECKIN_DEVICE_IDS[identity]
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     did = str(int(digest, 16) % 10**16).zfill(16)
-    _CHECKIN_DEVICE_IDS[token] = did
+    _CHECKIN_DEVICE_IDS[identity] = did
     return did
 
-def build_checkin_headers(token: str) -> dict[str, str]:
+def build_checkin_headers(token: str, account_id: str = "") -> dict[str, str]:
     """Build headers for the client daily-checkin API."""
     return {
         "Authorization": f"Cloud-IDE-JWT {token}",
         "Content-Type": "application/json",
-        "x-device-id": checkin_device_id_for(token),
+        "x-device-id": checkin_device_id_for(token, account_id),
         "x-device-brand": "ASUS TUF Gaming A15 FA507RM_FA507RM",
         "x-device-type": "windows",
+        "x-os-version": CHECKIN_OS_VERSION,
+        "x-app-version": CHECKIN_APP_VERSION,
     }
 
-async def fetch_checkin_credits_status(token: str = "") -> dict:
+async def fetch_checkin_credits_status(token: str = "", account_id: str = "") -> dict:
     """Query daily checkin credits status, returns the original JSON data."""
-    return await _post_checkin("/trae/api/v2/ug/checkin_credits/status", token)
+    return await _post_checkin(
+        "/trae/api/v2/ug/checkin_credits/status", token, account_id=account_id
+    )
 
-async def claim_checkin_credits(token: str = "") -> dict:
-    """Claim today's checkin credits. Server returns code=0 even if already checked.
+async def claim_checkin_credits(token: str = "", account_id: str = "") -> dict:
+    """Claim today's credits once and preserve upstream business errors.
 
-    Upstream limits claim requests per account/device with business code 9074
-    ("operation too frequent"). The real client responds by trying again after
-    a short delay, so we do the same here before returning the result.
+    In particular, do not immediately retry code 9074. A second claim within
+    seconds extends the upstream rate-limit window and was the reason one UI
+    click produced multiple failing upstream requests.
     """
     if not token:
         token = auth.get_token()
-    data = await _post_checkin("/trae/api/v2/ug/checkin_credits/claim", token)
-    code = data.get("code")
-    # 9074 = too frequent; 9095 = already checked in today (a no-op success).
-    if code == 9074:
-        now = time.time()
-        last = _CHECKIN_LAST_CLAIM.get(token, 0)
-        wait = 8.0
-        if now - last < wait:
-            await asyncio.sleep(wait - (now - last) + 1.0)
-        else:
-            await asyncio.sleep(2.0)
-        _CHECKIN_LAST_CLAIM[token] = time.time()
-        data = await _post_checkin("/trae/api/v2/ug/checkin_credits/claim", token)
-    return data
+    return await _post_checkin(
+        "/trae/api/v2/ug/checkin_credits/claim", token, account_id=account_id
+    )
 
-async def _post_checkin(path: str, token: str = "") -> dict:
+async def _post_checkin(
+    path: str, token: str = "", *, account_id: str = ""
+) -> dict:
     if not token:
         token = auth.get_token()
     if not token:
@@ -323,7 +390,9 @@ async def _post_checkin(path: str, token: str = "") -> dict:
     base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
     url = f"{base}{path}"
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json={}, headers=build_checkin_headers(token))
+        resp = await client.post(
+            url, json={}, headers=build_checkin_headers(token, account_id)
+        )
         text = resp.text
         if resp.status_code != 200:
             raise RuntimeError(f"Trae checkin [{resp.status_code}]: {text[:500]}")
@@ -332,17 +401,12 @@ async def _post_checkin(path: str, token: str = "") -> dict:
         except Exception as e:
             raise RuntimeError(f"Trae checkin invalid json: {e}") from e
 
-        # Upstream uses business codes in a 200 response. Distinguish "already
-        # checked in today" (a successful no-op) from genuine rate limiting so
-        # the UI and account polling can report the real state.
+        # Upstream uses business codes in a 200 response. Do not turn 9095 into
+        # ``checked_in=True``: its message is device-scoped (the same device
+        # may already have checked in for another account), so only the account
+        # status endpoint can establish whether this account is checked in.
         code = data.get("code")
-        if code == 9095:
-            # "already checked in today" is a successful no-op, not a failure.
-            data = dict(data)
-            data["checked_in"] = True
-            data["success"] = True
-            data["message"] = data.get("message") or "??????????"
-        elif code == 9074:
+        if code == 9074:
             # Preserve the upstream code so retry paths can react to rate
             # limiting; everything else is passed through as-is.
             data = dict(data)
@@ -490,16 +554,102 @@ def flatten_query(messages: list[dict]) -> str:
     """把 OpenAI 消息扁平化为 web remote 端点的 query JSON 字符串。"""
     parts: list[str] = []
     for m in messages:
-        content = _content_to_text(m.get("content", ""))
+        content_value = m.get("content", "")
+        if content_value in (None, "", []) and not m.get("tool_calls"):
+            for key in ("parts", "text", "prompt", "message", "input"):
+                candidate = m.get(key)
+                if candidate not in (None, "", [], {}):
+                    content_value = candidate
+                    break
+        content = _content_to_text(content_value)
         role = m.get("role", "user")
         if role == "system":
             parts.append(f"[System]\n{content}")
         elif role == "assistant":
-            parts.append(f"[Assistant]\n{content}")
+            assistant_parts = [content] if content else []
+            tool_history = raw_client._serialize_tool_calls(m.get("tool_calls"))
+            if tool_history:
+                assistant_parts.append(tool_history)
+            if assistant_parts:
+                parts.append("[Assistant]\n" + "\n\n".join(assistant_parts))
+        elif role == "tool":
+            tool_id = m.get("tool_call_id") or "unknown"
+            tool_name = m.get("name") or "tool"
+            parts.append(f"[Client Tool Result: {tool_id} {tool_name}]\n{content}")
         else:
             parts.append(content)
     text = "\n\n".join(parts)
     return json.dumps([{"type": "text", "data": {"content": text}}], ensure_ascii=False)
+
+
+def build_web_content(messages: list[dict]) -> list[dict]:
+    """Build a structured content array from OpenAI messages for the web remote endpoint.
+
+    Tool calls and results are formatted as readable text blocks so the upstream
+    agent understands the full conversation context including previous tool usage.
+    """
+    items: list[dict] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if content in (None, "", []) and not m.get("tool_calls"):
+            for key in ("parts", "text", "prompt", "message", "input"):
+                candidate = m.get(key)
+                if candidate not in (None, "", [], {}):
+                    content = candidate
+                    break
+        tool_calls = m.get("tool_calls")
+
+        if role == "system":
+            items.append({"type": "text", "data": {"content": f"[System]\n{_content_to_text(content)}"}})
+        elif role == "assistant" and tool_calls:
+            text = _content_to_text(content)
+            if text:
+                items.append({"type": "text", "data": {"content": text}})
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                tc_id = tc.get("id") or tc.get("tool_call_id") or "unknown"
+                tc_text = (
+                    f"\n[Client Tool Call: {tc_id} {func.get('name', 'unknown')}]"
+                    f"\nArguments: {func.get('arguments', '{}')}"
+                )
+                items.append({"type": "text", "data": {"content": tc_text}})
+        elif role == "tool":
+            tc_id = m.get("tool_call_id", "")
+            tool_name = m.get("name") or "tool"
+            items.append(
+                {
+                    "type": "text",
+                    "data": {
+                        "content": (
+                            f"\n[Client Tool Result: {tc_id} {tool_name}]\n"
+                            f"{_content_to_text(content)}"
+                        )
+                    },
+                }
+            )
+        else:
+            items.append({"type": "text", "data": {"content": _content_to_text(content)}})
+    return items
+
+
+def _messages_with_client_runtime(
+    messages: list[dict], options: Optional[dict] = None
+) -> list[dict]:
+    options = options or {}
+    if (
+        not _tool_protocol_requested(options, messages)
+        and "client_context" not in options
+        and "clientContext" not in options
+    ):
+        return messages
+    prompt = raw_client.build_runtime_system_prompt(
+        options.get("tools"),
+        raw_client.build_client_context(options),
+        options.get("tool_choice"),
+        options.get("parallel_tool_calls"),
+    )
+    return [{"role": "system", "content": prompt}, *messages]
 
 
 def _resolve_mode(model: str) -> tuple[str, str, str]:
@@ -719,20 +869,26 @@ async def _get_web_custom_model(model_name: str) -> Optional[dict]:
 async def create_web_session(
     client: httpx.AsyncClient,
     model: str,
-    query: str,
+    messages: list[dict],
+    options: Optional[dict] = None,
 ) -> tuple[str, str]:
     """POST /chat_sessions（OmniRoute 网页版方案）。"""
+    if _tool_protocol_requested(options, messages):
+        raise RuntimeError(
+            "Trae web remote cannot safely proxy caller-owned tool policy"
+        )
     base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
     token = auth.get_token()
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
 
     mode, strategy, model_name = _resolve_mode(model)
+    prepared_messages = _messages_with_client_runtime(messages, options)
     psd = auth.get_psd()
     initial_message = {
         "chat_session_id": "",
-        "content": [],
-        "query": query,
+        "content": build_web_content(prepared_messages),
+        "query": flatten_query(prepared_messages),
         "model_name": model_name,
         "agent_type": "solo_agent_remote",
         "model_selection_strategy": strategy,
@@ -811,10 +967,13 @@ def build_llm_chat_body(
     model: str,
     stream: bool,
     max_tokens: Optional[int] = None,
+    options: Optional[dict] = None,
 ) -> dict:
     """构造 /api/agent/v3/llm_utils_chat 与 create_agent_task 的请求体。"""
-    converted = convert_openai_messages(messages)
-    session_id = str(uuid.uuid4())
+    if _tool_protocol_requested(options, messages):
+        raise ValueError("Trae IDE agent endpoints cannot proxy caller-owned tool policy")
+    converted = convert_openai_messages(messages, options)
+    session_id = _requested_session_id(options) or str(uuid.uuid4())
     body = {
         "messages": [
             {
@@ -829,7 +988,8 @@ def build_llm_chat_body(
         "request_id": session_id,
         "session_id": session_id,
     }
-    if max_tokens and max_tokens > 0:
+    max_tokens = clamp_max_completion_tokens(max_tokens, model)
+    if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
         body["max_tokens"] = int(max_tokens)
     return body
 
@@ -838,10 +998,15 @@ async def build_trae_ide_request(
     messages: list[dict],
     model: str,
     max_tokens: Optional[int] = None,
+    options: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """构造与 trae2api 一致的 /api/ide/v1/chat 请求体。"""
-    converted = convert_openai_messages(messages)
-    session_id = generate_session_id_from_messages(converted)
+    if _tool_protocol_requested(options, messages):
+        raise ValueError("Trae IDE chat cannot safely proxy caller-owned tool policy")
+    converted = convert_openai_messages(messages, options)
+    session_id = _requested_session_id(options) or generate_session_id_from_messages(
+        messages
+    )
     trae_model = convert_model_name(model)
 
     messages_len = len(converted)
@@ -849,9 +1014,18 @@ async def build_trae_ide_request(
         raise ValueError("messages cannot be empty")
     last_content = _content_to_text(converted[-1].get("content", ""))
 
+    client_context = raw_client.build_client_context(options)
+    terminal_context = client_context.get("terminal_context")
+    if not isinstance(terminal_context, list):
+        terminal_context = []
     context_resolvers = [
         {"resolver_id": "project-labels", "variables": '{"labels":"- go\n- go.mod"}'},
-        {"resolver_id": "terminal_context", "variables": '{"terminal_context":[]}'},
+        {
+            "resolver_id": "terminal_context",
+            "variables": json.dumps(
+                {"terminal_context": terminal_context}, ensure_ascii=False
+            ),
+        },
     ]
 
     variables = {
@@ -873,9 +1047,9 @@ async def build_trae_ide_request(
         "use_filepath": True,
         "current_time": _rfc3339_zh_time(),
         "badge_clickable": True,
-        "workspace_path": generate_random_workspace_path(),
+        "workspace_path": str(client_context.get("workspace_path") or generate_random_workspace_path()),
         "brand": "Trae",
-        "system_type": "Windows",
+        "system_type": str(client_context.get("system_type") or "Windows"),
     }
 
     chat_history: list[dict] = []
@@ -916,16 +1090,18 @@ async def build_trae_ide_request(
         "is_preset": True,
         "provider": "",
     }
-    if max_tokens:
-        trae_req["max_output_tokens"] = max_tokens
-
+    max_tokens = clamp_max_completion_tokens(max_tokens, trae_model)
+    if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
+        trae_req["max_output_tokens"] = int(max_tokens)
     return trae_model, trae_req
 
 
-def convert_openai_messages(messages: list[dict]) -> list[dict]:
-    """把 OpenAI 消息数组转成 Trae 需要的纯文本消息。"""
+def convert_openai_messages(
+    messages: list[dict], options: Optional[dict] = None
+) -> list[dict]:
+    """Convert OpenAI messages without losing external tool-call history."""
     result: list[dict] = []
-    for m in messages:
+    for m in _messages_with_client_runtime(messages, options):
         role = m.get("role", "user")
         content = m.get("content", "")
         if isinstance(content, list):
@@ -937,8 +1113,23 @@ def convert_openai_messages(messages: list[dict]) -> list[dict]:
                     elif block.get("text"):
                         parts.append(block["text"])
             content = "\n".join(parts)
+        elif content is None:
+            content = ""
         elif not isinstance(content, str):
             content = str(content)
+        if role == "assistant":
+            tool_history = raw_client._serialize_tool_calls(m.get("tool_calls"))
+            if tool_history:
+                content = "\n\n".join(part for part in (content, tool_history) if part)
+        elif role == "tool":
+            tool_id = m.get("tool_call_id") or "unknown"
+            tool_name = m.get("name") or "tool"
+            content = f"Client tool result [{tool_id}] {tool_name}:\n{content}"
+            role = "user"
+        elif role == "developer":
+            role = "system"
+        elif role not in ("system", "user", "assistant"):
+            role = "user"
         result.append({"role": role, "content": content})
     return result
 
@@ -948,6 +1139,11 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
 
     返回 IdeChatResponse 包装对象，调用方消费完流式内容后需调用 .close()。
     """
+    if _tool_protocol_requested(options, messages):
+        raise RuntimeError(
+            "Trae IDE endpoints cannot safely proxy caller-owned tool policy"
+        )
+
     from . import auth as auth_module
 
     await auth_module.maybe_refresh()
@@ -965,16 +1161,27 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
         client = httpx.Client(headers=build_headers(), timeout=timeout, http2=False)
         try:
             if endpoint == "/api/ide/v1/chat":
-                _, trae_req = await build_trae_ide_request(messages, model, max_tokens)
+                _, trae_req = await build_trae_ide_request(
+                    messages,
+                    model,
+                    max_tokens,
+                    options,
+                )
             else:
-                trae_req = build_llm_chat_body(messages, model_name, stream, max_tokens)
+                trae_req = build_llm_chat_body(
+                    messages,
+                    model_name,
+                    stream,
+                    max_tokens,
+                    options,
+                )
             logger.info("trae-client: POST %s%s model=%s", base, endpoint, model_name)
             request = client.build_request("POST", base + endpoint, json=trae_req)
-            resp = client.send(request, stream=True)
+            resp = await asyncio.to_thread(client.send, request, stream=True)
             if resp.status_code == 200:
                 return IdeChatResponse(response=resp, client=client)
 
-            resp.read()
+            await asyncio.to_thread(resp.read)
             body = resp.text[:800]
             logger.warning("trae-client: %s returned %s: %s", endpoint, resp.status_code, body)
             errors.append(f"{endpoint} [{resp.status_code}]: {body}")

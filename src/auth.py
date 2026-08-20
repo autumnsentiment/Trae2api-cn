@@ -588,6 +588,15 @@ def _state_to_record(state: AuthState) -> dict:
     }
 
 
+def _merge_state_record(state: AuthState, previous: Optional[dict] = None) -> dict:
+    """Refresh auth fields without discarding cached account metadata."""
+    old = dict(previous or {})
+    record = dict(old)
+    record.update(_state_to_record(state))
+    record['label'] = old.get('label') or record['label']
+    return record
+
+
 def _record_valid(record: dict) -> bool:
     if not record.get('token'):
         return False
@@ -631,9 +640,7 @@ def _bootstrap_account_store() -> None:
     if current.token:
         aid = current.user_id or current.token[:24]
         old = _accounts.get(aid, {})
-        record = _state_to_record(current)
-        record['label'] = old.get('label') or record['label']
-        _accounts[aid] = record
+        _accounts[aid] = _merge_state_record(current, old)
         _active_account = aid
     if current.token:
         # Store the valid env/authorize token in memory even if persistence failed.
@@ -669,9 +676,7 @@ def _persist_active_account() -> None:
         return
     aid = state.user_id or state.token[:24]
     old = _accounts.get(aid, {})
-    record = _state_to_record(state)
-    record['label'] = old.get('label') or record['label']
-    _accounts[aid] = record
+    _accounts[aid] = _merge_state_record(state, old)
     _active_account = aid
     _save_accounts()
 
@@ -701,6 +706,20 @@ def set_account_checkin(account_id: str, data: dict) -> None:
         rec['checkin'] = dict(data or {})
         rec['checkin_updated_at'] = time.time()
         _save_accounts()
+
+
+def merge_account_checkin(account_id: str, data: dict) -> dict:
+    """Atomically merge a partial checkin or credits refresh into its cache."""
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get('checkin') or {})
+        checkin.update(dict(data or {}))
+        rec['checkin'] = checkin
+        rec['checkin_updated_at'] = time.time()
+        _save_accounts()
+        return dict(checkin)
 
 
 def get_account_record(account_id: str) -> dict:

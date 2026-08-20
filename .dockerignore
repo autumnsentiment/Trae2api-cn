@@ -4,6 +4,7 @@
 __pycache__
 *.pyc
 .env
+data
 start.bat
 work
 tests

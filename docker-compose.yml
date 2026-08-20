@@ -15,3 +15,11 @@ services:
       # CLI 模式可选：把宿主机 Linux 版 traecli 挂载进容器
       # - /usr/local/bin/traecli:/usr/local/bin/traecli:ro
       # - /root/.trae:/home/app/.trae:ro
+    networks:
+      - default
+      - new-api
+
+networks:
+  new-api:
+    external: true
+    name: new-api_new-api-network

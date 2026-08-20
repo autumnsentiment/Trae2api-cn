@@ -12,16 +12,18 @@ relay to execute commands on this machine.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +164,7 @@ def resolve_model_arg(model: str) -> list[str]:
     return [option, f"default_model={selected}"]
 
 
-def resolve_base_args() -> list[str]:
+def resolve_base_args(force_disable_tools: bool = False) -> list[str]:
     raw = _env("TRAE_CLI_ARGS")
     args = _split_args(raw) if raw else ["-p"]
     mode = output_mode()
@@ -173,12 +175,41 @@ def resolve_base_args() -> list[str]:
     elif not any(arg == "--output-format" for arg in args):
         args.extend(["--output-format", "text"])
 
-    if _env_bool("TRAE_CLI_DISABLE_TOOLS", True):
-        raw_tools = _env("TRAE_CLI_DISABLE_TOOLS", ",".join(DEFAULT_DISABLED_TOOLS))
-        tools = [t.strip() for t in raw_tools.split(",") if t.strip()]
+    disable_tools_raw = _env("TRAE_CLI_DISABLE_TOOLS", "true")
+    if force_disable_tools or _env_bool("TRAE_CLI_DISABLE_TOOLS", True):
+        if force_disable_tools:
+            tools = list(DEFAULT_DISABLED_TOOLS)
+            tools.extend(
+                tool.strip()
+                for tool in _env("TRAE_CLI_DISALLOWED_TOOLS").split(",")
+                if tool.strip()
+            )
+            if disable_tools_raw.lower() not in (
+                "1",
+                "true",
+                "yes",
+                "on",
+                "0",
+                "false",
+                "no",
+                "off",
+                "none",
+            ):
+                tools.extend(
+                    tool.strip()
+                    for tool in disable_tools_raw.split(",")
+                    if tool.strip()
+                )
+        elif disable_tools_raw.lower() in ("1", "true", "yes", "on"):
+            raw_tools = _env("TRAE_CLI_DISALLOWED_TOOLS", ",".join(DEFAULT_DISABLED_TOOLS))
+            tools = [t.strip() for t in raw_tools.split(",") if t.strip()]
+        else:
+            # Backward compatible: a comma-separated value can be supplied
+            # directly in TRAE_CLI_DISABLE_TOOLS.
+            raw_tools = disable_tools_raw
+            tools = [t.strip() for t in raw_tools.split(",") if t.strip()]
         for tool in tools:
-            if not any(arg == "--disallowed-tool" for arg in args):
-                args.extend(["--disallowed-tool", tool])
+            args.extend(["--disallowed-tool", tool])
 
     # Remove duplicate option/value pairs while preserving order.
     seen: set[tuple[str, str]] = set()
@@ -197,8 +228,8 @@ def resolve_base_args() -> list[str]:
     return out
 
 
-def build_cli_args(prompt: str, model: str) -> list[str]:
-    args = resolve_base_args()
+def build_cli_args(prompt: str, model: str, force_disable_tools: bool = False) -> list[str]:
+    args = resolve_base_args(force_disable_tools=force_disable_tools)
     args.extend(resolve_model_arg(model))
     if prompt_mode() != "stdin":
         args.append(prompt)
@@ -219,7 +250,132 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def build_cli_prompt(messages: list[dict]) -> str:
+def _iter_tool_definitions(tools: Any) -> list[dict]:
+    if isinstance(tools, list):
+        return [tool for tool in tools if isinstance(tool, dict)]
+    if not isinstance(tools, dict):
+        return []
+    result = []
+    for name, tool in tools.items():
+        if not isinstance(tool, dict):
+            continue
+        item = dict(tool)
+        item.setdefault("name", name)
+        result.append(item)
+    return result
+
+
+def build_client_context(client_context: Any = None) -> dict[str, Any]:
+    """Normalize the caller-owned terminal context used by CLI fallback."""
+
+    context = dict(client_context) if isinstance(client_context, Mapping) else {}
+    context["workspace_path"] = str(
+        context.get("workspace_path")
+        or context.get("workspacePath")
+        or _env("TRAE_CLIENT_WORKSPACE_PATH", r"C:\workspace")
+    )
+    context["system_type"] = str(
+        context.get("system_type")
+        or context.get("systemType")
+        or _env("TRAE_CLIENT_SYSTEM_TYPE", "Windows")
+    )
+    terminal_context = context.get("terminal_context", context.get("terminalContext"))
+    context["terminal_context"] = terminal_context if terminal_context is not None else []
+    context.pop("workspacePath", None)
+    context.pop("systemType", None)
+    context.pop("terminalContext", None)
+    return context
+
+
+def _client_context_prompt(client_context: Any = None) -> str:
+    context = build_client_context(client_context)
+    return (
+        "The external client's environment is authoritative. "
+        "Treat this context as the workspace and terminal where client tools run; "
+        "never substitute or describe the relay/Trae CLI process environment. "
+        "Client context JSON: "
+        + json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)
+    )
+
+
+def _external_tool_prompt(tools: Any, tool_choice: Any = None) -> str:
+    definitions = []
+    for tool in _iter_tool_definitions(tools):
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            function = tool["function"]
+            name = function.get("name")
+            description = function.get("description") or ""
+            parameters = function.get("parameters") or {"type": "object", "properties": {}}
+        else:
+            name = tool.get("name")
+            description = tool.get("description") or ""
+            parameters = tool.get("parameters") or tool.get("inputSchema") or tool.get("input_schema")
+            parameters = parameters or {"type": "object", "properties": {}}
+        if not isinstance(name, str) or not name.strip():
+            continue
+        definitions.append({
+            "name": name.strip(),
+            "description": str(description),
+            "parameters": parameters,
+        })
+    if not definitions:
+        if tools is None:
+            return ""
+        return (
+            "External client tool policy is active, but no client tools are available. "
+            "Do not execute Trae CLI internal filesystem, shell, edit, write, search, "
+            "or task tools. Answer directly without requesting or fabricating a tool result."
+        )
+
+    choice_instruction = "Choose a tool only when the task requires it."
+    if tool_choice == "none":
+        choice_instruction = "Do not call a tool for this turn."
+    elif tool_choice == "required":
+        choice_instruction = "You must call at least one available tool for this turn."
+    elif isinstance(tool_choice, dict):
+        selected = tool_choice.get("function") if tool_choice.get("type") == "function" else tool_choice
+        if isinstance(selected, dict) and selected.get("name"):
+            choice_instruction = f"You must call the tool named {selected['name']} for this turn."
+
+    schema_json = json.dumps(definitions, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "External client tool-calling mode is active. "
+        "Never execute Trae CLI internal filesystem, shell, edit, write, search, or task tools. "
+        "The client will execute tools and send their results back. "
+        "Treat the declared tools and their namespaces as the automatically discovered local plugin catalog; do not ask the user to list their environment or plugins first. "
+        "If tool_search or another plugin discovery tool is available, call it proactively before claiming a capability is unavailable. Use a client shell or environment tool to inspect cwd, OS, runtimes, and executables when those facts matter. "
+        f"{choice_instruction} "
+        "When a tool is needed, return one or more blocks and no fabricated tool output: "
+        '<tool_call>{"id":"call_stable_id","name":"tool_name","arguments":{...}}</tool_call>. '
+        "The arguments value must match the selected JSON schema. "
+        "After a Tool result message, continue using that result without repeating the same successful tool call or identical final-answer text. "
+        "A Tool result is not a final answer while the user's requested checklist has pending steps; continue with the next client tool. Never print internal client-tool history or protocol markers. "
+        f"Available external tools: {schema_json}"
+    )
+
+
+def _assistant_tool_history(message: dict) -> list[str]:
+    lines: list[str] = []
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list):
+        return lines
+    for index, call in enumerate(calls):
+        normalized = normalize_tool_call(call, index=index)
+        if not normalized:
+            continue
+        function = normalized["function"]
+        lines.append(
+            f"Tool call [{normalized['id']}] {function['name']}:\n{function['arguments']}"
+        )
+    return lines
+
+
+def build_cli_prompt(
+    messages: list[dict],
+    tools: Any = None,
+    tool_choice: Any = None,
+    client_context: Any = None,
+) -> str:
     """Serialize OpenAI messages into the plain text prompt Trae CLI expects."""
     max_messages = _env_int("TRAE_CLI_MAX_MESSAGES", 60)
     max_chars = _env_int("TRAE_CLI_MAX_PROMPT_CHARS", 20000)
@@ -230,15 +386,22 @@ def build_cli_prompt(messages: list[dict]) -> str:
         messages = [m for i, m in enumerate(messages) if m.get("role") == "system" or i in keep]
 
     lines: list[str] = []
+    tool_prompt = _external_tool_prompt(tools, tool_choice)
+    if tool_prompt:
+        lines.append(f"System:\n{tool_prompt}")
+    if tool_prompt or isinstance(client_context, Mapping):
+        lines.append(f"System:\n{_client_context_prompt(client_context)}")
+    protected_count = len(lines)
     for message in messages:
         role = message.get("role", "user")
         content = _content_to_text(message.get("content", "")).strip()
-        if not content:
-            continue
         if role == "system":
-            lines.append(f"System:\n{content}")
+            if content:
+                lines.append(f"System:\n{content}")
         elif role == "assistant":
-            lines.append(f"Assistant:\n{content}")
+            if content:
+                lines.append(f"Assistant:\n{content}")
+            lines.extend(_assistant_tool_history(message))
         elif role == "tool":
             tool_id = message.get("tool_call_id", "") or ""
             name = message.get("name", "") or ""
@@ -247,13 +410,25 @@ def build_cli_prompt(messages: list[dict]) -> str:
                 header += f" [{tool_id}]"
             if name:
                 header += f" {name}"
-            lines.append(f"{header}:\n{content}")
+            lines.append(f"{header}:\n{content or '[empty tool result]'}")
         else:
-            lines.append(f"User:\n{content}")
+            if content:
+                lines.append(f"User:\n{content}")
 
     prompt = "\n\n".join(lines).strip() or "Hello"
     if len(prompt) <= max_chars:
         return prompt
+    if protected_count:
+        protected_block = "\n\n".join(lines[:protected_count])
+        # The external tool contract is a safety boundary and must not be
+        # discarded when old conversation history is truncated.
+        remaining = max_chars - len(protected_block) - 64
+        if remaining > 256:
+            conversation = "\n\n".join(lines[protected_count:])
+            suffix = conversation[-remaining:]
+            omitted = max(0, len(conversation) - len(suffix))
+            return f"{protected_block}\n\n[Prompt truncated: {omitted} chars omitted]\n{suffix}"
+        return protected_block
     suffix = prompt[-max_chars:]
     omitted = len(prompt) - len(suffix)
     return f"[Prompt truncated: {omitted} chars omitted]\n{suffix}"
@@ -361,6 +536,749 @@ def strip_think_tags(text: str) -> str:
     )
 
 
+_TEXT_TOOL_BLOCK_RE = re.compile(
+    r"<(?P<tag>opencode_tool_call|tool_use|tool_call|tool_cell|bash|read|write|edit|glob|grep|task)>"
+    r"(?P<body>[\s\S]*?)</(?P=tag)>",
+    flags=re.IGNORECASE,
+)
+_NAMED_TOOL_BLOCK_RE = re.compile(
+    r"<(?P<tag>tool_call|tool_cell)\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>"
+    r"(?P<body>[\s\S]*?)</(?P=tag)>",
+    flags=re.IGNORECASE,
+)
+_KIMI_TOOL_PARAMETER_RE = re.compile(
+    r"<tool>\s*(?P<name>[^<]+?)\s*</tool>\s*"
+    r"<parameter(?:\s+[^>]*)?>\s*(?P<body>[\s\S]*?)\s*</parameter>",
+    flags=re.IGNORECASE,
+)
+_HISTORY_TOOL_MARKER_RE = re.compile(
+    r"Previous client tool request\(s\):\s*",
+    flags=re.IGNORECASE,
+)
+_HISTORY_TOOL_MARKER_BLOCK_RE = re.compile(
+    r"Previous client tool request\(s\):\s*\[[\s\S]*?\]",
+    flags=re.IGNORECASE,
+)
+_CLIENT_TOOL_HISTORY_MARKER_RE = re.compile(
+    r"Client tool calls already issued in this conversation\s*"
+    r"\(history only;.*?\):",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_CLIENT_TOOL_HISTORY_CALL_LINE_RE = re.compile(
+    r"^[ \t]*Client tool call\s+\[[^\]\r\n]*\][^\r\n]*(?:\r?\n|$)",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_TOOL_USE_TAG_RE = re.compile(r"<(?P<tag>[A-Za-z_][A-Za-z0-9_-]*)>\s*([\s\S]*?)\s*</(?P=tag)>", re.IGNORECASE)
+
+# The raw/CLI upstream sometimes echoes the history envelope that the relay
+# put in its prompt.  It is not user-visible assistant text.  In practice the
+# model may truncate that envelope halfway through an escaped JSON string, so
+# a regular expression that only matches a complete ``[...]`` value is not
+# sufficient.  The helpers below intentionally treat an incomplete envelope
+# as protocol text up to the next explicit tool block (or EOF).
+_HISTORY_MARKER_LITERAL = "Previous client tool request(s):"
+_HISTORY_PARTIAL_PREFIX_RE = re.compile(
+    r"^\s*Previous(?:\s+client(?:\s+tool(?:\s+request(?:s|\(s\)?)?)?)?)?\s*:?\s*$",
+    flags=re.IGNORECASE,
+)
+_CLIENT_HISTORY_PARTIAL_PREFIX_RE = re.compile(
+    r"^\s*Client(?:\s+tool(?:\s+calls(?:\s+already(?:\s+issued(?:\s+in(?:\s+this(?:\s+conversation)?)?)?)?)?)?)?\s*:?\s*$",
+    flags=re.IGNORECASE,
+)
+_HISTORY_PROTOCOL_TAG_RE = re.compile(
+    r"<\s*(?:opencode_tool_call|tool_use|tool_call|tool_cell|bash|read|write|edit|glob|grep|task)\b",
+    flags=re.IGNORECASE,
+)
+
+# The CLI can stop while it is echoing the history preamble.  In that case
+# there is no closing ``)`` or ``:`` yet (for example ``Previous client tool
+# request(s``).  Keep these as protocol residue even when ordinary answer
+# text precedes the fragment.  Matching is deliberately prefix-based so a
+# split marker can be held by the streaming accumulator until the next frame.
+_HISTORY_MARKER_PREFIXES = tuple(
+    marker.casefold()
+    for marker in (
+        _HISTORY_MARKER_LITERAL,
+        "Previous client tool requests:",
+        "Previous client tool request:",
+    )
+)
+_HISTORY_MARKER_START_RE = re.compile(
+    r"Previous\s+client\s+tool\s+request(?:s|\s*\(\s*s\s*\)?)?\s*:?",
+    flags=re.IGNORECASE,
+)
+_CLIENT_HISTORY_MARKER_LITERAL = (
+    "Client tool calls already issued in this conversation "
+    "(history only; use the matching results below and do not repeat them):"
+)
+_CLIENT_HISTORY_MARKER_PREFIX = _CLIENT_HISTORY_MARKER_LITERAL.casefold()
+
+
+def _is_history_marker_prefix(value: str) -> bool:
+    """Return whether *value* is only a (possibly truncated) history marker."""
+
+    candidate = " ".join(str(value).strip().split()).casefold()
+    if not candidate:
+        return False
+    return any(
+        marker.startswith(candidate) for marker in _HISTORY_MARKER_PREFIXES
+    ) or _CLIENT_HISTORY_MARKER_PREFIX.startswith(candidate)
+
+
+def _strip_partial_history_fragments(text: str) -> str:
+    """Hide marker fragments that are incomplete or split across stream frames.
+
+    ``strip_tool_call_blocks`` historically only removed a complete marker or
+    a marker that occupied the whole response.  A CLI cumulative snapshot can
+    instead look like ``answer\n\nPrevious client tool request(s``; exposing the
+    suffix causes clients to replay the same tool request.  Remove standalone
+    marker lines first, then a trailing marker attached after a line boundary
+    (or an intentional two-space separator), while preserving the answer.
+    """
+
+    if not text:
+        return text
+
+    removed_line = False
+    kept: list[str] = []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if _is_history_marker_prefix(body):
+            removed_line = True
+            continue
+        kept.append(line)
+    text = "".join(kept)
+    if removed_line:
+        # Removing a protocol-only final line should not leave a visible blank
+        # line after the real answer.
+        text = text.rstrip()
+
+    # A fragment may share a line with the answer.  Only accept a marker at the
+    # start of the response, after a newline, or after an explicit two-space
+    # separator; do not strip ordinary prose such as ``See Previous``.
+    for match in re.finditer(r"(?i)\b(?:previous|client)\b", text):
+        before = text[: match.start()]
+        if before and not (
+            before.endswith(("\n", "\r", "\t", "  "))
+        ):
+            continue
+        candidate = text[match.start() :].strip()
+        if _is_history_marker_prefix(candidate):
+            return before.rstrip()
+    return text
+
+
+def _decode_json_string_fragment(value: str) -> Optional[str]:
+    """Decode a JSON string body when the model returned a closed fragment."""
+
+    try:
+        decoded = json.loads('"' + value + '"')
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+
+def _recover_history_marker_calls(tail: str, index: int = 0) -> list[dict]:
+    """Recover a call whose outer history array was truncated.
+
+    We only accept a closed ``input`` string containing valid JSON arguments.
+    A half-written argument is discarded rather than turned into a fabricated
+    call; a native call in the same upstream payload will still be used.
+    """
+
+    recovered: list[dict] = []
+    pattern = re.compile(
+        r'\{\s*"id"\s*:\s*"(?P<id>(?:\\.|[^"\\])*)"\s*,\s*'
+        r'"name"\s*:\s*"(?P<name>(?:\\.|[^"\\])*)"\s*,\s*'
+        r'"input"\s*:\s*"(?P<input>(?:\\.|[^"\\])*)"',
+        flags=re.IGNORECASE,
+    )
+    for match_index, match in enumerate(pattern.finditer(tail)):
+        raw_id = _decode_json_string_fragment(match.group("id"))
+        name = _decode_json_string_fragment(match.group("name"))
+        input_text = _decode_json_string_fragment(match.group("input"))
+        if not raw_id or not name or input_text is None:
+            continue
+        try:
+            json.loads(input_text)
+        except (TypeError, ValueError):
+            continue
+        call = normalize_tool_call(
+            {"id": raw_id, "name": name, "input": input_text},
+            index=index + match_index,
+        )
+        if call:
+            call["_history_marker"] = True
+            recovered.append(call)
+    return recovered
+
+
+def _history_marker_records(text: str) -> list[tuple[int, int, list[dict], bool]]:
+    """Return ``(start, end, calls, complete)`` records for echoed history.
+
+    ``end`` excludes any explicit XML tool block that follows an incomplete
+    marker, allowing the normal tool-block parser to process that block.
+    """
+
+    records: list[tuple[int, int, list[dict], bool]] = []
+    cursor = 0
+    while True:
+        match = _HISTORY_MARKER_START_RE.search(text[cursor:])
+        if not match:
+            break
+        start = cursor + match.start()
+        marker_end = cursor + match.end()
+        probe = marker_end
+        while probe < len(text) and text[probe].isspace():
+            probe += 1
+
+        # The serializer normally emits a JSON array.  A truncated echo can
+        # omit its opening bracket and start with the first call object, which
+        # is still protocol history and must not become assistant content.
+        if probe >= len(text) or text[probe] not in "[{":
+            line_end = text.find("\n", marker_end)
+            end = len(text) if line_end < 0 else line_end + 1
+            records.append((start, end, [], False))
+            cursor = max(end, marker_end)
+            continue
+
+        json_end = _find_json_end(text, probe)
+        if json_end >= 0:
+            raw = text[probe:json_end]
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, (list, dict)):
+                calls: list[dict] = []
+                items = parsed if isinstance(parsed, list) else [parsed]
+                for index, item in enumerate(items):
+                    call = normalize_tool_call(item, index=index)
+                    if call:
+                        call["_history_marker"] = True
+                        calls.append(call)
+                record_end = json_end
+                # When only the opening ``[`` was lost, consume its orphaned
+                # closing bracket as part of the history envelope too.
+                if isinstance(parsed, dict):
+                    close_probe = json_end
+                    while close_probe < len(text) and text[close_probe].isspace():
+                        close_probe += 1
+                    if close_probe < len(text) and text[close_probe] == "]":
+                        record_end = close_probe + 1
+                records.append((start, record_end, calls, True))
+                cursor = record_end
+                continue
+
+        # Incomplete JSON: recover only closed call fragments, and hide the
+        # remaining protocol residue.  Preserve a later explicit XML block.
+        next_tag = _HISTORY_PROTOCOL_TAG_RE.search(text, probe + 1)
+        end = next_tag.start() if next_tag else len(text)
+        recovered = _recover_history_marker_calls(text[probe:end])
+        records.append((start, end, recovered, False))
+        cursor = max(end, marker_end)
+    return records
+
+
+def _string_or_empty(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _stringify_tool_arguments(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if value is None:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _stable_tool_id(name: str, arguments: str, index: int = 0) -> str:
+    digest = hashlib.sha256(f"{name}\0{arguments}\0{index}".encode("utf-8")).hexdigest()[:20]
+    return f"call_{digest}"
+
+
+def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Optional[dict]:
+    """Normalize Trae/native/text tool-call shapes to an OpenAI call object.
+
+    This function only serializes a request for the API client. It never executes
+    the command or touches a filesystem.
+    """
+    if not isinstance(raw, dict):
+        return None
+    function = raw.get("function") if isinstance(raw.get("function"), dict) else None
+    if function is None and isinstance(raw.get("function_call"), dict):
+        function = raw["function_call"]
+    if function is None and isinstance(raw.get("functionCall"), dict):
+        function = raw["functionCall"]
+    if function is None:
+        function = raw
+    inherited_synthetic_id = raw.get("_synthetic_id") is True
+    raw_id = _string_or_empty(raw.get("id")) or _string_or_empty(raw.get("tool_call_id"))
+    if not raw_id and isinstance(function, dict):
+        raw_id = _string_or_empty(function.get("id"))
+    name = (
+        _string_or_empty(function.get("name"))
+        or _string_or_empty(raw.get("name"))
+        or _string_or_empty(raw.get("tool_name"))
+        or _string_or_empty(raw.get("server_name"))
+        or _string_or_empty(fallback_name)
+    )
+    if not name and not raw_id and not isinstance(raw.get("index"), int):
+        return None
+    if name.lower() in {"finish", "done", "final"}:
+        return None
+    missing = object()
+    arguments: Any = missing
+    # Trae's native stream uses both ``arguments`` and ``args`` inside
+    # ``function_call``. Preserve an explicitly empty first fragment so a
+    # later index-only argument delta is not prefixed with a fabricated ``{}``.
+    for source in (function, raw):
+        for key in ("arguments", "args", "input", "params", "parameters"):
+            if key in source:
+                arguments = source.get(key)
+                break
+        if arguments is not missing:
+            break
+    # A tool-call record may put the actual fields at the top level. Remove
+    # protocol metadata before treating that record as arguments.
+    if arguments is missing:
+        arguments = {
+            key: value
+            for key, value in raw.items()
+            if key not in {
+                "id", "type", "name", "tool_name", "server_name", "index",
+                "function", "function_call", "functionCall",
+            }
+        }
+    arguments_text = _stringify_tool_arguments(arguments)
+    call_id = raw_id or _stable_tool_id(name, arguments_text, index)
+    result = {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments_text},
+        "_synthetic_id": inherited_synthetic_id or not bool(raw_id),
+        "_source_index": raw.get("_source_index", index),
+        "_explicit_index": raw.get("_explicit_index") is True
+        or isinstance(raw.get("index"), int),
+    }
+    if isinstance(raw.get("index"), int):
+        result["index"] = raw["index"]
+    return result
+
+
+def tool_call_signature(call: Any) -> str:
+    """Return a stable name/arguments key for duplicate-call protection."""
+
+    if not isinstance(call, dict):
+        return ""
+    function = call.get("function")
+    if not isinstance(function, dict):
+        function = call
+    name = _string_or_empty(function.get("name"))
+    if not name:
+        return ""
+    arguments = function.get("arguments")
+    if arguments is None:
+        arguments = function.get("input")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            arguments = arguments.strip()
+    try:
+        encoded = json.dumps(
+            arguments if arguments is not None else {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        encoded = str(arguments)
+    return f"{name}\0{encoded}"
+
+
+def completed_tool_signatures(messages: Any) -> set[str]:
+    """Find successful tool calls that should not be blindly repeated.
+
+    A repeated call is allowed when a new user message appears after its
+    result, which represents an explicit request to perform the operation
+    again.  Normal assistant -> tool-result continuation turns have no such
+    user message and are therefore protected.
+    """
+
+    if not isinstance(messages, list):
+        return set()
+    call_signatures: dict[str, str] = {}
+    tool_indexes: dict[str, int] = {}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                for raw in calls:
+                    call = normalize_tool_call(raw, index=index)
+                    if call and call.get("id"):
+                        signature = tool_call_signature(call)
+                        if signature:
+                            call_signatures[str(call["id"])] = signature
+        elif message.get("role") == "tool":
+            call_id = _string_or_empty(message.get("tool_call_id"))
+            if call_id and call_id in call_signatures:
+                tool_indexes[call_id] = index
+
+    protected: set[str] = set()
+    for call_id, result_index in tool_indexes.items():
+        signature = call_signatures.get(call_id)
+        if not signature:
+            continue
+        if any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            for message in messages[result_index + 1 :]
+        ):
+            continue
+        protected.add(signature)
+    return protected
+
+
+def _parse_text_tool_body(body: str, fallback_name: str = "", index: int = 0) -> Optional[dict]:
+    raw = body.strip()
+    if not raw:
+        return None
+    # Preferred format: a JSON object with name/tool and input/arguments.
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        call = normalize_tool_call(parsed, index=index, fallback_name=fallback_name)
+        if call:
+            return call
+
+    # Trae XML format: <tool_name>Read</tool_name><input>{...}</input>.
+    name_match = re.search(r"<(?:tool_name|server_name|name)>\s*([^<]+?)\s*</(?:tool_name|server_name|name)>", raw, re.I)
+    name = _string_or_empty(name_match.group(1)) if name_match else fallback_name
+    input_match = re.search(r"<input>\s*([\s\S]*?)\s*</input>", raw, re.I)
+    if input_match:
+        call = normalize_tool_call(
+            {"name": name, "arguments": input_match.group(1).strip()},
+            index=index,
+            fallback_name=name,
+        )
+        if call:
+            return call
+
+    # Kimi/Trae parameter forms: <tool>Bash</tool><parameter>{...}</parameter>.
+    tool_match = re.search(r"<tool>\s*([^<]+?)\s*</tool>", raw, re.I)
+    parameter_match = re.search(r"<parameter(?:\s+[^>]*)?>\s*([\s\S]*?)\s*</parameter>", raw, re.I)
+    if tool_match and parameter_match:
+        return normalize_tool_call(
+            {"name": tool_match.group(1), "arguments": parameter_match.group(1).strip()},
+            index=index,
+        )
+
+    # Named XML fields, e.g. <command>dir</command> or <filePath>x</filePath>.
+    if name:
+        fields: dict[str, str] = {}
+        for field_match in _TOOL_USE_TAG_RE.finditer(raw):
+            key = field_match.group("tag")
+            if key.lower() in {"tool_name", "server_name", "input", "parameter", "tool"}:
+                continue
+            value = field_match.group(2).strip()
+            if value:
+                fields[key] = value
+        for field_match in re.finditer(
+            r"<(?:arg|parameter)\s+name=[\"']([^\"']+)[\"']\s*>\s*([\s\S]*?)\s*</(?:arg|parameter)>",
+            raw,
+            re.I,
+        ):
+            key = field_match.group(1).strip()
+            value = field_match.group(2).strip()
+            if key and value:
+                fields[key] = value
+        if fields:
+            return normalize_tool_call({"name": name, "arguments": fields}, index=index)
+    return None
+
+
+def extract_text_tool_calls(content: Any) -> list[dict]:
+    """Extract tool calls encoded in Trae's text/XML fallback formats."""
+    text = _content_to_text(content)
+    if not text:
+        return []
+    calls: list[dict] = []
+    occupied: list[tuple[int, int]] = []
+    # A model may echo the relay's serialized history marker verbatim.  That is
+    # protocol residue, not a fresh client-tool request: executing it again is
+    # the source of the ``Previous client`` loop.  Mark the whole envelope as
+    # occupied so it is removed from visible text, but only parse real native
+    # tool blocks below.
+    for start, end, marker_calls, _complete in _history_marker_records(text):
+        occupied.append((start, end))
+    for match in _TEXT_TOOL_BLOCK_RE.finditer(text):
+        tag = match.group("tag").lower()
+        call = _parse_text_tool_body(match.group("body"), fallback_name=tag, index=len(calls))
+        if call:
+            calls.append(call)
+            occupied.append((match.start(), match.end()))
+    for match in _NAMED_TOOL_BLOCK_RE.finditer(text):
+        call = _parse_text_tool_body(match.group("body"), fallback_name=match.group("name"), index=len(calls))
+        if call:
+            calls.append(call)
+            occupied.append((match.start(), match.end()))
+    for match in _KIMI_TOOL_PARAMETER_RE.finditer(text):
+        call = _parse_text_tool_body(
+            match.group("body"),
+            fallback_name=match.group("name"),
+            index=len(calls),
+        )
+        if call:
+            calls.append(call)
+            occupied.append((match.start(), match.end()))
+
+    # A compact <tool_call> form can be split by malformed model output. Look
+    # for a JSON object containing a name/arguments pair before the closing tag.
+    for match in re.finditer(r"(\{[\s\S]*?\})\s*</tool_call>", text, re.I):
+        if any(start <= match.start() < end for start, end in occupied):
+            continue
+        call = _parse_text_tool_body(match.group(1), index=len(calls))
+        if call:
+            calls.append(call)
+
+    deduped: dict[str, dict] = {}
+    for call in calls:
+        # Prefer a native/XML call over the same id echoed in a history
+        # envelope.  The latter is only a compatibility fallback.
+        call_id = call["id"]
+        previous = deduped.get(call_id)
+        if previous is not None and previous.get("_history_marker") and not call.get(
+            "_history_marker"
+        ):
+            deduped[call_id] = call
+        else:
+            deduped.setdefault(call_id, call)
+    return list(deduped.values())
+
+
+def _iter_native_tool_calls(result: dict) -> list[dict]:
+    candidates: list[Any] = []
+    for key in ("tool_calls", "tool_call", "function_call"):
+        value = result.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+        elif isinstance(value, dict):
+            candidates.append(value)
+    message = result.get("message")
+    if isinstance(message, dict):
+        for key in ("tool_calls", "tool_call", "function_call"):
+            value = message.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+            elif isinstance(value, dict):
+                candidates.append(value)
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in {
+                    "tool_use", "tool_call", "function_call", "function",
+                }:
+                    candidates.append(block)
+
+    # Trae CLI often wraps the final assistant message in agent_states.
+    states = result.get("agent_states")
+    response_meta = message.get("response_meta") if isinstance(message, dict) else None
+    finish_reason = response_meta.get("finish_reason") if isinstance(response_meta, dict) else None
+    visible_message_text = ""
+    if isinstance(message, dict):
+        visible_message_text = strip_tool_call_blocks(message.get("content")).strip()
+    use_agent_states = not visible_message_text or finish_reason in {
+        "tool_calls", "tool-calls", "function_call", "tool_use",
+    }
+    if use_agent_states and isinstance(states, list):
+        for state in reversed(states):
+            if not isinstance(state, dict):
+                continue
+            messages = state.get("messages")
+            if not isinstance(messages, list):
+                continue
+            for message in reversed(messages):
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    value = message.get("tool_calls")
+                    if isinstance(value, list):
+                        candidates.extend(value)
+                    break
+            if candidates:
+                break
+
+    calls: list[dict] = []
+    for index, candidate in enumerate(candidates):
+        call = normalize_tool_call(candidate, index=index)
+        if call:
+            calls.append(call)
+    return calls
+
+
+def extract_tool_calls(result: Any) -> list[dict]:
+    """Extract native or text-encoded calls from a CLI/upstream payload."""
+    if not isinstance(result, dict):
+        return extract_text_tool_calls(result)
+    calls = _iter_native_tool_calls(result)
+    message = result.get("message")
+    content = message.get("content") if isinstance(message, dict) else result.get("content")
+    calls.extend(extract_text_tool_calls(content))
+    if not calls:
+        calls.extend(extract_text_tool_calls(result.get("response")))
+
+    deduped: dict[str, dict] = {}
+    for call in calls:
+        deduped[call["id"]] = call
+    return list(deduped.values())
+
+
+def strip_tool_call_blocks(content: Any) -> str:
+    """Remove serialized tool-call blocks from visible assistant text."""
+    text = _content_to_text(content)
+    if not text:
+        return ""
+    text = _TEXT_TOOL_BLOCK_RE.sub("", text)
+    text = _NAMED_TOOL_BLOCK_RE.sub("", text)
+    text = _KIMI_TOOL_PARAMETER_RE.sub("", text)
+    # Raw-chat history is serialized as a readable line so the upstream can
+    # preserve the call/result relationship.  If the model echoes that line,
+    # it is protocol residue, never assistant content.
+    text = _CLIENT_TOOL_HISTORY_MARKER_RE.sub("", text)
+    text = _CLIENT_TOOL_HISTORY_CALL_LINE_RE.sub("", text)
+    # Remove complete *and truncated* echoed history envelopes.  Work from the
+    # end so offsets remain valid when multiple markers occur in one response.
+    for start, end, _calls, _complete in reversed(_history_marker_records(text)):
+        prefix = text[:start]
+        suffix = text[end:]
+        text = (prefix.rstrip() if not suffix else prefix) + suffix
+    text = re.sub(r"<tool_calls>\s*</tool_calls>", "", text, flags=re.I)
+    # A hard upstream cutoff can leave only the first word(s) of the marker
+    # (for example ``Previous`` or ``Previous client``).  When that residue is
+    # the complete visible payload it is protocol noise, not an answer.
+    if _HISTORY_PARTIAL_PREFIX_RE.fullmatch(text):
+        return ""
+    if _CLIENT_HISTORY_PARTIAL_PREFIX_RE.fullmatch(text):
+        return ""
+    text = re.sub(
+        r"^\s*Previous(?:\s+client(?:\s+tool(?:\s+request(?:\(s\))?)?)?)?\s*:?\s*(?=<)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = _strip_partial_history_fragments(text)
+    return re.sub(r"^\s*---\s*$", "", text, flags=re.M)
+
+
+class ProtocolTextFilter:
+    """Filter echoed client-tool history across arbitrary stream chunks."""
+
+    _MARKER = _HISTORY_MARKER_LITERAL
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._suppress = False
+        self._array_started = False
+        self._depth = 0
+        self._in_string = False
+        self._escape = False
+
+    def _prefix_length(self, value: str) -> int:
+        folded = value.casefold()
+        marker = self._MARKER.casefold()
+        for length in range(min(len(value), len(marker)), 0, -1):
+            if folded.endswith(marker[:length]):
+                return length
+        return 0
+
+    def feed(self, content: Any) -> str:
+        if content is None:
+            return ""
+        text = _content_to_text(content)
+        if not text:
+            return ""
+        self._pending += text
+        output: list[str] = []
+        while self._pending:
+            if not self._suppress:
+                marker_index = self._pending.casefold().find(self._MARKER.casefold())
+                if marker_index >= 0:
+                    output.append(self._pending[:marker_index])
+                    self._pending = self._pending[marker_index + len(self._MARKER):]
+                    self._suppress = True
+                    self._array_started = False
+                    self._depth = 0
+                    self._in_string = False
+                    self._escape = False
+                    continue
+                keep = self._prefix_length(self._pending)
+                if keep:
+                    output.append(self._pending[:-keep])
+                    self._pending = self._pending[-keep:]
+                else:
+                    output.append(self._pending)
+                    self._pending = ""
+                break
+
+            if not self._array_started:
+                array_index = self._pending.find("[")
+                if array_index < 0:
+                    # A marker without an array is protocol residue. Keep a
+                    # bounded tail until the stream ends so split chunks can
+                    # still complete the marker without growing memory.
+                    self._pending = self._pending[-len(self._MARKER):]
+                    break
+                self._pending = self._pending[array_index:]
+                self._array_started = True
+
+            for index, char in enumerate(self._pending):
+                if self._in_string:
+                    if self._escape:
+                        self._escape = False
+                    elif char == "\\":
+                        self._escape = True
+                    elif char == '"':
+                        self._in_string = False
+                    continue
+                if char == '"':
+                    self._in_string = True
+                elif char == "[":
+                    self._depth += 1
+                elif char == "]":
+                    self._depth -= 1
+                    if self._depth <= 0:
+                        self._pending = self._pending[index + 1:]
+                        self._suppress = False
+                        self._array_started = False
+                        self._depth = 0
+                        break
+            else:
+                self._pending = ""
+                break
+        # A split marker can be emitted into ``output`` when the next frame
+        # arrives before the marker has completed (for example two consecutive
+        # ``Previous client tool request(s`` fragments).  Sanitize each return
+        # value as well as ``flush()`` so protocol residue never reaches the
+        # public stream between frames.
+        return _strip_partial_history_fragments("".join(output))
+
+    def flush(self) -> str:
+        """Return safe trailing text; incomplete protocol is never exposed."""
+
+        if self._suppress:
+            self._pending = ""
+            return ""
+        text = self._pending
+        self._pending = ""
+        return strip_tool_call_blocks(text)
+
+
 def extract_result_text(result: dict) -> str:
     """Extract final text from a Trae CLI JSON result."""
     message = result.get("message")
@@ -369,19 +1287,19 @@ def extract_result_text(result: dict) -> str:
     content = message.get("content", "")
     parts: list[str] = []
     if isinstance(content, str):
-        cleaned = strip_think_tags(content)
+        cleaned = strip_tool_call_blocks(strip_think_tags(content))
         if cleaned:
             parts.append(cleaned)
     elif isinstance(content, list):
         for block in content:
             if isinstance(block, str):
-                cleaned = strip_think_tags(block)
+                cleaned = strip_tool_call_blocks(strip_think_tags(block))
                 if cleaned:
                     parts.append(cleaned)
             elif isinstance(block, dict):
                 block_type = block.get("type", "")
                 if block_type in ("text", "output_text") and isinstance(block.get("text"), str):
-                    cleaned = strip_think_tags(block["text"])
+                    cleaned = strip_tool_call_blocks(strip_think_tags(block["text"]))
                     if cleaned:
                         parts.append(cleaned)
     return "\n".join(parts)
@@ -403,16 +1321,32 @@ def extract_usage(result: dict) -> Optional[dict]:
                 return int(value)
         return 0
 
+    def optional_num(*keys: str) -> Optional[int | float]:
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(0, value)
+        return None
+
     prompt = num("input_tokens", "inputTokens", "prompt_tokens")
     completion = num("output_tokens", "outputTokens", "completion_tokens")
     total = num("total_tokens", "totalTokens")
     if not total:
         total = prompt + completion
-    return {
+    mapped = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
     }
+    credits = optional_num(
+        "credits_consumed",
+        "consumed_credits",
+        "credit_cost",
+        "credits_cost",
+    )
+    if credits is not None:
+        mapped["credits_consumed"] = credits
+    return mapped
 
 
 async def _pump_stream(stream, queue: asyncio.Queue, name: str) -> None:
@@ -432,15 +1366,50 @@ async def stream_cli_chat(
     options: Optional[dict] = None,
 ) -> AsyncIterator[CliEvent]:
     """Stream Trae CLI JSON/text output as CliEvent objects."""
-    del options
+    options = options or {}
     command = resolve_cli_command()
     if not command:
         raise CliUnavailableError(
             "Trae CLI not found. Install traecli/trae-cli/traex or set TRAE_CLI_COMMAND."
         )
 
-    prompt = build_cli_prompt(messages)
-    args = build_cli_args(prompt, model)
+    tool_policy = (
+        bool(options.get("_tool_protocol_requested"))
+        or any(
+            key in options for key in ("tools", "tool_choice", "parallel_tool_calls")
+        )
+        or any(
+            isinstance(message, dict)
+            and (
+                message.get("role") == "tool"
+                or (
+                    message.get("role") == "assistant"
+                    and isinstance(message.get("tool_calls"), list)
+                    and bool(message["tool_calls"])
+                )
+            )
+            for message in messages
+        )
+    )
+    tool_catalog = (
+        options["tools"]
+        if "tools" in options
+        else options.get("_inherited_tools")
+    )
+    external_tools = _iter_tool_definitions(tool_catalog)
+    client_context = options.get("client_context", options.get("clientContext"))
+    prompt_context = (
+        client_context
+        if client_context is not None
+        else ({} if tool_policy else None)
+    )
+    prompt = build_cli_prompt(
+        messages,
+        tools=external_tools if tool_policy else None,
+        tool_choice=options.get("tool_choice"),
+        client_context=prompt_context,
+    )
+    args = build_cli_args(prompt, model, force_disable_tools=tool_policy)
     workdir = resolve_workdir()
     timeout = float(_env("TRAE_CLI_QUERY_TIMEOUT", "300"))
     use_stdin = prompt_mode() == "stdin"

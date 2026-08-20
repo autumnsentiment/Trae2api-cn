@@ -1,15 +1,18 @@
 # Trae2api-cn
 
-Trae CN / Trae Solo CN 模型反代。把 Trae 的模型能力包装成 OpenAI 兼容 API，支持多账号轮询、网页 OAuth 登录、账号并发控制、空闲会话回收。
+Trae CN / Trae Solo CN 模型与工具调用反代。把 Trae 终端协议包装成 OpenAI 兼容 API，支持调用方终端执行工具、多账号轮询、网页 OAuth 登录、账号并发控制和空闲会话回收。
 
 **仅供学习使用。请勿用于商业用途。**
 
 ## 特点
 
-- OpenAI 兼容接口：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/chat`、`POST /v1`
+- OpenAI 兼容接口：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/chat`、`POST /v1`
 - 流式与非流式输出
-- 三种上游模式：Trae CLI 本地子进程、OmniRoute 网页版 remote 会话、IDE chat 端点
-- 自动按优先级回退到可用上游端点
+- OpenAI `tools` / `tool_choice` / `parallel_tool_calls` 兼容，流式输出标准 `delta.tool_calls`
+- Codex Responses API 兼容：支持文本流、`function_call`、`custom_tool_call`、namespace 工具及 `*_call_output` 续轮
+- 调用方工具桥接：请求中声明的 Windows 工作区、Shell、读写和编辑工具由 API 调用方执行，relay 只转发调用与结果
+- 五种上游模式：Trae raw chat、9router 风格 remote 会话、Trae CLI 子进程、旧版网页 remote、IDE chat 端点
+- `auto` 与 `raw` 都只直连 Trae 原生 `llm_utils_chat`，不会把请求留在 relay 缓存，也不会回退到 CLI/remote/web/IDE 模拟路径
 - 多账号管理：网页 UI 添加/切换/删除账号，round-robin 轮询
 - 网页 OAuth 登录：在浏览器中直接授权，无需手动抓取 JWT
 - 多账号轮询：每次请求自动切换到下一个有效账号，突破单账号并发限制
@@ -85,13 +88,132 @@ docker compose up -d --build
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TRAE_AUTH_SOURCE` | `auto` | 认证来源 |
-| `UPSTREAM_MODE` | `auto` | 上游模式：`cli` / `web` / `ide` / `auto` |
-| `TRAE_WEB_BASE_URL` | `https://core-normal.trae.cn/api/remote/v1` | 网页版上游端点 |
+| `UPSTREAM_MODE` | `raw` | 上游模式：`auto` 与 `raw` 均只直连 `llm_utils_chat`；其他兼容模式需显式选择 `remote`（或 `9router`）/ `cli` / `web` / `ide` |
+| `TRAE_CHECKIN_INTERVAL_SECONDS` | `60` | 多账号轮询时相邻实际签到请求的间隔 |
+| `TRAE_CHECKIN_9074_RETRY_SECONDS` | `60` | 上游返回业务码 9074 后提示的最短重试等待时间；relay 不会立即重复 claim |
+| `TRAE_RAW_BASE_URL` | `https://trae-api-cn.mchost.guru` | Trae 原生 `llm_utils_chat` 网关；账号站 `api.trae.com.cn` 不提供此模型端点 |
+| `TRAE_CLIENT_WORKSPACE_PATH` | `C:\workspace` | 未传 `client_context` 时使用的调用方工作区 |
+| `TRAE_CLIENT_SYSTEM_TYPE` | `Windows` | 未传 `client_context` 时使用的调用方系统 |
+| `TRAE_CLI_DISALLOWED_TOOLS` | `Read,Bash,Edit,Replace,Write,Glob,Grep,Task` | CLI 模式额外禁用的 relay 本机工具；外部工具请求会与默认项合并 |
+| `TRAE_WEB_BASE_URL` | `https://trae-api-cn.mchost.guru/api/remote/v1` | remote 上游端点；`remote` 模式按 9router 的 `chat_sessions` + `events` 协议转发 |
 | `TRAE_WEB_PARALLEL_LIMIT` | `2` | 每账号最大并行会话数 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_FETCH_MODEL_LIST` | `false` | `/v1/models` 是否从上游拉取真实模型列表 |
-| `RELAY_API_KEYS` | 空 | API 密钥鉴权（逗号分隔多个） |
+| `SSE_HEARTBEAT_SECONDS` | `1` | Chat/Responses 上游空窗时发送标准 SSE 注释心跳；`0` 为关闭 |
+| `TRAE_USAGE_RECORDS_PATH` | `data/usage_records.json` | 消费记录独立持久化文件，不改写 `data/accounts.json` |
+| `TRAE_USAGE_CREDIT_SETTLE_SECONDS` | `1` | 请求完成后等待上游积分账单落库再计算单次积分差值 |
+| `RESPONSES_SESSION_TTL_SECONDS` | `3600` | `previous_response_id` 会话缓存有效期（秒） |
+| `RESPONSES_SESSION_MAX_ENTRIES` | `1024` | Responses 进程内会话缓存最大条数 |
+| `RELAY_API_KEYS` | 空 | API 密钥鉴权（逗号分隔多个）；公网部署必须设置并配合 TLS |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+
+控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态和模型。积分优先使用上游显式 usage；没有显式值时，relay 在后台比较同一账号请求前后的累计积分，无法安全归属时显示 `--`，不会把未知值伪装成 0。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
+
+## 工具调用
+
+工具调用使用标准 OpenAI 多轮协议。首次请求把工具 schema 和调用方环境放进请求：
+
+```json
+{
+  "model": "auto",
+  "stream": false,
+  "session_id": "terminal-session-1",
+  "messages": [{"role": "user", "content": "读取 README.md"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "读取调用方工作区中的文件",
+      "parameters": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+      }
+    }
+  }],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "client_context": {
+    "workspace_path": "C:\\Users\\me\\project",
+    "system_type": "Windows 11",
+    "terminal_context": [{"shell": "PowerShell", "cwd": "C:\\Users\\me\\project"}]
+  }
+}
+```
+
+非流式响应使用 `message.content: null`、`message.tool_calls` 和 `finish_reason: "tool_calls"`；`function.arguments` 是 JSON 字符串。流式响应在 `delta.tool_calls` 中返回增量，客户端需要按 `index` / `id` 拼接，直到收到 `finish_reason: "tool_calls"`。
+
+客户端收到 assistant 的 `tool_calls` 后，在自己的终端执行工具，再把原 assistant 消息和 `role: "tool"`、匹配的 `tool_call_id`（建议同时带 `name`）及执行结果一起发起下一轮请求。relay 本身不会执行请求中声明的外部工具，也不会自动拥有调用方文件系统；`client_context` 只是告诉模型真实环境，不能替代客户端工具实现。
+
+第二轮请求需带回完整历史，例如：
+
+```json
+{
+  "model": "auto",
+  "session_id": "terminal-session-1",
+  "messages": [
+    {"role": "user", "content": "读取 README.md"},
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_read_1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+      }]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_read_1",
+      "name": "read_file",
+      "content": "README.md 的实际内容"
+    }
+  ],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+    }
+  }]
+}
+```
+
+`UPSTREAM_MODE=auto` 与 `UPSTREAM_MODE=raw` 的路由完全相同：Chat 与 Responses 请求都只发送到 Trae 原生 `llm_utils_chat`。`tools`、`tool_choice`、`parallel_tool_calls`、assistant 的 `tool_calls` 历史及 `role: "tool"` 结果均使用上游原生字段透传；relay 不再用 `Previous client...` 文本模拟工具历史，也不再回退到 CLI/remote/web/IDE。显式使用 `remote`、`web` 或 `ide` 模式发送工具协议请求会返回 `400`。
+
+### 传输实现说明
+
+`remote` 模式复用了 9router Trae executor 的两步会话协议：先 `POST /chat_sessions` 创建回合，再 `GET /chat_sessions/{id}/events?reply_to_message_id=...` 读取 SSE。`plan_item.thought` 按累计快照计算增量，`token_usage`、`done` 和 `error` 会转换为现有 OpenAI Chat/Responses 输出。它只复用 9router 的转发逻辑，不切换到国际版；默认仍使用当前 CN remote 地址。
+
+`ide` 模式保留 trae2api 的 `/api/ide/v1/chat` 请求结构：稳定的 `session_id` / `conversation_id`、`chat_history`、`last_llm_response_info`、设备指纹和 Cloud-IDE-JWT 请求头。两种模式共用现有账号切换、token 快照、SSE 心跳、消费记录和 Responses 会话缓存。
+
+raw 模式不会剥离顶层工具字段后重试。上游错误会原样转换成 API 错误，避免请求看似成功却没有真正发起工具轮次。`GET /v1/status` 的 `tool_execution` 固定为 `client`，并列出当前工具桥接能力。
+
+`UPSTREAM_MODE=cli` 仅作为显式兼容模式保留，会禁用默认工具并合并 `TRAE_CLI_DISALLOWED_TOOLS`；`auto` 不会进入该路径。
+
+工具调用属于不可信模型输出。客户端应校验工具名 allowlist 和 JSON schema，并对路径、命令、权限、超时及输出大小做限制。提示词、`client_context`、工具 schema 和工具结果都会发送给 relay/Trae 上游，敏感内容仍需在调用端裁剪。
+
+## Codex Responses API
+
+Codex 使用 `POST /v1/responses`，不能只把 `wire_api` 改成 Responses 后继续返回 Chat Completions SSE。relay 会把 Responses 的 `input`、扁平 function、自定义工具和 namespace 工具转换到现有 raw/CLI 工具管线，再返回带类型的 Responses 事件。
+
+流式工具轮次会依次包含完整的 `response.output_item.done` 和 `response.completed`。Codex 收到当前响应完成后，才会在调用方终端执行工具，并用相同 `call_id` 加入 `function_call_output` 或 `custom_tool_call_output`，自动发起下一次 `/v1/responses` 请求。Responses 流不使用 Chat Completions 的 `data: [DONE]` 作为完成信号。
+
+Codex 自定义 provider 示例：
+
+```toml
+model_provider = "trae-relay"
+model = "glm-5.3"
+
+[model_providers.trae-relay]
+base_url = "http://服务器:8000/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+若前面还有 new-api，应确保其 Responses 渠道把 `/v1/responses` 原样转发到本 relay；relay 地址自身则是 `http://服务器:8000/v1`。
+
+relay 支持两种连续会话方式：客户端可以在每轮重放完整 `input` 历史，也可以只发送新的输入或工具结果并携带上一轮返回的 `previous_response_id`。后一种方式会从有 TTL 和容量上限的进程内缓存恢复用户消息、assistant 输出、工具调用及绑定；客户端即使同时重放完整历史也会进行重叠去重。`store: false` 不写入缓存，未知、过期、容器重启后失效或超过缓存上限的 response id 会返回明确的 `400 previous_response_id` 错误。
 
 ## 网页管理界面
 

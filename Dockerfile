@@ -9,7 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN useradd --system --create-home --user-group --home-dir /home/app relay
+RUN groupadd --system --gid 999 relay \
+    && useradd --system --uid 999 --gid 999 --create-home --home-dir /home/app relay
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -19,7 +20,6 @@ COPY src ./src
 COPY web_login.py .
 COPY start_auth.bat .
 
-RUN chown -R relay:relay /app /home/app
 RUN chown -R relay:relay /app /home/app && chmod -R u+rwX,go+rX /app
 
 USER relay
