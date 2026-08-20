@@ -697,6 +697,20 @@ def get_active_account_id() -> str:
         return _active_account
 
 
+def get_active_account_snapshot() -> tuple[str, dict]:
+    """Return the selected account id and its credential record atomically.
+
+    Account polling and the web console can switch the global account while a
+    request is being prepared.  Callers that need a token plus its owning id
+    must read both values under the same store lock; otherwise an id from one
+    account can be paired with a token from another account.
+    """
+
+    with _STORE_LOCK:
+        account_id = _active_account
+        return account_id, dict(_accounts.get(account_id) or {})
+
+
 def set_account_checkin(account_id: str, data: dict) -> None:
     """Replace one account's daily-checkin state and mark it freshly queried."""
     with _STORE_LOCK:

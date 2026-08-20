@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -511,6 +512,69 @@ class CheckinResultTests(unittest.TestCase):
 
 
 class UsageRecordTests(unittest.TestCase):
+    @staticmethod
+    def _jwt_for_account(account_id: str) -> str:
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"data": {"id": account_id}}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return "header." + payload + ".signature"
+
+    def test_token_identity_helper_uses_jwt_data_id(self):
+        token = self._jwt_for_account("jwt-account")
+        self.assertEqual(
+            main_module._account_id_from_token(token),
+            "jwt-account",
+        )
+
+    def test_token_only_tracker_uses_bound_jwt_account_not_active_account(self):
+        original_history = main_module._USAGE_HISTORY
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = []
+        main_module._USAGE_ENRICH_TASKS.clear()
+        main_module._USAGE_SNAPSHOT_TASKS.clear()
+        main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+        main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+        token = self._jwt_for_account("charged-account")
+
+        async def scenario(path):
+            with (
+                patch("src.main.auth.get_active_account_id", return_value="selected-account"),
+                patch("src.main.auth.get_user_id", return_value="selected-account"),
+                patch("src.main.auth.get_token", return_value=self._jwt_for_account("selected-account")),
+                patch("src.main._fetch_used_credits", new=AsyncMock(return_value=None)),
+            ):
+                tracker = main_module._UsageTracker(
+                    "glm-5.3",
+                    "/v1/responses",
+                    False,
+                    {
+                        "_account_id": "selected-account",
+                        "_auth_token": token,
+                    },
+                )
+                self.assertEqual(tracker.account_id, "charged-account")
+                self.assertEqual(tracker.token, token)
+                tracker.update({"input_tokens": 1, "output_tokens": 1})
+                with patch.object(main_module, "_USAGE_RECORDS_PATH", path):
+                    await tracker.finish("completed")
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "usage_records.json"
+            try:
+                asyncio.run(scenario(path))
+                self.assertEqual(len(main_module._USAGE_HISTORY), 1)
+                self.assertEqual(
+                    main_module._USAGE_HISTORY[0]["account_id"],
+                    "charged-account",
+                )
+            finally:
+                main_module._USAGE_HISTORY = original_history
+                main_module._USAGE_RECORDS_PATH = original_path
+                main_module._USAGE_ENRICH_TASKS.clear()
+                main_module._USAGE_SNAPSHOT_TASKS.clear()
+                main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+                main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
     def test_usage_record_normalizes_tokens_and_unknown_credit(self):
         record = main_module._normalize_usage_record(
             {"account_id": "acct", "model": "m", "prompt_tokens": 3, "completion_tokens": 4}
@@ -703,6 +767,10 @@ class SessionLeaseTests(unittest.TestCase):
             patch("src.main.auth.next_polling_account") as rotate,
             patch("src.main.auth.get_active_account_id", return_value="account-1"),
             patch(
+                "src.main.auth.get_active_account_snapshot",
+                return_value=("account-1", {"token": "first-jwt"}),
+            ),
+            patch(
                 "src.main.auth.get_account_record",
                 return_value={"token": "first-jwt"},
             ) as account,
@@ -726,7 +794,72 @@ class SessionLeaseTests(unittest.TestCase):
         self.assertEqual(second["_account_id"], "account-1")
         self.assertEqual(second["_auth_token"], "first-jwt")
         self.assertEqual(rotate.call_count, 1)
-        self.assertEqual(account.call_count, 1)
+        # The atomic snapshot supplies the credential and avoids a second
+        # mutable account-store read.
+        self.assertEqual(account.call_count, 0)
+
+    def test_inferred_history_rebinds_after_account_switch_but_explicit_session_stays_pinned(self):
+        messages = [{"role": "user", "content": "inspect the workspace"}]
+        with (
+            patch("src.main.UPSTREAM_MODE", "raw"),
+            patch("src.main.auth.next_polling_account"),
+            patch(
+                "src.main.auth.get_active_account_snapshot",
+                side_effect=[
+                    ("account-a", {"token": "token-a"}),
+                    ("account-b", {"token": "token-b"}),
+                ],
+            ) as snapshot,
+        ):
+            first = main_module._bind_chat_session(messages, {})
+            inferred = main_module._bind_chat_session(
+                [
+                    *messages,
+                    {"role": "assistant", "content": "tool requested"},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+                ],
+                {},
+            )
+
+        self.assertEqual(first["_account_id"], "account-a")
+        self.assertEqual(first["_auth_token"], "token-a")
+        self.assertEqual(inferred["_account_id"], "account-b")
+        self.assertEqual(inferred["_auth_token"], "token-b")
+        self.assertEqual(snapshot.call_count, 2)
+
+        main_module._CHAT_HISTORY_SESSIONS.clear()
+        main_module._UPSTREAM_SESSION_LEASES.clear()
+        with (
+            patch("src.main.UPSTREAM_MODE", "raw"),
+            patch("src.main.auth.next_polling_account"),
+            patch(
+                "src.main.auth.get_active_account_snapshot",
+                side_effect=[
+                    ("account-a", {"token": "token-a"}),
+                ],
+            ),
+        ):
+            pinned = main_module._bind_chat_session(
+                messages,
+                {},
+                requested_session_id="terminal-1",
+            )
+            with patch(
+                "src.main.auth.get_active_account_snapshot",
+                return_value=("account-b", {"token": "token-b"}),
+            ):
+                continuation = main_module._bind_chat_session(
+                    [
+                        *messages,
+                        {"role": "assistant", "content": "tool requested"},
+                        {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+                    ],
+                    {},
+                    requested_session_id="terminal-1",
+                )
+
+        self.assertEqual(pinned["_account_id"], "account-a")
+        self.assertEqual(continuation["_account_id"], "account-a")
 
     def test_idle_session_lease_is_reaped_and_active_stream_is_retained(self):
         main_module._UPSTREAM_SESSION_LEASES["idle"] = main_module._UpstreamSessionLease(

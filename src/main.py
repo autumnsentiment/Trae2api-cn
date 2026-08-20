@@ -15,6 +15,8 @@ main.py - Trae CN Relay 中转站
 """
 
 import asyncio
+import base64
+import binascii
 import codecs
 import gzip
 import hashlib
@@ -665,7 +667,17 @@ def _web_login_html() -> str:
           </table>
         </div>"""
     else:
-        accounts_html = '<p style="font-size:13px;color:#9aa0b0;margin-bottom:8px">暂无账号，请先登录或手动添加。</p>'
+        # Keep the account actions in the DOM even before the first login.
+        # This gives the console a stable control surface and lets the same
+        # frontend code handle an account list that becomes populated after a
+        # login without requiring a page-specific script branch.
+        accounts_html = '''
+        <p style="font-size:13px;color:#9aa0b0;margin-bottom:8px">暂无账号，请先登录或手动添加。</p>
+        <div class="account-toolbar" hidden>
+          <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">查询签到状态</button>
+          <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">查询全部积分</button>
+          <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">一键轮询签到</button>
+        </div>'''
 
     logout_btn = ''
     if state.token:
@@ -1855,13 +1867,36 @@ def _bind_chat_session(
     with _CHAT_SESSION_LOCK:
         _prune_chat_sessions(now)
         session_id = requested_session_id.strip()
+        inferred_account_snapshot: tuple[str, dict] | None = None
         if not session_id and _chat_has_prior_turn(messages):
+            # Capture the currently selected account once for an inferred
+            # replay. This both makes the account comparison atomic and lets a
+            # manual account switch take effect without consulting the mutable
+            # legacy getters separately.
+            inferred_account_snapshot = auth.get_active_account_snapshot()
             # Prefer the most specific known prefix, then fall back to the full
             # replay for idempotent retries of the same request.
             for length in range(len(messages), 0, -1):
                 found = _CHAT_HISTORY_SESSIONS.get(_chat_history_key(messages, length))
                 if found is not None:
-                    session_id = found[0]
+                    candidate_id = found[0]
+                    candidate_lease = _UPSTREAM_SESSION_LEASES.get(candidate_id)
+                    # A client that switched accounts and then replayed a full
+                    # OpenAI history without a relay session id must start a
+                    # fresh upstream conversation. Explicit session ids (used
+                    # by Responses continuation) bypass this branch and keep
+                    # their original credential by design.
+                    active_account = str(
+                        (inferred_account_snapshot or ("", {}))[0] or ""
+                    )
+                    if (
+                        active_account
+                        and candidate_lease is not None
+                        and candidate_lease.account_id
+                        and candidate_lease.account_id != active_account
+                    ):
+                        continue
+                    session_id = candidate_id
                     _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages, length))
                     break
         if not session_id:
@@ -1879,11 +1914,28 @@ def _bind_chat_session(
                 "auto",
             ):
                 auth.next_polling_account()
-            account_id = auth.get_active_account_id() or ""
-            record = auth.get_account_record(account_id) if account_id else {}
+            # Read the selected id and its credential record as one snapshot.
+            # Separate getter calls can race an account rotation and bind an
+            # account id to a different account's token.
+            if inferred_account_snapshot is not None and not bool(
+                auth.get_polling_status().get("enabled")
+            ):
+                account_id, record = inferred_account_snapshot
+            else:
+                account_id, record = auth.get_active_account_snapshot()
+            # Keep compatibility with integrations/tests that replace the
+            # legacy getters while still preferring the atomic snapshot in
+            # normal operation.
+            if not account_id:
+                account_id = auth.get_active_account_id() or ""
+            if account_id and not record:
+                record = auth.get_account_record(account_id)
+            token = str(record.get("token") or "")
+            if not token and not account_id:
+                token = str(auth.get_token() or "")
             lease = _UpstreamSessionLease(
                 account_id=account_id,
-                auth_token=str(record.get("token") or auth.get_token() or ""),
+                auth_token=token,
                 last_client_activity=now,
             )
             _UPSTREAM_SESSION_LEASES[session_id] = lease
@@ -2118,6 +2170,9 @@ def _usage_values(usage: Any) -> dict[str, Any]:
 
 def _request_account_identity() -> tuple[str, str]:
     token = auth.get_token() or ""
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        return token_identity, token
     account_id = (
         auth.get_active_account_id()
         or auth.get_user_id()
@@ -2125,6 +2180,35 @@ def _request_account_identity() -> tuple[str, str]:
         or "default"
     )
     return str(account_id), token
+
+
+def _account_id_from_token(token: str) -> str:
+    """Extract the immutable Trae account id carried by a JWT, if present."""
+
+    raw_token = str(token or "").strip()
+    if not raw_token:
+        return ""
+    try:
+        parts = raw_token.split(".")
+        if len(parts) < 2:
+            return ""
+        encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+    except (ValueError, TypeError, UnicodeError, binascii.Error, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, Mapping):
+        return ""
+    data = payload.get("data")
+    if isinstance(data, Mapping):
+        for key in ("id", "user_id", "userId", "sub"):
+            value = data.get(key)
+            if value not in (None, ""):
+                return str(value)
+    for key in ("user_id", "userId", "sub"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
 
 
 async def _fetch_used_credits(token: str) -> int | float | None:
@@ -2267,6 +2351,22 @@ class _UsageTracker:
         options = options or {}
         self.account_id = str(options.get("_account_id") or "")
         self.token = str(options.get("_auth_token") or "")
+        if self.account_id and not self.token:
+            # An explicitly bound account owns the lookup.  Never fill its
+            # token from the mutable global auth state.
+            record = auth.get_account_record(self.account_id)
+            self.token = str(record.get("token") or "")
+        token_identity = _account_id_from_token(self.token)
+        if token_identity:
+            # The JWT is the credential that the upstream actually bills. It
+            # is authoritative over a stale UI-selected account id.
+            if self.account_id and self.account_id != token_identity:
+                logger.warning(
+                    "usage account corrected from bound id=%s to token id=%s",
+                    self.account_id,
+                    token_identity,
+                )
+            self.account_id = token_identity
         if not self.account_id or not self.token:
             fallback_account_id, fallback_token = _request_account_identity()
             self.account_id = self.account_id or fallback_account_id
@@ -2466,20 +2566,42 @@ async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = 
 
 async def run_web_session(messages, model, stream: bool, options: Optional[dict] = None):
     """OmniRoute 风格网页版 remote 会话，带账号并发槽和空闲回收。"""
-    account_id = auth.get_user_id() or auth.get_token()[:16] or "default"
+    options = dict(options or {})
+    token = str(options.get("_auth_token") or "").strip()
+    account_id = str(options.get("_account_id") or "").strip()
+    if not token and account_id:
+        token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+    if not token and not account_id:
+        token = str(auth.get_token() or "").strip()
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        account_id = token_identity
+    if not account_id:
+        account_id = str(
+            auth.get_active_account_id() or auth.get_user_id() or token[:16] or "default"
+        )
+    if not token:
+        token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
     await trae_client.acquire_web_slot(account_id, timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")))
     client = httpx.AsyncClient(timeout=60)
     session_id = ""
     translation_options = _tool_translation_options(options, messages)
+    bound_options = {**options, "_auth_token": token, "_account_id": account_id}
     try:
         session_id, message_id = await trae_client.create_web_session(
             client,
             model,
             messages,
-            options=options,
+            options=bound_options,
         )
-        trae_client.register_web_lease(account_id, session_id, message_id, client)
-        event_iter = trae_client.stream_web_events(client, session_id, message_id)
+        trae_client.register_web_lease(
+            account_id, session_id, message_id, client, token=token
+        )
+        event_iter = trae_client.stream_web_events(
+            client, session_id, message_id, options=bound_options
+        )
         if stream:
             async def gen():
                 try:
@@ -2491,7 +2613,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
                 finally:
                     # Actively interrupt the upstream session so it stops
                     # occupying a running slot, then close local resources.
-                    await trae_client.stop_web_session(client, session_id, message_id)
+                    await trae_client.stop_web_session(
+                        client, session_id, message_id, options=bound_options
+                    )
                     await client.aclose()
                     if trae_client.unregister_web_lease(session_id):
                         trae_client.release_web_slot(account_id)
@@ -2507,14 +2631,18 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
             _track_usage_from_result(result, model)
             return JSONResponse(content=result)
         finally:
-            await trae_client.stop_web_session(client, session_id, message_id)
+            await trae_client.stop_web_session(
+                client, session_id, message_id, options=bound_options
+            )
             await client.aclose()
             if trae_client.unregister_web_lease(session_id):
                 trae_client.release_web_slot(account_id)
     except Exception:
         if session_id:
             try:
-                await trae_client.stop_web_session(client, session_id, message_id)
+                await trae_client.stop_web_session(
+                    client, session_id, message_id, options=bound_options
+                )
             except Exception:
                 pass
         await client.aclose()
@@ -2534,9 +2662,27 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     ``_bind_chat_session`` are used for both create and events requests.
     """
     options = dict(options or {})
-    account_id = str(options.get("_account_id") or auth.get_active_account_id() or "default")
+    account_id = str(options.get("_account_id") or "").strip()
+    token = str(options.get("_auth_token") or "").strip()
+    if not token and account_id:
+        # A bound account owns its credential.  Do not fall back to the
+        # mutable global token, which may belong to a concurrently selected
+        # account.
+        token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+    if not token and not account_id:
+        token = str(auth.get_token() or "").strip()
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        # The JWT is the identity Trae bills.  It is authoritative if an old
+        # account-store key or UI selection is stale.
+        account_id = token_identity
+    if not account_id:
+        account_id = str(auth.get_active_account_id() or "default")
     record = auth.get_account_record(account_id) if account_id else {}
-    token = str(options.get("_auth_token") or record.get("token") or auth.get_token() or "")
+    if not token:
+        token = str(record.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
     remote_options = dict(options)
     provider_specific = record.get("provider_specific") or record.get("providerSpecificData")
     if isinstance(provider_specific, dict):
@@ -3044,7 +3190,10 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             if mode == "raw":
                 return await run_raw_chat(messages, model, stream, options)
             mode_options = dict(options)
-            if mode != "remote":
+            # Web and remote routes must receive the lease-bound credential;
+            # otherwise a concurrent account switch can make the upstream bill
+            # one token while the usage tracker records another.
+            if mode not in ("remote", "web", "ide"):
                 mode_options.pop("_auth_token", None)
                 mode_options.pop("_account_id", None)
             if mode == "cli":

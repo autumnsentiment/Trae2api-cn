@@ -1512,6 +1512,181 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
         )
         self.assertTrue(closed)
 
+    def test_stream_reconciles_cumulative_text_snapshots_and_replays(self):
+        async def inner():
+            for content in ("hello", "hello world", "hello world"):
+                yield "data: " + json.dumps(
+                    {"choices": [{"delta": {"content": content}}]}
+                ) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        async def run():
+            _, _, context = responses_api.normalize_request(
+                {"model": "auto", "input": "hello", "stream": True}
+            )
+            return [
+                event
+                async for event in responses_api.translate_chat_stream(
+                    inner(), context
+                )
+            ]
+
+        events = _parse_responses_sse("".join(asyncio.run(run())))
+        deltas = [
+            payload.get("delta", "")
+            for name, payload in events
+            if name == "response.output_text.delta"
+        ]
+        self.assertEqual("".join(deltas), "hello world")
+
+    def test_stream_keeps_short_incremental_text_repetition(self):
+        async def inner():
+            for content in ("ha", "ha"):
+                yield "data: " + json.dumps(
+                    {"choices": [{"delta": {"content": content}}]}
+                ) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        async def run():
+            _, _, context = responses_api.normalize_request(
+                {"model": "auto", "input": "hello", "stream": True}
+            )
+            return [
+                event
+                async for event in responses_api.translate_chat_stream(
+                    inner(), context
+                )
+            ]
+
+        events = _parse_responses_sse("".join(asyncio.run(run())))
+        self.assertEqual(
+            "".join(
+                payload.get("delta", "")
+                for name, payload in events
+                if name == "response.output_text.delta"
+            ),
+            "haha",
+        )
+
+    def test_stream_reconciles_cumulative_tool_arguments(self):
+        async def inner():
+            for arguments in ('{"path":"R', '{"path":"README.md"}', '{"path":"README.md"}'):
+                yield "data: " + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_read",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": arguments,
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        async def run():
+            _, _, context = responses_api.normalize_request(
+                {
+                    "model": "auto",
+                    "input": "read",
+                    "stream": True,
+                    "tools": [_responses_tool()],
+                }
+            )
+            return [
+                event
+                async for event in responses_api.translate_chat_stream(
+                    inner(), context
+                )
+            ]
+
+        events = _parse_responses_sse("".join(asyncio.run(run())))
+        done = next(
+            payload
+            for name, payload in events
+            if name == "response.function_call_arguments.done"
+        )
+        self.assertEqual(done["arguments"], '{"path":"README.md"}')
+        self.assertEqual(json.loads(done["arguments"]), {"path": "README.md"})
+
+    def test_finish_reason_without_done_fails_and_is_not_cached(self):
+        async def inner():
+            yield (
+                'data: {"choices":[{"delta":{"content":"partial"},'
+                '"finish_reason":"stop"}]}\n\n'
+            )
+
+        async def run():
+            _, _, context = responses_api.normalize_request(
+                {"model": "auto", "input": "hello", "stream": True}
+            )
+            chunks = [
+                event
+                async for event in responses_api.translate_chat_stream(
+                    inner(), context
+                )
+            ]
+            return context.response_id, chunks
+
+        response_id, chunks = asyncio.run(run())
+        events = _parse_responses_sse("".join(chunks))
+        self.assertEqual(events[-1][0], "response.failed")
+        self.assertNotIn("response.completed", [name for name, _ in events])
+        self.assertIsNone(responses_api._RESPONSE_SESSIONS.get(response_id))
+
+    def test_text_before_tool_call_is_not_prematurely_final_answer(self):
+        async def inner():
+            yield (
+                'data: {"choices":[{"delta":{"content":"I will inspect."}}]}\n\n'
+            )
+            yield (
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"id":"call_read","function":{"name":"read_file",'
+                '"arguments":"{}"}}]}}]}\n\n'
+            )
+            yield "data: [DONE]\n\n"
+
+        async def run():
+            _, _, context = responses_api.normalize_request(
+                {
+                    "model": "auto",
+                    "input": "read",
+                    "stream": True,
+                    "tools": [_responses_tool()],
+                }
+            )
+            return [
+                event
+                async for event in responses_api.translate_chat_stream(
+                    inner(), context
+                )
+            ]
+
+        events = _parse_responses_sse("".join(asyncio.run(run())))
+        added = next(
+            payload
+            for name, payload in events
+            if name == "response.output_item.added"
+            and payload["item"]["type"] == "message"
+        )
+        self.assertNotIn("phase", added["item"])
+        done = next(
+            payload
+            for name, payload in events
+            if name == "response.output_item.done"
+            and payload["item"]["type"] == "message"
+        )
+        self.assertEqual(done["item"]["phase"], "commentary")
+
     def test_raw_empty_retry_emits_one_responses_lifecycle(self):
         class LineSource:
             def __init__(self, lines):

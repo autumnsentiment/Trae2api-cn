@@ -1314,6 +1314,77 @@ _CHAT_STREAM_DONE = object()
 _CHAT_STREAM_HEARTBEAT = object()
 
 
+class _StreamDeltaReconciler:
+    """Convert a mixed incremental/cumulative upstream field into deltas.
+
+    Some Trae/Chat stream implementations emit a growing snapshot for a
+    field, while others emit only the newly generated suffix.  The Responses
+    protocol only accepts the latter.  Snapshot mode is enabled only after
+    there is evidence of a growing/replayed snapshot, keeping short legitimate
+    repetitions such as ``ha`` + ``ha`` intact for normal incremental streams.
+    """
+
+    _TEXT_REPLAY_MIN_LENGTH = 16
+
+    def __init__(self, *, suppress_short_replay: bool = False) -> None:
+        self.value = ""
+        self.snapshot_mode = False
+        self.suppress_short_replay = suppress_short_replay
+
+    def feed(self, incoming: str) -> str:
+        if not incoming:
+            return ""
+
+        # Once an upstream has demonstrated cumulative snapshots, older and
+        # duplicate snapshots are never public deltas again.
+        if self.snapshot_mode:
+            if incoming.startswith(self.value):
+                suffix = incoming[len(self.value) :]
+                self.value = incoming
+                return suffix
+            if self.value.startswith(incoming):
+                return ""
+            self.value += incoming
+            return incoming
+
+        # A longer value beginning with already-emitted text is definitive
+        # evidence of a cumulative snapshot.
+        if (
+            self.value
+            and len(incoming) > len(self.value)
+            and incoming.startswith(self.value)
+        ):
+            self.snapshot_mode = True
+            suffix = incoming[len(self.value) :]
+            self.value = incoming
+            return suffix
+
+        # Tool arguments must form one JSON document, so an exact replay can
+        # never be safely appended.  For ordinary text, only suppress a full
+        # sentence/paragraph replay; short repeated tokens remain valid.
+        if incoming == self.value and (
+            self.suppress_short_replay
+            or len(incoming) >= self._TEXT_REPLAY_MIN_LENGTH
+        ):
+            self.snapshot_mode = True
+            return ""
+
+        # A shorter prefix after a substantial body is also a replayed
+        # snapshot rather than a new text token.
+        if (
+            self.value.startswith(incoming)
+            and (
+                self.suppress_short_replay
+                or len(incoming) >= self._TEXT_REPLAY_MIN_LENGTH
+            )
+        ):
+            self.snapshot_mode = True
+            return ""
+
+        self.value += incoming
+        return incoming
+
+
 async def _chat_sse_events(body_iterator) -> AsyncIterator[Any]:
     buffer = ""
 
@@ -1375,8 +1446,8 @@ async def _translate_chat_stream(
     usage = None
     finish_reason = "stop"
     saw_terminal = False
-    saw_finish_reason = False
     text_filter = ProtocolTextFilter()
+    text_deltas = _StreamDeltaReconciler()
 
     def append_text_events(content: str) -> list[str]:
         nonlocal sequence, text_item, text_index
@@ -1390,7 +1461,6 @@ async def _translate_chat_stream(
                 "type": "message",
                 "role": "assistant",
                 "status": "in_progress",
-                "phase": "final_answer",
                 "content": [
                     {
                         "type": "output_text",
@@ -1495,16 +1565,11 @@ async def _translate_chat_stream(
                     continue
                 if choice.get("finish_reason"):
                     finish_reason = str(choice.get("finish_reason"))
-                    # Chat upstreams may attach finish_reason to a cumulative
-                    # snapshot before the remaining SSE deltas arrive.  Keep
-                    # consuming the stream; [DONE] (or a clean EOF after a
-                    # finish snapshot) is the turn boundary.
-                    saw_finish_reason = True
                 delta = choice.get("delta")
                 if not isinstance(delta, Mapping):
                     continue
-                content = delta.get("content")
-                content = text_filter.feed(content)
+                content = _content_to_text(delta.get("content"))
+                content = text_filter.feed(text_deltas.feed(content))
                 for event in append_text_events(content):
                     yield event
 
@@ -1522,6 +1587,9 @@ async def _translate_chat_stream(
                             "name": "",
                             "call_id": "",
                             "arguments": "",
+                            "argument_deltas": _StreamDeltaReconciler(
+                                suppress_short_replay=True
+                            ),
                             "item": None,
                             "output_index": -1,
                             "binding": None,
@@ -1585,6 +1653,11 @@ async def _translate_chat_stream(
                         sequence += 1
 
                     if argument_delta:
+                        argument_delta = state["argument_deltas"].feed(
+                            argument_delta
+                        )
+                        if not argument_delta:
+                            continue
                         state["arguments"] += argument_delta
                         binding = state.get("binding")
                         if binding and binding.response_type == "function":
@@ -1615,7 +1688,11 @@ async def _translate_chat_stream(
     for event in append_text_events(text_filter.flush()):
         yield event
 
-    if not saw_terminal and not saw_finish_reason:
+    # Only the protocol's [DONE] sentinel proves that the Chat event stream
+    # reached its terminal boundary.  A finish_reason frame can be an early
+    # snapshot and an EOF after it must remain retryable rather than cached as
+    # a completed Responses turn.
+    if not saw_terminal:
         yield _sse_event(
             "response.failed",
             sequence,
@@ -1627,7 +1704,7 @@ async def _translate_chat_stream(
                 error={
                     "code": "upstream_stream_incomplete",
                     "message": (
-                        "Upstream stream ended without finish_reason or [DONE]"
+                        "Upstream stream ended without [DONE]"
                     ),
                 },
             ),

@@ -691,12 +691,19 @@ def release_web_slot(account_id: str = "") -> None:
     _web_slot(account_id).release()
 
 
-def register_web_lease(account_id: str, session_id: str, message_id: str, client: httpx.AsyncClient) -> None:
+def register_web_lease(
+    account_id: str,
+    session_id: str,
+    message_id: str,
+    client: httpx.AsyncClient,
+    token: str = "",
+) -> None:
     _WEB_LEASES[session_id] = {
         "account_id": account_id,
         "session_id": session_id,
         "message_id": message_id,
         "client": client,
+        "token": token,
         "last_activity": time.monotonic(),
     }
 
@@ -717,12 +724,18 @@ def idle_web_leases() -> list[dict]:
 
 
 
-async def stop_web_session(client: httpx.AsyncClient, session_id: str, message_id: str) -> None:
+async def stop_web_session(
+    client: httpx.AsyncClient,
+    session_id: str,
+    message_id: str,
+    options: Optional[dict] = None,
+) -> None:
     """Actively interrupt an upstream web session so it stops occupying a running slot."""
     if not session_id or not message_id:
         return
     base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
-    token = auth.get_token()
+    options = options or {}
+    token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
         return
     try:
@@ -749,7 +762,12 @@ async def reap_idle_web_sessions() -> int:
         if unregister_web_lease(session_id):
             if client is not None:
                 try:
-                    await stop_web_session(client, session_id, message_id)
+                    await stop_web_session(
+                        client,
+                        session_id,
+                        message_id,
+                        options={"_auth_token": lease.get("token") or ""},
+                    )
                 except Exception:
                     pass
             if client is not None:
@@ -877,7 +895,8 @@ async def create_web_session(
             "Trae web remote cannot safely proxy caller-owned tool policy"
         )
     base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
-    token = auth.get_token()
+    options = options or {}
+    token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
 
@@ -929,11 +948,13 @@ async def stream_web_events(
     client: httpx.AsyncClient,
     session_id: str,
     message_id: str,
+    options: Optional[dict] = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     """GET /chat_sessions/{id}/events?reply_to_message_id=...（SSE）。"""
     base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
     url = f"{base}/chat_sessions/{session_id}/events?reply_to_message_id={message_id}"
-    token = auth.get_token()
+    options = options or {}
+    token = str(options.get("_auth_token") or auth.get_token() or "")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     async with client.stream("GET", url, headers=build_web_headers(token), timeout=timeout) as resp:
         if resp.status_code != 200:
@@ -1145,19 +1166,59 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
 
     from . import auth as auth_module
 
-    await auth_module.maybe_refresh()
+    # A relay session captures its credential before dispatch.  Keep that
+    # snapshot independent from the mutable global auth state: account polling
+    # or a console switch may happen while this request is waiting for headers.
+    options = dict(options or {})
+    bound_account_id = str(options.get("_account_id") or "").strip()
+    bound_token = str(options.get("_auth_token") or "").strip()
+    bound_record = (
+        auth_module.get_account_record(bound_account_id)
+        if bound_account_id
+        else {}
+    )
+    if not bound_token and not bound_account_id:
+        # The legacy unbound path may refresh the selected account.  Never
+        # refresh here when a caller supplied a lease account: refresh_token()
+        # operates on global auth and could replace a different account's
+        # credential mid-request.
+        await auth_module.maybe_refresh()
+        bound_token = str(auth.get_token() or "").strip()
+    if not bound_token:
+        bound_token = str(bound_record.get("token") or "").strip()
+    if not bound_token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
 
-    base = os.environ.get("TRAE_API_HOST", "") or auth.get_auth().host or "https://trae-api-cn.mchost.guru"
+    bound_user_id = str(
+        options.get("_auth_user_id")
+        or bound_record.get("user_id")
+        or bound_account_id
+        or auth.get_user_id()
+        or ""
+    ).strip()
+    base = str(
+        options.get("_auth_host")
+        or bound_record.get("host")
+        or os.environ.get("TRAE_API_HOST", "")
+        or auth.get_auth().host
+        or "https://trae-api-cn.mchost.guru"
+    )
     base = base.rstrip("/")
 
     model_name = convert_model_name(model)
-    options = options or {}
     max_tokens = options.get("maxTokens") or options.get("max_tokens")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     errors: list[str] = []
 
     for endpoint in IDE_ENDPOINTS:
-        client = httpx.Client(headers=build_headers(), timeout=timeout, http2=False)
+        client = httpx.Client(
+            headers=build_headers(
+                token_override=bound_token,
+                user_id_override=bound_user_id,
+            ),
+            timeout=timeout,
+            http2=False,
+        )
         try:
             if endpoint == "/api/ide/v1/chat":
                 _, trae_req = await build_trae_ide_request(

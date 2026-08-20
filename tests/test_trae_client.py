@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from src import trae_client
@@ -223,6 +224,118 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
 
 
 class IdeRequestContextTests(unittest.TestCase):
+    def test_ide_request_uses_bound_account_credential_snapshot(self):
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                pass
+
+        class FakeClient:
+            def __init__(self, *, headers, timeout, http2):
+                self.headers = headers
+                self.timeout = timeout
+                self.http2 = http2
+                calls.append(self)
+
+            def build_request(self, method, url, **kwargs):
+                self.request = (method, url, kwargs)
+                return self.request
+
+            def send(self, request, stream=True):
+                self.sent = (request, stream)
+                return FakeResponse()
+
+            def close(self):
+                self.closed = True
+
+        bound_options = {
+            "_account_id": "charged-account",
+            "_auth_token": "bound-token",
+        }
+        with (
+            patch(
+                "src.trae_client.auth.get_account_record",
+                return_value={
+                    "user_id": "charged-account",
+                    "host": "https://charged.example",
+                    "token": "stale-token",
+                },
+            ),
+            patch("src.trae_client.auth.get_token", return_value="selected-token"),
+            patch("src.trae_client.auth.get_user_id", return_value="selected-account"),
+            patch("src.trae_client.auth.get_auth", return_value=SimpleNamespace(host="https://selected.example")),
+            patch("src.trae_client.auth.maybe_refresh", new=AsyncMock()) as refresh,
+            patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+            patch(
+                "src.trae_client.build_headers",
+                side_effect=lambda **kwargs: {
+                    "Authorization": "Cloud-IDE-JWT " + kwargs["token_override"],
+                    "x-uid": kwargs["user_id_override"],
+                },
+            ) as build_headers,
+        ):
+            response = asyncio.run(
+                trae_client.send_chat_request(
+                    [{"role": "user", "content": "hello"}],
+                    "auto",
+                    False,
+                    bound_options,
+                )
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].headers["Authorization"], "Cloud-IDE-JWT bound-token")
+        self.assertEqual(calls[0].headers["x-uid"], "charged-account")
+        self.assertEqual(calls[0].request[1], "https://charged.example/api/agent/v3/llm_utils_chat")
+        build_headers.assert_called_once_with(
+            token_override="bound-token",
+            user_id_override="charged-account",
+        )
+        refresh.assert_not_awaited()
+        response.close()
+
+    def test_unbound_ide_request_can_refresh_selected_account(self):
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                pass
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+
+            def build_request(self, *args, **kwargs):
+                return (args, kwargs)
+
+            def send(self, request, stream=True):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        with (
+            patch("src.trae_client.auth.maybe_refresh", new=AsyncMock()) as refresh,
+            patch("src.trae_client.auth.get_token", return_value="selected-token"),
+            patch("src.trae_client.auth.get_user_id", return_value="selected-account"),
+            patch("src.trae_client.auth.get_auth", return_value=SimpleNamespace(host="https://selected.example")),
+            patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+            patch("src.trae_client.build_headers", return_value={}),
+        ):
+            response = asyncio.run(
+                trae_client.send_chat_request(
+                    [{"role": "user", "content": "hello"}],
+                    "auto",
+                    False,
+                )
+            )
+
+        refresh.assert_awaited_once()
+        response.close()
+
     def test_uses_caller_workspace_and_terminal_context(self):
         _, request = asyncio.run(
             trae_client.build_trae_ide_request(
