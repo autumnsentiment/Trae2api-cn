@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from src import auth
 from src.auth import AuthState, _merge_state_record
 
 
@@ -32,6 +34,26 @@ class AuthStateMergeTests(unittest.TestCase):
         self.assertEqual(merged["checkin"], previous["checkin"])
         self.assertEqual(merged["checkin_updated_at"], previous["checkin_updated_at"])
         self.assertEqual(merged["future_cache_field"], previous["future_cache_field"])
+
+    def test_credit_merge_does_not_refresh_daily_checkin_timestamp(self):
+        record = {
+            "checkin": {"checked_in": True},
+            "checkin_status_updated_at": 100.0,
+            "checkin_updated_at": 100.0,
+        }
+        with (
+            patch.object(auth, "_accounts", {"account-1": record}),
+            patch.object(auth, "_save_accounts"),
+            patch("src.auth.time.time", return_value=200.0),
+        ):
+            merged = auth.merge_account_credits(
+                "account-1", {"account_credits": {"remaining": 10}}
+            )
+
+        self.assertTrue(merged["checked_in"])
+        self.assertEqual(record["checkin_status_updated_at"], 100.0)
+        self.assertEqual(record["checkin_updated_at"], 100.0)
+        self.assertEqual(record["credits_updated_at"], 200.0)
 
 
 if __name__ == "__main__":

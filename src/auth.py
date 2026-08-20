@@ -698,18 +698,20 @@ def get_active_account_id() -> str:
 
 
 def set_account_checkin(account_id: str, data: dict) -> None:
-    """Persist checkin/credits cache for one account."""
+    """Replace one account's daily-checkin state and mark it freshly queried."""
     with _STORE_LOCK:
         rec = _accounts.get(account_id)
         if not rec:
             return
         rec['checkin'] = dict(data or {})
-        rec['checkin_updated_at'] = time.time()
+        now = time.time()
+        rec['checkin_status_updated_at'] = now
+        rec['checkin_updated_at'] = now
         _save_accounts()
 
 
 def merge_account_checkin(account_id: str, data: dict) -> dict:
-    """Atomically merge a partial checkin or credits refresh into its cache."""
+    """Merge daily-checkin state and mark the status snapshot freshly queried."""
     with _STORE_LOCK:
         rec = _accounts.get(account_id)
         if not rec:
@@ -717,7 +719,23 @@ def merge_account_checkin(account_id: str, data: dict) -> dict:
         checkin = dict(rec.get('checkin') or {})
         checkin.update(dict(data or {}))
         rec['checkin'] = checkin
-        rec['checkin_updated_at'] = time.time()
+        now = time.time()
+        rec['checkin_status_updated_at'] = now
+        rec['checkin_updated_at'] = now
+        _save_accounts()
+        return dict(checkin)
+
+
+def merge_account_credits(account_id: str, data: dict) -> dict:
+    """Merge entitlement credits without refreshing the daily-checkin date."""
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get('checkin') or {})
+        checkin.update(dict(data or {}))
+        rec['checkin'] = checkin
+        rec['credits_updated_at'] = time.time()
         _save_accounts()
         return dict(checkin)
 
@@ -745,7 +763,10 @@ def list_accounts() -> list[dict]:
                 'credits': checkin.get('credits'),
                 'checked_in': checkin.get('checked_in'),
                 'checkin_enable': checkin.get('enable'),
-                'checkin_updated_at': rec.get('checkin_updated_at', 0),
+                'checkin_updated_at': rec.get(
+                    'checkin_status_updated_at', rec.get('checkin_updated_at', 0)
+                ),
+                'credits_updated_at': rec.get('credits_updated_at', 0),
                 'account_credits': checkin.get('account_credits'),
                 'work_credits': checkin.get('work_credits'),
                 'total_credits': checkin.get('total_credits'),

@@ -32,6 +32,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -114,6 +115,7 @@ _CHECKIN_CLAIM_GATE_LOOP: asyncio.AbstractEventLoop | None = None
 _CHECKIN_NEXT_CLAIM_AT = 0.0
 _CHECKIN_COOLDOWN_UNTIL: dict[str, float] = {}
 _CHECKIN_ACCEPTED_UNTIL: dict[str, float] = {}
+_CHECKIN_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 # Kept as a compatibility knob for older integrations; claim no longer runs
 # automatic verification probes.
 _CHECKIN_VERIFY_DELAYS: tuple[float, ...] = ()
@@ -1318,7 +1320,9 @@ async function checkinClaimAll(){{
   if(!confirm('确定按顺序逐个对所有账号签到？')) return;
   setBusy(true);
   try{{
-    var result=await requestJSON('/api/checkin/claim-all',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}},900000);
+    var accountCount=document.querySelectorAll('tr[data-account-id]').length;
+    var timeoutMs=Math.max(900000,(accountCount+1)*({CHECKIN_INTERVAL}+5)*1000);
+    var result=await requestJSON('/api/checkin/claim-all',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}},timeoutMs);
     var d=result.data;
     if(!result.ok||!d||!d.success){{ throw new Error(apiError(d,result.status)); }}
     var accounts=d.accounts||[];
@@ -3327,7 +3331,7 @@ async def api_checkin_work_credits(account_id: str):
         raw_total = await trae_client.fetch_account_total_credits(token)
         total = trae_client.parse_account_credits(raw_total)
         work = _sub_credits(total, general)
-        auth.merge_account_checkin(
+        auth.merge_account_credits(
             account_id,
             {
                 "work_credits": work,
@@ -3632,7 +3636,7 @@ async def api_checkin_credits(account_id: str):
     try:
         raw = await trae_client.fetch_account_credits(token)
         parsed = trae_client.parse_account_credits(raw)
-        auth.merge_account_checkin(account_id, {"account_credits": parsed})
+        auth.merge_account_credits(account_id, {"account_credits": parsed})
         return JSONResponse(
             {
                 "success": True,
@@ -3676,6 +3680,10 @@ async def _fetch_full_credits(token: str) -> dict:
         trae_client.fetch_account_total_credits(token),
         return_exceptions=True,
     )
+    if isinstance(raw_ac, BaseException) and isinstance(raw_total, BaseException):
+        raise RuntimeError(
+            "Trae credits query failed: general and total credits are unavailable"
+        ) from raw_ac
     account_credits = (
         None
         if isinstance(raw_ac, BaseException)
@@ -3716,20 +3724,25 @@ def _cached_checkin_account_snapshot(
         "account_credits": cached.get("account_credits"),
         "work_credits": cached.get("work_credits"),
         "total_credits": cached.get("total_credits"),
-        "checkin_updated_at": record.get("checkin_updated_at", 0),
+        "checkin_updated_at": record.get(
+            "checkin_status_updated_at", record.get("checkin_updated_at", 0)
+        ),
+        "credits_updated_at": record.get("credits_updated_at", 0),
         "checkin": cached,
     }
 
 
 def _checkin_cache_is_today(record: dict) -> bool:
-    """Only trust a cached checked-in flag for the current local day."""
+    """Only trust a cached checked-in flag for today's Trae CN business day."""
     try:
-        updated_at = float(record.get("checkin_updated_at") or 0)
+        updated_at = float(record.get("checkin_status_updated_at") or 0)
     except (TypeError, ValueError):
         return False
     if updated_at <= 0:
         return False
-    return time.localtime(updated_at)[:3] == time.localtime()[:3]
+    updated_date = datetime.fromtimestamp(updated_at, _CHECKIN_TIMEZONE).date()
+    current_date = datetime.fromtimestamp(time.time(), _CHECKIN_TIMEZONE).date()
+    return updated_date == current_date
 
 
 def _checkin_response_is_rate_limited(data: dict) -> bool:
@@ -3750,7 +3763,7 @@ async def _fetch_credit_account_snapshot(
     full = await _fetch_full_credits(token)
     patch = {key: value for key, value in full.items() if value is not None}
     merged = (
-        auth.merge_account_checkin(account_id, patch)
+        auth.merge_account_credits(account_id, patch)
         if patch
         else dict(record.get("checkin") or {})
     )
@@ -3785,9 +3798,15 @@ async def _fetch_checkin_status_snapshot(
         if retry_after:
             return {
                 **cached_row,
+                "success": False,
                 "stale": True,
+                "rate_limited": True,
                 "retryable": True,
                 "retry_after_seconds": retry_after,
+                "error": (
+                    "Trae checkin status skipped [9074]: local cooldown active; "
+                    f"retry after at least {retry_after}s"
+                ),
             }
 
     status = await trae_client.fetch_checkin_credits_status(token, account_id)
@@ -3831,7 +3850,10 @@ async def _fetch_checkin_status_snapshot(
         "work_credits": merged.get("work_credits"),
         "total_credits": merged.get("total_credits"),
         "checkin_updated_at": auth.get_account_record(account_id).get(
-            "checkin_updated_at", cached_row.get("checkin_updated_at", 0)
+            "checkin_status_updated_at",
+            auth.get_account_record(account_id).get(
+                "checkin_updated_at", cached_row.get("checkin_updated_at", 0)
+            ),
         ),
     }
 
@@ -3844,7 +3866,10 @@ async def _fetch_checkin_account_snapshot(
 ) -> dict:
     """Backward-compatible name for a checkin-only account refresh."""
     return await _fetch_checkin_status_snapshot(
-        account_id, rec, respect_pending=respect_pending
+        account_id,
+        rec,
+        respect_pending=respect_pending,
+        use_cached_on_cooldown=True,
     )
 
 def _checkin_claim_error(data: dict) -> str:
@@ -3891,6 +3916,13 @@ def _checkin_cooldown_remaining(account_id: str) -> int:
         _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
         return 0
     return max(1, int(remaining + 0.999))
+
+
+def _checkin_start_cooldown(account_id: str) -> int:
+    """Start one account's local cooldown after an upstream 9074 response."""
+    retry_after = max(1, int(CHECKIN_RETRY_AFTER))
+    _CHECKIN_COOLDOWN_UNTIL[account_id] = time.monotonic() + retry_after
+    return retry_after
 
 
 def _checkin_mark_accepted(account_id: str, snapshot: dict, *, pending: bool) -> None:
@@ -4111,7 +4143,7 @@ async def api_checkin_claim_credits():
                 credits_sort = 999999999
             fresh_checkin = dict(rec.get("checkin") or {})
             fresh_checkin.update({key: value for key, value in full.items() if value is not None})
-            row["checkin"] = auth.merge_account_checkin(aid, fresh_checkin)
+            row["checkin"] = auth.merge_account_credits(aid, fresh_checkin)
         except Exception:
             row["account_credits"] = None
             credits_sort = 0

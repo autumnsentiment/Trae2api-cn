@@ -309,23 +309,22 @@ CHECKIN_APP_VERSION = os.environ.get("TRAE_CHECKIN_APP_VERSION", "3.3.65")
 
 def _checkin_identity(token: str, account_id: str = "") -> str:
     """Return an account-stable identity without retaining or logging a token."""
+    if token:
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+                data = payload.get("data")
+                if isinstance(data, dict) and data.get("id"):
+                    return str(data["id"])
+                for key in ("user_id", "userId", "sub"):
+                    if payload.get(key):
+                        return str(payload[key])
+        except (ValueError, TypeError, UnicodeError, binascii.Error, json.JSONDecodeError):
+            pass
     if account_id:
         return str(account_id)
-    if not token:
-        return ""
-    try:
-        parts = token.split(".")
-        if len(parts) >= 2:
-            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
-            data = payload.get("data")
-            if isinstance(data, dict) and data.get("id"):
-                return str(data["id"])
-            for key in ("user_id", "userId", "sub"):
-                if payload.get(key):
-                    return str(payload[key])
-    except (ValueError, TypeError, UnicodeError, binascii.Error, json.JSONDecodeError):
-        pass
     # Non-JWT credentials are uncommon, but remain deterministic for the
     # lifetime of that credential instead of producing an empty header.
     return token

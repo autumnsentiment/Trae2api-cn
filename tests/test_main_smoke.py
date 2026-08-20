@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -49,6 +50,70 @@ class CheckinResultTests(unittest.TestCase):
         message = _checkin_claim_error({"code": 9074, "message": "too frequent"})
         self.assertIn("[9074]", message)
         self.assertIn("too frequent", message)
+
+    def test_status_9074_starts_cooldown_and_suppresses_second_probe(self):
+        status = AsyncMock(return_value={"code": 9074, "message": "too frequent"})
+        record = {
+            "token": "test-token",
+            "checkin": {"checked_in": False, "credits": 200},
+        }
+        with (
+            patch("src.main.auth.get_account_record", return_value=record),
+            patch("src.main.trae_client.fetch_checkin_credits_status", new=status),
+            patch("src.main.CHECKIN_RETRY_AFTER", 60),
+            patch("src.main.time.monotonic", return_value=100.0),
+        ):
+            first = asyncio.run(main_module.api_checkin_account_status("account-1"))
+            second = asyncio.run(main_module.api_checkin_account_status("account-1"))
+
+        first_body = json.loads(first.body)
+        second_body = json.loads(second.body)
+        self.assertFalse(first_body["success"])
+        self.assertEqual(first_body["data"]["code"], 9074)
+        self.assertFalse(second_body["success"])
+        self.assertTrue(second_body["stale"])
+        self.assertIn("9074", second_body["error"])
+        self.assertEqual(status.await_count, 1)
+
+    def test_checkin_cache_uses_china_business_day_and_status_timestamp(self):
+        china = timezone(timedelta(hours=8))
+        now = datetime(2026, 8, 20, 0, 10, tzinfo=china).timestamp()
+        previous_day = datetime(2026, 8, 19, 23, 50, tzinfo=china).timestamp()
+        record = {
+            "checkin_status_updated_at": previous_day,
+            "checkin_updated_at": now,
+            "credits_updated_at": now,
+        }
+
+        with patch("src.main.time.time", return_value=now):
+            self.assertFalse(main_module._checkin_cache_is_today(record))
+
+        legacy_record = {
+            "checkin_updated_at": now,
+            "credits_updated_at": now,
+        }
+        with patch("src.main.time.time", return_value=now):
+            self.assertFalse(main_module._checkin_cache_is_today(legacy_record))
+
+    def test_bulk_credit_refresh_reports_when_both_upstreams_fail(self):
+        raw_accounts = [("account-1", {"token": "test-token"})]
+        with (
+            patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
+            patch("src.main.auth.get_active_account_id", return_value="account-1"),
+            patch(
+                "src.main.trae_client.fetch_account_credits",
+                new=AsyncMock(side_effect=RuntimeError("general failed")),
+            ),
+            patch(
+                "src.main.trae_client.fetch_account_total_credits",
+                new=AsyncMock(side_effect=RuntimeError("total failed")),
+            ),
+        ):
+            response = asyncio.run(main_module.api_checkin_credits_accounts())
+
+        body = json.loads(response.body)
+        self.assertTrue(body["success"])
+        self.assertIn("credits query failed", body["accounts"][0]["error"])
 
     def test_bulk_credits_static_route_is_not_captured_as_account_id(self):
         with patch("src.main.auth.get_accounts_raw", return_value=[]):
@@ -105,6 +170,7 @@ class CheckinResultTests(unittest.TestCase):
                     "token": "test-token",
                     "user_id": "user-1",
                     "checkin": {"checked_in": True},
+                    "checkin_status_updated_at": __import__("time").time(),
                     "checkin_updated_at": __import__("time").time(),
                 },
             ),
@@ -405,6 +471,7 @@ class CheckinResultTests(unittest.TestCase):
                     "token": "test-token",
                     "user_id": "user-1",
                     "checkin": {"checked_in": True, "keep": "yes"},
+                    "checkin_status_updated_at": __import__("time").time(),
                     "checkin_updated_at": __import__("time").time(),
                 },
             )
@@ -429,7 +496,7 @@ class CheckinResultTests(unittest.TestCase):
                         }
                     ),
                 ),
-                patch("src.main.auth.merge_account_checkin", side_effect=lambda aid, data: saved.append(dict(data)) or dict(data)),
+                patch("src.main.auth.merge_account_credits", side_effect=lambda aid, data: saved.append(dict(data)) or dict(data)),
                 patch("src.main.trae_client.claim_checkin_credits", new=AsyncMock()),
             ):
                 response = await main_module.api_checkin_claim_credits()

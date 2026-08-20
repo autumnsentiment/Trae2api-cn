@@ -41,6 +41,19 @@ class CheckinDeviceTests(unittest.TestCase):
             trae_client.checkin_device_id_for(second),
         )
 
+    def test_jwt_identity_wins_over_legacy_account_store_key(self):
+        first = _fake_jwt("account-42", 100)
+        refreshed = _fake_jwt("account-42", 200)
+
+        self.assertEqual(
+            trae_client.checkin_device_id_for(first, "legacy-row-key"),
+            trae_client.checkin_device_id_for(refreshed, "renamed-row-key"),
+        )
+        self.assertEqual(
+            trae_client.build_checkin_headers(first, "legacy-row-key")["x-device-id"],
+            trae_client.build_checkin_headers(first)["x-device-id"],
+        )
+
     def test_headers_include_client_checkin_metadata(self):
         headers = trae_client.build_checkin_headers(_fake_jwt("account-44", 100))
 
