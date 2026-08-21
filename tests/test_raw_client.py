@@ -405,6 +405,84 @@ class RawClientBuildTests(unittest.TestCase):
 
 
 class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_display_model_label_is_sent_as_exact_upstream_config(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'event: output\ndata: {"response":"ok"}\n\n',
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+        with (
+            patch.object(raw_client.auth, "maybe_refresh", new=AsyncMock(return_value=False)),
+            patch.object(raw_client.auth, "get_token", return_value="jwt-token"),
+            patch.object(raw_client.auth, "get_user_id", return_value="user-1"),
+            patch.dict(os.environ, {"TRAE_RAW_BASE_URL": "https://raw.example"}, clear=False),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch(
+                "src.trae_client.resolve_model_config",
+                new=AsyncMock(
+                    return_value={
+                        "name": "DeepSeek-V4-Pro-Official",
+                        "config_name": "DeepSeek-V4-Pro-Official",
+                    }
+                ),
+            ) as lookup,
+            patch("src.raw_client.httpx.Client", side_effect=client_factory),
+        ):
+            wrapped = await raw_client.send_raw_chat_request(
+                [{"role": "user", "content": "hello"}],
+                "A future model display label",
+            )
+
+        self.assertEqual(captured["body"]["model"], "DeepSeek-V4-Pro-Official")
+        lookup.assert_awaited_once_with(
+            "A future model display label", token_override="jwt-token"
+        )
+        wrapped.close()
+
+    async def test_display_model_label_uses_known_offline_mapping(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'event: output\ndata: {"response":"ok"}\n\n',
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+        with (
+            patch.object(raw_client.auth, "maybe_refresh", new=AsyncMock(return_value=False)),
+            patch.object(raw_client.auth, "get_token", return_value="jwt-token"),
+            patch.object(raw_client.auth, "get_user_id", return_value="user-1"),
+            patch.dict(os.environ, {"TRAE_RAW_BASE_URL": "https://raw.example"}, clear=False),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch("src.trae_client.resolve_model_config", new=AsyncMock()) as lookup,
+            patch("src.raw_client.httpx.Client", side_effect=client_factory),
+        ):
+            wrapped = await raw_client.send_raw_chat_request(
+                [{"role": "user", "content": "hello"}],
+                "DeepSeek-V4-Pro 正式版",
+            )
+
+        self.assertEqual(captured["body"]["model"], "DeepSeek-V4-Pro-Official")
+        lookup.assert_not_awaited()
+        wrapped.close()
+
     async def test_send_raw_chat_request_uses_llm_utils_protocol(self):
         captured = {}
 

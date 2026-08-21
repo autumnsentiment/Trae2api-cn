@@ -89,6 +89,20 @@ _KNOWN_MODELS = {
 }
 
 
+_DISPLAY_MODEL_ALIASES = {
+    # Trae's web UI labels are not always the config names expected by
+    # llm_utils_chat. Keep an offline fallback for the current CN labels.
+    "deepseek-v4-pro 正式版": "DeepSeek-V4-Pro-Official",
+    "deepseek-v4-flash 正式版": "DeepSeek-V4-Flash-Official",
+    "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
+    "seed-2.1-turbo": "Doubao-Seed-2.1-Turbo",
+    "seed-code": "Doubao-Seed-Code",
+    "seed-evolving": "Doubao-Seed-Evolving",
+    "qwen3.7-plus": "qwen-3.7-plus",
+    "qwen3.8-max": "qwen3.8-max",
+}
+
+
 def _option(options: Mapping[str, Any], *names: str, default: Any = None) -> Any:
     for name in names:
         if name in options and options[name] is not None:
@@ -128,6 +142,52 @@ def resolve_raw_model(model: str, options: Optional[Mapping[str, Any]] = None) -
         display_name = known.display_name if known else (mapped or without_provider or config_name)
 
     return RawModel(str(config_name), str(raw_model_name), str(display_name))
+
+
+async def resolve_raw_model_for_request(
+    model: str, options: Optional[Mapping[str, Any]] = None
+) -> RawModel:
+    """Resolve display labels before sending a raw upstream request.
+
+    The OpenAI facade can expose Trae display labels such as
+    ``DeepSeek-V4-Pro 正式版``, while the raw endpoint expects the exact
+    ``config_name`` (``DeepSeek-V4-Pro-Official``). Passing the display label
+    can make Trae silently use its default model.
+    """
+
+    options = options or {}
+    explicit_raw = _option(options, "raw_model_name", "rawModelName")
+    resolved = resolve_raw_model(model, options)
+    if explicit_raw:
+        return resolved
+
+    requested = (model or "auto").strip()
+    normalized = requested[5:].lower() if requested.lower().startswith("trae/") else requested.lower()
+    static_config = _DISPLAY_MODEL_ALIASES.get(normalized)
+    if static_config:
+        return RawModel(static_config, static_config, resolved.display_name)
+
+    known = _KNOWN_MODELS.get(normalized)
+    if known or resolved.raw_model_name != requested:
+        return resolved
+
+    token = str(options.get("_auth_token") or auth.get_token() or "").strip()
+    try:
+        from . import trae_client
+
+        config = await trae_client.resolve_model_config(
+            requested, token_override=token
+        )
+        config_name = str(
+            (config or {}).get("config_name")
+            or (config or {}).get("name")
+            or ""
+        ).strip()
+        if config_name:
+            return RawModel(config_name, config_name, resolved.display_name)
+    except Exception as exc:
+        logger.warning("raw model config lookup failed for %s: %s", requested, exc)
+    return resolved
 
 
 def resolve_raw_base_url(options: Optional[Mapping[str, Any]] = None) -> str:
@@ -849,8 +909,10 @@ async def send_raw_chat_request(
 
     options = options or {}
     base_url = resolve_raw_base_url(options)
-    raw_model = resolve_raw_model(model, options)
-    body = build_raw_chat_body(messages, model, options)
+    raw_model = await resolve_raw_model_for_request(model, options)
+    body_options = dict(options)
+    body_options.setdefault("raw_model_name", raw_model.raw_model_name)
+    body = build_raw_chat_body(messages, model, body_options)
     request_id = str(body["request_id"])
     headers = build_raw_headers(base_url, token, raw_model, request_id, options)
     logger.info(

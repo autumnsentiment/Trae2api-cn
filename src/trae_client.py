@@ -825,10 +825,10 @@ def _build_web_model_config(raw: dict) -> dict:
     return cfg
 
 
-async def _fetch_web_model_configs() -> dict[str, dict]:
+async def _fetch_web_model_configs(token_override: str = "") -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
     base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
-    token = auth.get_token()
+    token = token_override or auth.get_token()
     if not token:
         return {}
     url = f"{base}/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true"
@@ -851,7 +851,9 @@ async def _fetch_web_model_configs() -> dict[str, dict]:
     return out
 
 
-async def _get_web_custom_model(model_name: str) -> Optional[dict]:
+async def _get_web_custom_model(
+    model_name: str, *, token_override: str = ""
+) -> Optional[dict]:
     """Return custom_model for a manual web model selection.
 
     Lookup priority:
@@ -861,11 +863,12 @@ async def _get_web_custom_model(model_name: str) -> Optional[dict]:
     """
     if not model_name:
         return None
-    account_key = auth.get_user_id() or auth.get_token()[:16] or "default"
+    token = token_override or auth.get_token()
+    account_key = auth.get_user_id() or token[:16] or "default"
     now = time.time()
     cached = _WEB_MODEL_CACHE.get(account_key)
     if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
-        configs = await _fetch_web_model_configs()
+        configs = await _fetch_web_model_configs(token)
         cached = (now, configs)
         _WEB_MODEL_CACHE[account_key] = cached
 
@@ -903,6 +906,14 @@ async def _get_web_custom_model(model_name: str) -> Optional[dict]:
             "features": {},
         }
     return None
+
+
+async def resolve_model_config(
+    model_name: str, *, token_override: str = ""
+) -> Optional[dict]:
+    """Resolve a public/display model label to Trae's exact config object."""
+
+    return await _get_web_custom_model(model_name, token_override=token_override)
 
 
 async def create_web_session(
