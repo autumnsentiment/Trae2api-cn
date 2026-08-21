@@ -20,6 +20,7 @@ import string
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -439,6 +440,28 @@ async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
             raise RuntimeError(f"Trae pay credits: {data.get('message') or data}")
         return data
 
+def _credit_decimal(value: Any) -> Decimal | None:
+    """Parse an upstream credit value without losing fractional precision."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _json_credit_number(value: Decimal) -> int | float:
+    """Return a regular JSON-compatible number while retaining fractions."""
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
+
+
 def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> dict:
     """Parse total account credits from the entitlement pack list.
 
@@ -453,8 +476,8 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
     not just work-specific packs.
     """
     packs = data.get("user_entitlement_pack_list") or []
-    total_limit = 0
-    used = 0
+    total_limit = Decimal(0)
+    used = Decimal(0)
     unlimited = False
     for pack in packs:
         bi = pack.get("entitlement_base_info") or {}
@@ -464,22 +487,21 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
             continue
         usage = pack.get("usage") or {}
         quota = bi.get("quota") or {}
-        limit = quota.get("credits_limit")
+        limit = _credit_decimal(quota.get("credits_limit"))
         if limit is None:
             continue  # skip feature-only packs (product_type=0)
-        amount = usage.get("credits_amount") or 0
-        if limit == -1:
+        amount = _credit_decimal(usage.get("credits_amount")) or Decimal(0)
+        if limit == Decimal(-1):
             unlimited = True
-            total_limit = -1
-        elif isinstance(limit, (int, float)):
-            total_limit += int(limit)
-        if isinstance(amount, (int, float)):
-            used += int(amount)
-    remaining = None if unlimited else max(total_limit - used, 0)
+        elif limit >= 0:
+            total_limit += limit
+        if amount >= 0:
+            used += amount
+    remaining = None if unlimited else max(total_limit - used, Decimal(0))
     return {
-        "total_limit": total_limit,
-        "used": used,
-        "remaining": remaining,
+        "total_limit": -1 if unlimited else _json_credit_number(total_limit),
+        "used": _json_credit_number(used),
+        "remaining": None if remaining is None else _json_credit_number(remaining),
         "unlimited": unlimited,
         "is_credits_billing": bool(data.get("is_credits_billing")),
         "packs": len(packs),

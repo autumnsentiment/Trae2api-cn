@@ -143,6 +143,7 @@ _CHAT_HISTORY_SESSIONS: OrderedDict[str, tuple[str, float]] = OrderedDict()
 @dataclass
 class _UpstreamSessionLease:
     account_id: str
+    billing_id: str
     auth_token: str
     last_client_activity: float
     active_streams: int = 0
@@ -617,14 +618,14 @@ def _web_login_html() -> str:
         if work_acct.get("unlimited"):
             work_credits_text = "☆ 无限"
         elif work_acct.get("remaining") is not None:
-            work_credits_text = f"剩{work_acct['remaining']}/总{work_acct.get('total_limit','?')}"
+            work_credits_text = f"剩{float(work_acct['remaining']):.2f}/总{float(work_acct.get('total_limit') or 0):.2f}"
         else:
             work_credits_text = "-"
         total = acc.get("total_credits") or {}
         if total.get("unlimited"):
             total_credits_text = "☆ 无限"
         elif total.get("remaining") is not None:
-            total_credits_text = f"剩{total['remaining']}/总{total.get('total_limit','?')}"
+            total_credits_text = f"剩{float(total['remaining']):.2f}/总{float(total.get('total_limit') or 0):.2f}"
         else:
             total_credits_text = "-"
         credits = acc.get("credits")
@@ -1002,7 +1003,7 @@ async function refreshUsage() {{
         var total=Number(record.total_tokens!==undefined?record.total_tokens:(input+output));
         var tokenText=record.tokens_source==='unknown'?'--':(input+' / '+output+' / '+total);
         var credits=record.credits_consumed;
-        var creditText=credits===null||credits===undefined?'--':String(credits);
+        var creditText=credits===null||credits===undefined?'--':Number(credits).toFixed(2);
         var source=record.credits_source||'unknown';
         var status=record.status||'completed';
         var statusText=status==='completed'?'完成':(status==='cancelled'?'已取消':(status==='error'?'失败':status));
@@ -1138,7 +1139,7 @@ function setCredits(id,data){{
     if(!el) return;
     if(value===undefined||value===null) return;
     if(value.unlimited) el.textContent='☆ 无限';
-    else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+value.remaining+'/总'+(value.total_limit===undefined?'?':value.total_limit);
+    else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+Number(value.remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
     else el.textContent='-';
   }});
 }}
@@ -1933,8 +1934,10 @@ def _bind_chat_session(
             token = str(record.get("token") or "")
             if not token and not account_id:
                 token = str(auth.get_token() or "")
+            billing_id = _account_id_from_token(token) or account_id
             lease = _UpstreamSessionLease(
                 account_id=account_id,
+                billing_id=billing_id,
                 auth_token=token,
                 last_client_activity=now,
             )
@@ -1954,6 +1957,8 @@ def _bind_chat_session(
         bound["_account_id"] = lease.account_id
         if UPSTREAM_MODE in ("raw", "direct", "auto"):
             bound["_auth_user_id"] = lease.account_id
+    if lease.billing_id:
+        bound["_billing_id"] = lease.billing_id
     if lease.auth_token:
         bound["_auth_token"] = lease.auth_token
     return bound
@@ -2120,6 +2125,16 @@ def _number_value(value: Any) -> int | float | None:
         return None
     return max(0, value)
 
+
+
+def _credit_round(value: int | float | None) -> int | float | None:
+    """Round credit values to 2 decimal places for consistent display."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
 
 def _first_number(data: Mapping[str, Any], *keys: str) -> int | float | None:
     for key in keys:
@@ -2330,10 +2345,10 @@ async def _enrich_usage_credits(
             return
         _update_usage_record(
             request_id,
-            credits_consumed=after - before,
+            credits_consumed=_credit_round(after - before),
             credits_source="snapshot_delta",
-            credits_before=before,
-            credits_after=after,
+            credits_before=_credit_round(before),
+            credits_after=_credit_round(after),
         )
     finally:
         _end_credit_snapshot(account_id)
@@ -2350,6 +2365,7 @@ class _UsageTracker:
         self.request_id = "req-" + uuid_mod.uuid4().hex
         options = options or {}
         self.account_id = str(options.get("_account_id") or "")
+        self.billing_id = str(options.get("_billing_id") or "")
         self.token = str(options.get("_auth_token") or "")
         if self.account_id and not self.token:
             # An explicitly bound account owns the lookup.  Never fill its
@@ -2367,6 +2383,10 @@ class _UsageTracker:
                     token_identity,
                 )
             self.account_id = token_identity
+        if self.billing_id:
+            # billing_id overrides account_id for usage records so the
+            # deducted credits are attributed to the token owner.
+            self.account_id = self.billing_id
         if not self.account_id or not self.token:
             fallback_account_id, fallback_token = _request_account_identity()
             self.account_id = self.account_id or fallback_account_id
@@ -2953,6 +2973,15 @@ async def _run_web_with_retry(messages, model, stream: bool, options: Optional[d
                 if "solo_agent_parallel_limit" in err or "429" in err:
                     logger.warning("web 429 parallel limit, rotating account: %s", err)
                     auth.next_polling_account()
+                    # Rebind options from the newly rotated account so the
+                    # retry uses the correct token and billing identity.
+                    account_id, record = auth.get_active_account_snapshot()
+                    token = str(record.get("token") or "")
+                    billing_id = _account_id_from_token(token) or account_id
+                    options = dict(options or {})
+                    options["_account_id"] = account_id
+                    options["_billing_id"] = billing_id
+                    options["_auth_token"] = token
                     continue
                 raise
         raise RuntimeError("All web accounts busy: Trae parallel limit reached")
@@ -2971,6 +3000,15 @@ async def _run_remote_with_retry(messages, model, stream, options: Optional[dict
                 if "parallel" in message.lower() or "429" in message:
                     logger.warning("remote parallel limit, rotating account: %s", message)
                     auth.next_polling_account()
+                    # Rebind options from the newly rotated account so the
+                    # retry uses the correct token and billing identity.
+                    account_id, record = auth.get_active_account_snapshot()
+                    token = str(record.get("token") or "")
+                    billing_id = _account_id_from_token(token) or account_id
+                    options = dict(options or {})
+                    options["_account_id"] = account_id
+                    options["_billing_id"] = billing_id
+                    options["_auth_token"] = token
                     continue
                 raise
         raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
@@ -3010,7 +3048,7 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
                     else "unknown"
                 )
             ),
-            "credits_consumed": credits,
+            "credits_consumed": _credit_round(credits),
             "credits_source": str(
                 record.get("credits_source")
                 or ("upstream" if credits is not None else "unknown")
@@ -3125,6 +3163,10 @@ def _update_usage_record(request_id: str, **updates: Any) -> None:
                 continue
             merged = dict(existing)
             merged.update(updates)
+            # Round credit fields before normalizing
+            for key in ("credits_consumed", "credits_before", "credits_after"):
+                if key in merged:
+                    merged[key] = _credit_round(merged[key])
             _USAGE_HISTORY[index] = _normalize_usage_record(merged)
             _save_usage_history_locked()
             return

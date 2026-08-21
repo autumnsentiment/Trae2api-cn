@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -54,6 +55,94 @@ class AuthStateMergeTests(unittest.TestCase):
         self.assertEqual(record["checkin_status_updated_at"], 100.0)
         self.assertEqual(record["checkin_updated_at"], 100.0)
         self.assertEqual(record["credits_updated_at"], 200.0)
+
+
+class RefreshTokenRaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_updates_captured_account_after_active_account_switch(self):
+        request_started = asyncio.Event()
+        release_response = asyncio.Event()
+        posted = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "Result": {
+                        "Token": "new-token-a",
+                        "RefreshToken": "new-refresh-a",
+                        "TokenExpireAt": "1900000000000",
+                    }
+                }
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json):
+                posted.update({"url": url, "json": json})
+                request_started.set()
+                await release_response.wait()
+                return FakeResponse()
+
+        account_a = {
+            "user_id": "account-a",
+            "token": "old-token-a",
+            "refresh_token": "refresh-a",
+            "expired_at": "2026-01-01T00:00:00Z",
+            "host": "https://account-a.example",
+            "client_id": "client-a",
+            "source": "web-login",
+            "edition": "cn",
+            "provider_specific": {},
+        }
+        account_b = {
+            "user_id": "account-b",
+            "token": "token-b",
+            "refresh_token": "refresh-b",
+            "expired_at": "2026-01-01T00:00:00Z",
+            "host": "https://account-b.example",
+            "client_id": "client-b",
+            "source": "web-login",
+            "edition": "cn",
+            "provider_specific": {},
+        }
+        accounts = {"account-a": account_a, "account-b": account_b}
+
+        with (
+            patch.object(auth, "_accounts", accounts),
+            patch.object(auth, "_active_account", "account-a"),
+            patch.object(auth, "_auth", auth._record_to_state(account_a)),
+            patch.object(auth, "_save_accounts"),
+            patch.object(auth, "_save_env_snapshot"),
+            patch("src.auth.httpx.AsyncClient", FakeClient),
+        ):
+            refresh_task = asyncio.create_task(auth.refresh_token())
+            await request_started.wait()
+
+            self.assertTrue(auth.switch_account("account-b"))
+            release_response.set()
+
+            self.assertTrue(await refresh_task)
+            self.assertEqual(auth.get_active_account_id(), "account-b")
+            self.assertEqual(auth.get_token(), "token-b")
+            self.assertEqual(accounts["account-b"]["token"], "token-b")
+            self.assertEqual(accounts["account-b"]["refresh_token"], "refresh-b")
+            self.assertEqual(accounts["account-a"]["token"], "new-token-a")
+            self.assertEqual(
+                accounts["account-a"]["refresh_token"], "new-refresh-a"
+            )
+
+        self.assertEqual(posted["url"], "https://account-a.example/cloudide/api/v3/trae/oauth/ExchangeToken")
+        self.assertEqual(posted["json"]["RefreshToken"], "refresh-a")
+        self.assertEqual(posted["json"]["UserID"], "account-a")
 
 
 if __name__ == "__main__":

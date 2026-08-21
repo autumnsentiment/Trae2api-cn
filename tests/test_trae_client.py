@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import unittest
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -116,6 +117,58 @@ class CheckinDeviceTests(unittest.TestCase):
         upstream.assert_awaited_once_with(
             "/trae/api/v2/ug/checkin_credits/claim", "token-1", account_id="account-1"
         )
+
+
+class AccountCreditsParserTests(unittest.TestCase):
+    def test_preserves_fractional_limits_usage_and_remaining(self):
+        result = trae_client.parse_account_credits(
+            {
+                "user_entitlement_pack_list": [
+                    {
+                        "entitlement_base_info": {
+                            "available_endpoint": 0,
+                            "quota": {"credits_limit": 100.75},
+                        },
+                        "usage": {"credits_amount": 12.34},
+                    },
+                    {
+                        "entitlement_base_info": {
+                            "available_endpoint": 0,
+                            "quota": {"credits_limit": 10.25},
+                        },
+                        "usage": {"credits_amount": 0.56},
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(result["total_limit"], 111)
+        self.assertAlmostEqual(result["used"], 12.9)
+        self.assertAlmostEqual(result["remaining"], 98.1)
+        self.assertIsInstance(result["total_limit"], int)
+        self.assertIsInstance(result["used"], float)
+        json.dumps(result)
+
+    def test_accepts_numeric_strings_without_truncating(self):
+        result = trae_client.parse_account_credits(
+            {
+                "user_entitlement_pack_list": [
+                    {
+                        "entitlement_base_info": {
+                            "available_endpoint": 1,
+                            "quota": {"credits_limit": "20.50"},
+                        },
+                        "usage": {"credits_amount": "3.25"},
+                    }
+                ]
+            },
+            available_endpoint_filter=1,
+        )
+
+        self.assertEqual(result["total_limit"], 20.5)
+        self.assertEqual(result["used"], 3.25)
+        self.assertEqual(result["remaining"], 17.25)
+        self.assertTrue(all(not isinstance(value, Decimal) for value in result.values()))
 
 
 TOOLS = [

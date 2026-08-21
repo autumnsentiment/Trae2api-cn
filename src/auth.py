@@ -347,21 +347,41 @@ async def refresh_token() -> bool:
     if not _refresh_lock.acquire(blocking=False):
         return False
     try:
-        state = _auth
-        rt = state.refresh_token
+        # Capture the account and its refresh credentials together. Account
+        # polling or a console switch may replace ``_auth`` while the network
+        # request is in flight, so the response must never be written through
+        # the mutable global state.
+        with _STORE_LOCK:
+            captured_account_id = _active_account
+            captured_record = dict(_accounts.get(captured_account_id) or {})
+            captured_state = _auth
+            if captured_record:
+                rt = captured_record.get("refresh_token") or ""
+                host = captured_record.get("host") or DEFAULT_BASE_URLS.get(
+                    captured_record.get("edition", "cn"),
+                    "https://trae-api-cn.mchost.guru",
+                )
+                client_id = captured_record.get("client_id") or "ono9krqynydwx5"
+                user_id = captured_record.get("user_id") or ""
+            else:
+                with captured_state._lock:
+                    rt = captured_state.refresh_token or ""
+                    host = captured_state.host or DEFAULT_BASE_URLS.get(
+                        captured_state.edition,
+                        "https://trae-api-cn.mchost.guru",
+                    )
+                    client_id = captured_state.client_id or "ono9krqynydwx5"
+                    user_id = captured_state.user_id or ""
         if not rt:
             logger.error("auth: no refresh token, cannot refresh")
             return False
-
-        host = state.host or DEFAULT_BASE_URLS.get(state.edition, "https://trae-api-cn.mchost.guru")
-        client_id = state.client_id or "ono9krqynydwx5"
 
         url = f"{host}/cloudide/api/v3/trae/oauth/ExchangeToken"
         payload = {
             "ClientID": client_id,
             "RefreshToken": rt,
             "ClientSecret": "-",
-            "UserID": state.user_id or "",
+            "UserID": user_id,
         }
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -379,15 +399,59 @@ async def refresh_token() -> bool:
             logger.error("auth: exchange token failed: %s", error)
             return False
 
-        with _auth._lock:
-            _auth.token = new_token
-            _auth.refresh_token = new_refresh
-            _auth.expired_at = _normalize_expire(new_expire)
-            _auth.client_id = client_id
+        normalized_expire = _normalize_expire(new_expire)
+        update_active_state = False
+        with _STORE_LOCK:
+            if captured_account_id:
+                current_record = _accounts.get(captured_account_id)
+                if current_record is None:
+                    logger.warning(
+                        "auth: refreshed account %s was removed before update",
+                        captured_account_id,
+                    )
+                    return False
+                current_refresh = current_record.get("refresh_token") or ""
+                if current_refresh and current_refresh != rt:
+                    logger.warning(
+                        "auth: discarded stale refresh response for account %s",
+                        captured_account_id,
+                    )
+                    return False
+                updated_record = dict(current_record)
+                updated_record.update(
+                    {
+                        "token": new_token,
+                        "refresh_token": new_refresh,
+                        "expired_at": normalized_expire,
+                        "client_id": client_id,
+                    }
+                )
+                _accounts[captured_account_id] = updated_record
+                if _active_account == captured_account_id:
+                    _switch_record(updated_record)
+                    update_active_state = True
+                _save_accounts()
+            else:
+                # Preserve the legacy single-account path, but only while the
+                # exact state captured before the request is still selected.
+                if _active_account or _auth is not captured_state:
+                    logger.warning(
+                        "auth: discarded refresh response after account switch"
+                    )
+                    return False
+                with captured_state._lock:
+                    captured_state.token = new_token
+                    captured_state.refresh_token = new_refresh
+                    captured_state.expired_at = normalized_expire
+                    captured_state.client_id = client_id
+                update_active_state = True
 
-        logger.info("auth: token refreshed")
-        _save_env_snapshot()
-        _persist_active_account()
+        logger.info(
+            "auth: token refreshed%s",
+            f" for account {captured_account_id}" if captured_account_id else "",
+        )
+        if update_active_state:
+            _save_env_snapshot()
         return True
     except Exception as e:
         logger.error("auth: refresh error: %s", e)

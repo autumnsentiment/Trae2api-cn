@@ -864,11 +864,13 @@ class SessionLeaseTests(unittest.TestCase):
     def test_idle_session_lease_is_reaped_and_active_stream_is_retained(self):
         main_module._UPSTREAM_SESSION_LEASES["idle"] = main_module._UpstreamSessionLease(
             account_id="account-1",
+            billing_id="account-1",
             auth_token="token-1",
             last_client_activity=10.0,
         )
         main_module._UPSTREAM_SESSION_LEASES["streaming"] = main_module._UpstreamSessionLease(
             account_id="account-2",
+            billing_id="account-2",
             auth_token="token-2",
             last_client_activity=10.0,
             active_streams=1,
@@ -882,6 +884,7 @@ class SessionLeaseTests(unittest.TestCase):
     def test_leased_stream_marks_client_activity_until_sse_finishes(self):
         main_module._UPSTREAM_SESSION_LEASES["stream-1"] = main_module._UpstreamSessionLease(
             account_id="account-1",
+            billing_id="account-1",
             auth_token="token-1",
             last_client_activity=0.0,
         )
@@ -1009,7 +1012,7 @@ class MainCliSmokeTests(unittest.TestCase):
             {
                 key: value
                 for key, value in captured["options"].items()
-                if key != "_relay_request_id"
+                if key not in ("_relay_request_id", "_billing_id")
             },
             expected_options,
         )
