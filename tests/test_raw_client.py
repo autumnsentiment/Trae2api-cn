@@ -405,6 +405,31 @@ class RawClientBuildTests(unittest.TestCase):
 
 
 class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_lookup_uses_bound_billing_identity(self):
+        with patch(
+            "src.trae_client.resolve_model_config",
+            new=AsyncMock(
+                return_value={
+                    "name": "DeepSeek-V4-Pro-Official",
+                    "config_name": "DeepSeek-V4-Pro-Official",
+                }
+            ),
+        ) as lookup:
+            resolved = await raw_client.resolve_raw_model_for_request(
+                "A future model display label",
+                {
+                    "_auth_token": "token-b",
+                    "_auth_user_id": "account-b",
+                },
+            )
+
+        self.assertEqual(resolved.raw_model_name, "DeepSeek-V4-Pro-Official")
+        lookup.assert_awaited_once_with(
+            "A future model display label",
+            token_override="token-b",
+            user_id_override="account-b",
+        )
+
     async def test_display_model_label_is_sent_as_exact_upstream_config(self):
         captured = {}
 

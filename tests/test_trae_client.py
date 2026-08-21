@@ -160,6 +160,46 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model_a["config_name"], "config-a")
         self.assertEqual(fetched, [token_b, token_a])
 
+    async def test_web_session_resolves_custom_model_with_bound_credentials(self):
+        token_b = _fake_jwt("account-b", 100)
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            @staticmethod
+            def json():
+                return {"data": {"chat_session_id": "session-b", "message_id": "message-b"}}
+
+        class FakeClient:
+            async def post(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        lookup = AsyncMock(
+            return_value={"name": "requested-model", "config_name": "config-b"}
+        )
+        with (
+            patch.object(trae_client, "_get_web_custom_model", new=lookup),
+            patch.object(trae_client.auth, "get_psd", return_value={}),
+            patch.object(trae_client, "build_web_headers", return_value={}),
+        ):
+            session_id, message_id = await trae_client.create_web_session(
+                FakeClient(),
+                "requested-model",
+                [{"role": "user", "content": "hello"}],
+                options={
+                    "_auth_token": token_b,
+                    "_auth_user_id": "account-b",
+                },
+            )
+
+        self.assertEqual((session_id, message_id), ("session-b", "message-b"))
+        lookup.assert_awaited_once_with(
+            "requested-model",
+            token_override=token_b,
+            user_id_override="account-b",
+        )
+
 
 class AccountCreditsParserTests(unittest.TestCase):
     def test_preserves_fractional_limits_usage_and_remaining(self):
