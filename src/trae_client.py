@@ -122,6 +122,27 @@ _WORKSPACE_DIRS = ["projects", "workspace", "dev", "code", "work"]
 _TOOL_OPTION_KEYS = ("tools", "tool_choice", "parallel_tool_calls")
 
 
+def _web_model_cache_key(token: str = "", user_id_override: str = "") -> str:
+    """Return a stable, account-bound key without retaining raw credentials.
+
+    A bound request can carry a token for an account different from the
+    process-wide active account. Prefer the explicit billing identity, then
+    the immutable JWT identity, and only hash the token as a final fallback.
+    """
+    token = str(token or "").strip()
+    explicit_id = str(user_id_override or "").strip()
+    if explicit_id:
+        return explicit_id
+
+    if token:
+        identity = _checkin_identity(token)
+        if identity and identity != token:
+            return identity
+        return "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    return str(auth.get_user_id() or "default")
+
+
 def _tool_protocol_requested(
     options: Optional[dict], messages: Optional[list[dict]] = None
 ) -> bool:
@@ -852,7 +873,7 @@ async def _fetch_web_model_configs(token_override: str = "") -> dict[str, dict]:
 
 
 async def _get_web_custom_model(
-    model_name: str, *, token_override: str = ""
+    model_name: str, *, token_override: str = "", user_id_override: str = ""
 ) -> Optional[dict]:
     """Return custom_model for a manual web model selection.
 
@@ -864,7 +885,7 @@ async def _get_web_custom_model(
     if not model_name:
         return None
     token = token_override or auth.get_token()
-    account_key = auth.get_user_id() or token[:16] or "default"
+    account_key = _web_model_cache_key(token, user_id_override)
     now = time.time()
     cached = _WEB_MODEL_CACHE.get(account_key)
     if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
@@ -909,11 +930,15 @@ async def _get_web_custom_model(
 
 
 async def resolve_model_config(
-    model_name: str, *, token_override: str = ""
+    model_name: str, *, token_override: str = "", user_id_override: str = ""
 ) -> Optional[dict]:
     """Resolve a public/display model label to Trae's exact config object."""
 
-    return await _get_web_custom_model(model_name, token_override=token_override)
+    return await _get_web_custom_model(
+        model_name,
+        token_override=token_override,
+        user_id_override=user_id_override,
+    )
 
 
 async def create_web_session(
@@ -946,7 +971,17 @@ async def create_web_session(
         "common_params": _web_common_params(psd, mode),
     }
     if strategy != "auto":
-        custom_model = await _get_web_custom_model(model_name)
+        bound_user_id = str(
+            options.get("_auth_user_id")
+            or options.get("_billing_id")
+            or options.get("_account_id")
+            or ""
+        ).strip()
+        custom_model = await _get_web_custom_model(
+            model_name,
+            token_override=token,
+            user_id_override=bound_user_id,
+        )
         if custom_model:
             initial_message["custom_model"] = custom_model
     body = {

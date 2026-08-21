@@ -175,9 +175,16 @@ async def resolve_raw_model_for_request(
     try:
         from . import trae_client
 
-        config = await trae_client.resolve_model_config(
-            requested, token_override=token
-        )
+        lookup_kwargs: dict[str, str] = {"token_override": token}
+        bound_user_id = str(
+            options.get("_auth_user_id")
+            or options.get("_billing_id")
+            or options.get("_account_id")
+            or ""
+        ).strip()
+        if bound_user_id:
+            lookup_kwargs["user_id_override"] = bound_user_id
+        config = await trae_client.resolve_model_config(requested, **lookup_kwargs)
         config_name = str(
             (config or {}).get("config_name")
             or (config or {}).get("name")

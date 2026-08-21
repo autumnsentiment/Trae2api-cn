@@ -119,6 +119,48 @@ class CheckinDeviceTests(unittest.TestCase):
         )
 
 
+class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bound_account_model_config_cache_does_not_cross_contaminate(self):
+        token_a = _fake_jwt("account-a", 100)
+        token_b = _fake_jwt("account-b", 100)
+        fetched = []
+
+        async def fetch(token):
+            fetched.append(token)
+            return {
+                "requested-model": {
+                    "config_name": "config-a" if token == token_a else "config-b"
+                }
+            }
+
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", side_effect=fetch),
+            patch.object(trae_client.auth, "get_user_id", return_value="account-a"),
+        ):
+            model_b = await trae_client._get_web_custom_model(
+                "requested-model",
+                token_override=token_b,
+                user_id_override="account-b",
+            )
+            # A second B request should reuse B's own cache entry.
+            cached_b = await trae_client._get_web_custom_model(
+                "requested-model",
+                token_override=token_b,
+                user_id_override="account-b",
+            )
+            model_a = await trae_client._get_web_custom_model(
+                "requested-model",
+                token_override=token_a,
+                user_id_override="account-a",
+            )
+
+        self.assertEqual(model_b["config_name"], "config-b")
+        self.assertEqual(cached_b["config_name"], "config-b")
+        self.assertEqual(model_a["config_name"], "config-a")
+        self.assertEqual(fetched, [token_b, token_a])
+
+
 class AccountCreditsParserTests(unittest.TestCase):
     def test_preserves_fractional_limits_usage_and_remaining(self):
         result = trae_client.parse_account_credits(
