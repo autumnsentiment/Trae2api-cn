@@ -48,6 +48,7 @@ from . import auth, cli_client, raw_client, responses_api, trae_client, trae_rem
 from .model_limits import clamp_max_completion_tokens
 from .sse import (
     EmptyUpstreamResponse,
+    RepeatedCompletedToolResponse,
     collect_nonstream_cli,
     collect_nonstream_ide,
     collect_nonstream_web,
@@ -123,16 +124,17 @@ _CHECKIN_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _CHECKIN_VERIFY_DELAYS: tuple[float, ...] = ()
 
 # OpenAI clients normally replay the complete conversation instead of sending
-# a relay-specific session id. Keep a short lease so a tool/result continuation
-# reaches the same terminal-protocol conversation with the same auth snapshot.
+# a relay-specific session id. Tool execution can legitimately take several
+# minutes, so keep the credential/session binding long enough for those
+# continuations to return to the same upstream account.
 _CHAT_SESSION_TTL = max(
     1.0,
     float(
         os.environ.get(
             "TRAE_SESSION_IDLE_TIMEOUT_SECONDS",
-            os.environ.get("TRAE_CHAT_SESSION_TTL_SECONDS", "60"),
+            os.environ.get("TRAE_CHAT_SESSION_TTL_SECONDS", "3600"),
         )
-        or "60"
+        or "3600"
     ),
 )
 _CHAT_SESSION_MAX = max(64, int(os.environ.get("TRAE_CHAT_SESSION_CACHE_SIZE", "2048") or "2048"))
@@ -370,7 +372,7 @@ def _normalize_chat_messages(value: Any) -> list[dict[str, Any]]:
             if fallback is not None:
                 message["content"] = fallback
         normalized.append(message)
-    return normalized
+    return cli_client.repair_tool_call_history(normalized)
 
 
 def _json_loads_safe(value: str) -> dict:
@@ -1956,7 +1958,7 @@ def _bind_chat_session(
     if lease.account_id:
         bound["_account_id"] = lease.account_id
         if UPSTREAM_MODE in ("raw", "direct", "auto"):
-            bound["_auth_user_id"] = lease.account_id
+            bound["_auth_user_id"] = lease.billing_id or lease.account_id
     if lease.billing_id:
         bound["_billing_id"] = lease.billing_id
     if lease.auth_token:
@@ -2857,6 +2859,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
             saw_done = False
             stream_status = "running"
             try:
+                retry_options = dict(options or {})
                 for attempt in range(2):
                     try:
                         async for chunk in translate_ide_stream(
@@ -2876,14 +2879,26 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                             yield chunk
                         stream_status = "completed"
                         return
+                    except RepeatedCompletedToolResponse:
+                        if attempt:
+                            raise RuntimeError(
+                                "Trae upstream repeated an already completed tool call "
+                                "after the relay recovery retry"
+                            )
+                        logger.warning(
+                            "raw upstream repeated only completed tool calls; retrying once with recovery guidance"
+                        )
+                        retry_options = dict(options or {})
+                        retry_options["_recover_suppressed_tool_call"] = True
                     except EmptyUpstreamResponse:
                         logger.warning("raw upstream returned an empty response; retrying once")
+                        retry_options = dict(options or {})
                     finally:
                         current.close()
 
                     try:
                         current = await raw_client.send_raw_chat_request(
-                            messages, model, options
+                            messages, model, retry_options
                         )
                         _capture_chat_session_auth(
                             str((options or {}).get("session_id") or ""),
@@ -2927,6 +2942,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
         )
 
     current = raw_resp
+    retry_options = dict(options or {})
     for attempt in range(2):
         try:
             result = await collect_nonstream_ide(
@@ -2937,12 +2953,26 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
             )
             _track_usage_from_result(result, model)
             return JSONResponse(content=result)
+        except RepeatedCompletedToolResponse:
+            if attempt:
+                raise RuntimeError(
+                    "Trae upstream repeated an already completed tool call "
+                    "after the relay recovery retry"
+                )
+            logger.warning(
+                "raw upstream repeated only completed tool calls; retrying once with recovery guidance"
+            )
+            retry_options = dict(options or {})
+            retry_options["_recover_suppressed_tool_call"] = True
         except EmptyUpstreamResponse:
             logger.warning("raw upstream returned an empty response; retrying once")
+            retry_options = dict(options or {})
         finally:
             current.close()
         try:
-            current = await raw_client.send_raw_chat_request(messages, model, options)
+            current = await raw_client.send_raw_chat_request(
+                messages, model, retry_options
+            )
             _capture_chat_session_auth(
                 str((options or {}).get("session_id") or ""),
                 str(getattr(current, "auth_token", "") or ""),
@@ -3333,6 +3363,13 @@ async def handle_chat(req: Request):
         sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, Mapping)),
         stream,
     )
+    logger.info(
+        "request binding id=%s account=%s billing=%s session=%s",
+        tracker.request_id,
+        str(options.get("_account_id") or "default"),
+        str(options.get("_billing_id") or options.get("_account_id") or "default"),
+        str(options.get("session_id") or options.get("sessionId") or "")[:32],
+    )
     if stream:
         session_id = str(options.get("session_id") or options.get("sessionId") or "")
         return StreamingResponse(
@@ -3403,6 +3440,13 @@ async def handle_responses(req: Request):
         len(messages),
         sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, Mapping)),
         stream,
+    )
+    logger.info(
+        "request binding id=%s account=%s billing=%s session=%s",
+        tracker.request_id,
+        str(options.get("_account_id") or "default"),
+        str(options.get("_billing_id") or options.get("_account_id") or "default"),
+        str(options.get("session_id") or options.get("sessionId") or "")[:32],
     )
     if stream:
         session_id = str(options.get("session_id") or options.get("sessionId") or "")

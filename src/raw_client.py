@@ -621,6 +621,14 @@ def build_raw_messages(
             options.get("parallel_tool_calls"),
             native_tools=native_tools,
         )
+        if options.get("_recover_suppressed_tool_call"):
+            runtime_prompt += (
+                " The previous upstream turn attempted only a tool call that "
+                "the client has already completed. Use the existing tool "
+                "result now. Return the final answer, or request a different "
+                "necessary tool call with different arguments; do not repeat "
+                "the completed call."
+            )
         result.append(
             {"role": "system", "content": [{"type": "text", "text": runtime_prompt}]}
         )

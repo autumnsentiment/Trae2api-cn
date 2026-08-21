@@ -900,6 +900,155 @@ def tool_call_signature(call: Any) -> str:
     return f"{name}\0{encoded}"
 
 
+_TOOL_FAILURE_STATUSES = {
+    "error",
+    "failed",
+    "failure",
+    "cancelled",
+    "canceled",
+    "timeout",
+    "timed_out",
+    "timed-out",
+}
+
+
+def _tool_content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                text = item.get("text")
+                if text not in (None, ""):
+                    parts.append(str(text))
+                elif item.get("content") not in (None, ""):
+                    parts.append(str(item["content"]))
+            elif item not in (None, ""):
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+    if isinstance(value, Mapping):
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(value)
+    return "" if value is None else str(value)
+
+
+def tool_result_is_failed(message: Mapping[str, Any]) -> bool:
+    """Return whether a tool result explicitly reports a failed execution."""
+
+    if not isinstance(message, Mapping):
+        return False
+    for key in ("is_error", "isError", "failed"):
+        value = message.get(key)
+        if value is True or (
+            isinstance(value, str) and value.strip().lower() in {"true", "1", "yes"}
+        ):
+            return True
+    success = message.get("success")
+    if success is False or (
+        isinstance(success, str) and success.strip().lower() in {"false", "0", "no"}
+    ):
+        return True
+    status = str(message.get("status") or "").strip().lower()
+    if status in _TOOL_FAILURE_STATUSES:
+        return True
+
+    content = message.get("content")
+    text = _tool_content_text(content)
+    parsed: Any = None
+    if text:
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+    if isinstance(parsed, Mapping):
+        parsed_status = str(parsed.get("status") or "").strip().lower()
+        if parsed_status in _TOOL_FAILURE_STATUSES:
+            return True
+        if parsed.get("is_error") is True or parsed.get("isError") is True:
+            return True
+        if parsed.get("success") is False:
+            return True
+        if parsed.get("error") not in (None, "", False, {}, []):
+            return True
+
+    lowered = text.lower()
+    return bool(
+        re.match(
+            r"^\s*(?:error|failed|failure|exception|traceback|command failed|"
+            r"工具调用.*(?:失败|错误|技术问题)|(?:失败|错误|异常))",
+            lowered,
+        )
+    )
+
+
+def repair_tool_call_history(
+    messages: Any, *, known_call_ids: Optional[set[str]] = None
+) -> list[dict[str, Any]]:
+    """Insert explicit failed results for assistant calls missing a response."""
+
+    if not isinstance(messages, list):
+        return []
+    source = [dict(item) for item in messages if isinstance(item, Mapping)]
+    repaired: list[dict[str, Any]] = []
+    inserted = 0
+    index = 0
+    while index < len(source):
+        message = source[index]
+        repaired.append(message)
+        index += 1
+        if message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        expected: list[tuple[str, str]] = []
+        for raw in calls:
+            if not isinstance(raw, Mapping):
+                continue
+            function = raw.get("function") if isinstance(raw.get("function"), Mapping) else raw
+            call_id = str(raw.get("id") or raw.get("tool_call_id") or "").strip()
+            name = str(function.get("name") or "tool").strip()
+            if call_id:
+                expected.append((call_id, name))
+        if not expected:
+            continue
+
+        contiguous: list[dict[str, Any]] = []
+        while index < len(source) and source[index].get("role") in {"tool", "function"}:
+            contiguous.append(source[index])
+            index += 1
+        repaired.extend(contiguous)
+        seen = {
+            str(item.get("tool_call_id") or item.get("toolCallId") or "").strip()
+            for item in contiguous
+        }
+        for call_id, name in expected:
+            if known_call_ids is not None and call_id not in known_call_ids:
+                continue
+            if call_id in seen:
+                continue
+            repaired.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": (
+                        "[relay] Missing tool result for this call. The tool "
+                        "execution did not complete; treat it as failed and "
+                        "continue without repeating the same call blindly."
+                    ),
+                    "is_error": True,
+                }
+            )
+            inserted += 1
+    if inserted:
+        logger.warning("repaired %d missing tool result(s) in request history", inserted)
+    return repaired
+
+
 def completed_tool_signatures(messages: Any) -> set[str]:
     """Find successful tool calls that should not be blindly repeated.
 
@@ -925,9 +1074,13 @@ def completed_tool_signatures(messages: Any) -> set[str]:
                         signature = tool_call_signature(call)
                         if signature:
                             call_signatures[str(call["id"])] = signature
-        elif message.get("role") == "tool":
-            call_id = _string_or_empty(message.get("tool_call_id"))
-            if call_id and call_id in call_signatures:
+        elif message.get("role") in {"tool", "function"}:
+            call_id = _string_or_empty(
+                message.get("tool_call_id")
+                or message.get("toolCallId")
+                or message.get("id")
+            )
+            if call_id and call_id in call_signatures and not tool_result_is_failed(message):
                 tool_indexes[call_id] = index
 
     protected: set[str] = set()

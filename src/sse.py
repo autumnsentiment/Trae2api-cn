@@ -91,6 +91,10 @@ class EmptyUpstreamResponse(RuntimeError):
     """Raised before any chunks are emitted when an upstream turn is empty."""
 
 
+class RepeatedCompletedToolResponse(EmptyUpstreamResponse):
+    """Raised when the only upstream output repeats an already completed call."""
+
+
 def make_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
 
@@ -543,6 +547,26 @@ def _suppress_completed_tool_calls(
     return filtered
 
 
+def _contains_completed_tool_repeat(
+    calls: Any, completed_tool_signatures: Any = None
+) -> bool:
+    if not isinstance(calls, list):
+        return False
+    protected = {
+        str(value)
+        for value in (completed_tool_signatures or [])
+        if isinstance(value, str) and value
+    }
+    if not protected:
+        return False
+    return any(
+        isinstance(call, dict)
+        and (signature := _tool_call_signature(call))
+        and signature in protected
+        for call in calls
+    )
+
+
 def _filter_for_accumulator(
     accumulator: ToolCallAccumulator,
     calls: Any,
@@ -734,6 +758,7 @@ async def translate_ide_stream(
     response_text = ProtocolTextAccumulator()
     final_usage = None
     final_reason = "stop"
+    saw_completed_repeat = False
     started = not fail_on_empty
     pending_queue_chunks: list[str] = []
 
@@ -798,6 +823,8 @@ async def translate_ide_stream(
         calls = _calls_from_payload(obj)
         calls.extend(reasoning_calls)
         calls.extend(response_calls)
+        if _contains_completed_tool_repeat(calls, completed_tool_signatures):
+            saw_completed_repeat = True
 
         tool_chunks = list(
             _emit_tool_deltas(
@@ -844,6 +871,10 @@ async def translate_ide_stream(
             final_reason = str(obj.get("finish_reason") or obj.get("stop_reason") or final_reason)
             break
 
+    if content_count == 0 and not tool_calls.has_calls and saw_completed_repeat:
+        raise RepeatedCompletedToolResponse(
+            "Trae upstream repeated only already completed tool calls"
+        )
     if fail_on_empty and content_count == 0 and not tool_calls.has_calls:
         raise EmptyUpstreamResponse("Trae raw upstream returned no text or tool call")
 
@@ -1200,6 +1231,7 @@ async def collect_nonstream_ide(
     usage = None
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
     pending_event = None
+    saw_completed_repeat = False
     async for line in _iter_stream_lines(response):
         if line is _STREAM_HEARTBEAT:
             continue
@@ -1233,6 +1265,8 @@ async def collect_nonstream_ide(
         calls = _calls_from_payload(obj)
         calls.extend(reasoning_calls)
         calls.extend(response_calls)
+        if _contains_completed_tool_repeat(calls, completed_tool_signatures):
+            saw_completed_repeat = True
         tool_calls.add(
             _filter_for_accumulator(
                 tool_calls,
@@ -1257,6 +1291,10 @@ async def collect_nonstream_ide(
                 obj.get("finish_reason") or obj.get("stop_reason") or finish_reason
             )
             break
+    if not full and not tool_calls.has_calls and saw_completed_repeat:
+        raise RepeatedCompletedToolResponse(
+            "Trae upstream repeated only already completed tool calls"
+        )
     if fail_on_empty and not full and not tool_calls.has_calls:
         raise EmptyUpstreamResponse("Trae raw upstream returned no text or tool call")
     _ensure_required_tool_call(tool_choice, tool_calls.has_calls)

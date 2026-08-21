@@ -185,6 +185,36 @@ class RawClientBuildTests(unittest.TestCase):
         self.assertNotIn("Client tool call [call-1]", history)
         self.assertNotIn("Client tool result [call-1]", history)
 
+    def test_build_body_does_not_synthesize_missing_native_tool_result(self):
+        body = raw_client.build_raw_chat_body(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "mcp__node_repl__js:92",
+                            "type": "function",
+                            "function": {
+                                "name": "mcp__node_repl__js",
+                                "arguments": '{"code":"1+1"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+            "auto",
+        )
+
+        assistant_index = next(
+            index
+            for index, message in enumerate(body["messages"])
+            if message["role"] == "assistant"
+        )
+        following = body["messages"][assistant_index + 1]
+        self.assertEqual(following["role"], "user")
+        self.assertNotIn("tool_call_id", following)
+
     def test_generation_parameters_are_forwarded_without_rewriting(self):
         generation_options = {
             "temperature": 0.25,
@@ -355,6 +385,23 @@ class RawClientBuildTests(unittest.TestCase):
         self.assertEqual(normalized["authorization"], "Cloud-IDE-JWT token")
         self.assertNotIn("extra", normalized)
         self.assertNotIn("x-ide-function", normalized)
+
+    def test_raw_header_prefers_bound_billing_identity(self):
+        model = raw_client.RawModel("config", "raw-model", "Display")
+        with (
+            patch.object(raw_client.auth, "get_user_id", return_value="global-user"),
+            patch("src.trae_client.build_headers", return_value={}),
+        ):
+            headers = raw_client.build_raw_headers(
+                "https://raw.example",
+                "token",
+                model,
+                "request-id",
+                {"_auth_user_id": "billing-account"},
+            )
+
+        normalized = {key.lower(): value for key, value in headers.items()}
+        self.assertEqual(normalized["x-uid"], "billing-account")
 
 
 class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):

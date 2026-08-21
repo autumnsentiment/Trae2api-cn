@@ -19,7 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Mapping, Optional
 
-from .cli_client import ProtocolTextFilter
+from .cli_client import ProtocolTextFilter, repair_tool_call_history
 from .model_limits import clamp_max_completion_tokens
 
 
@@ -193,7 +193,7 @@ def _positive_env_integer(name: str, default: int) -> int:
 
 _RESPONSE_SESSION_IDLE_TIMEOUT = _positive_env_number(
     "TRAE_SESSION_IDLE_TIMEOUT_SECONDS",
-    _positive_env_number("TRAE_CHAT_SESSION_TTL_SECONDS", 60),
+    _positive_env_number("TRAE_CHAT_SESSION_TTL_SECONDS", 3600),
 )
 
 
@@ -947,9 +947,12 @@ def normalize_request(
     else:
         raise ResponsesRequestError("input must be a string or array", "input")
 
-    history_messages = _merge_response_history(
-        history_messages,
-        current_messages,
+    history_messages = repair_tool_call_history(
+        _merge_response_history(
+            history_messages,
+            current_messages,
+        ),
+        known_call_ids=set(call_bindings),
     )
     messages = [*instruction_messages, *history_messages]
     if not messages:

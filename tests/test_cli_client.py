@@ -227,6 +227,63 @@ class ExtractionTests(unittest.TestCase):
         messages.append({"role": "user", "content": "Please run it again."})
         self.assertEqual(cli_client.completed_tool_signatures(messages), set())
 
+    def test_failed_tool_result_does_not_protect_duplicate_signature(self):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "Bash",
+                            "arguments": '{"command":"New-Item demo.txt"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": '{"status":"failed","error":"PowerShell failed"}',
+            },
+        ]
+
+        self.assertEqual(cli_client.completed_tool_signatures(messages), set())
+
+    def test_repair_tool_call_history_fills_each_missing_result(self):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-a",
+                        "function": {"name": "Read", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call-b",
+                        "function": {"name": "Bash", "arguments": "{}"},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-a",
+                "content": "ok",
+            },
+            {"role": "user", "content": "continue"},
+        ]
+
+        repaired = cli_client.repair_tool_call_history(messages)
+
+        self.assertEqual([item["role"] for item in repaired], ["assistant", "tool", "tool", "user"])
+        inserted = repaired[2]
+        self.assertEqual(inserted["tool_call_id"], "call-b")
+        self.assertTrue(inserted["is_error"])
+        self.assertNotIn(
+            cli_client.tool_call_signature(messages[0]["tool_calls"][1]),
+            cli_client.completed_tool_signatures(repaired),
+        )
+
 
 class PromptAndArgsTests(unittest.TestCase):
     def test_build_cli_prompt_roles(self):

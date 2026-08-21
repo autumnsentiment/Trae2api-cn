@@ -760,6 +760,31 @@ class SessionLeaseTests(unittest.TestCase):
         main_module._CHAT_HISTORY_SESSIONS.clear()
         main_module._UPSTREAM_SESSION_LEASES.clear()
 
+    def test_chat_normalization_repairs_missing_tool_result(self):
+        normalized = main_module._normalize_chat_messages(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "mcp__node_repl__js:92",
+                            "type": "function",
+                            "function": {
+                                "name": "mcp__node_repl__js",
+                                "arguments": '{"code":"1+1"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        self.assertEqual([item["role"] for item in normalized], ["assistant", "tool", "user"])
+        repaired = normalized[1]
+        self.assertEqual(repaired["tool_call_id"], "mcp__node_repl__js:92")
+        self.assertTrue(repaired["is_error"])
+
     def test_continuation_reuses_initial_account_and_token_snapshot(self):
         messages = [{"role": "user", "content": "inspect the workspace"}]
         with (
@@ -797,6 +822,26 @@ class SessionLeaseTests(unittest.TestCase):
         # The atomic snapshot supplies the credential and avoids a second
         # mutable account-store read.
         self.assertEqual(account.call_count, 0)
+
+    def test_session_binding_uses_jwt_billing_identity_for_raw_uid(self):
+        token = UsageRecordTests._jwt_for_account("billing-account")
+        with (
+            patch("src.main.UPSTREAM_MODE", "raw"),
+            patch("src.main.auth.next_polling_account"),
+            patch(
+                "src.main.auth.get_active_account_snapshot",
+                return_value=("store-account", {"token": token}),
+            ),
+        ):
+            bound = main_module._bind_chat_session(
+                [{"role": "user", "content": "hello"}],
+                {},
+                requested_session_id="terminal-billing",
+            )
+
+        self.assertEqual(bound["_account_id"], "store-account")
+        self.assertEqual(bound["_billing_id"], "billing-account")
+        self.assertEqual(bound["_auth_user_id"], "billing-account")
 
     def test_inferred_history_rebinds_after_account_switch_but_explicit_session_stays_pinned(self):
         messages = [{"role": "user", "content": "inspect the workspace"}]
@@ -1675,6 +1720,101 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertTrue(first.closed)
         self.assertTrue(second.closed)
         self.assertEqual(send_raw.await_count, 2)
+
+    def test_raw_nonstream_recovers_from_suppressed_completed_tool_repeat(self):
+        class LineSource:
+            def __init__(self, lines):
+                self.lines = lines
+
+            def iter_lines(self):
+                return iter(self.lines)
+
+        class FakeRawResponse:
+            def __init__(self, lines):
+                self.response = LineSource(lines)
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        repeated_call = {
+            "id": "call-new-id",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            },
+        }
+        first = FakeRawResponse(
+            [
+                "data: "
+                + json.dumps(
+                    {"tool_calls": [repeated_call], "finish_reason": "tool_calls"}
+                ),
+                "data: [DONE]",
+            ]
+        )
+        second = FakeRawResponse(
+            [
+                'data: {"response":"recovered after tool repeat"}',
+                'data: {"finish_reason":"stop"}',
+                "data: [DONE]",
+            ]
+        )
+        send_raw = AsyncMock(side_effect=[first, second])
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        messages = [
+            {"role": "user", "content": "Read README.md"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-old-id",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"README.md"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-old-id",
+                "name": "read_file",
+                "content": "README contents",
+            },
+        ]
+
+        with (
+            patch("src.main.UPSTREAM_MODE", "raw"),
+            patch("src.main.raw_client.send_raw_chat_request", send_raw),
+        ):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={"model": "auto", "messages": messages, "tools": tools},
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["choices"][0]["message"]["content"],
+            "recovered after tool repeat",
+        )
+        self.assertNotIn("tool_calls", response.json()["choices"][0]["message"])
+        self.assertEqual(send_raw.await_count, 2)
+        retry_options = send_raw.await_args_list[1].args[2]
+        self.assertTrue(retry_options["_recover_suppressed_tool_call"])
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
 
     def test_raw_stream_stops_after_one_empty_retry(self):
         class LineSource:
