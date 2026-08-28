@@ -94,6 +94,8 @@ class AuthState:
 _auth = AuthState()
 _refresh_lock = threading.Lock()
 _STORE_LOCK = threading.RLock()
+_account_refresh_locks: dict[str, threading.Lock] = {}
+_account_refresh_locks_guard = threading.Lock()
 _accounts: dict[str, dict] = {}
 _active_account: str = ""
 _poll_enabled: bool = False
@@ -465,6 +467,98 @@ async def maybe_refresh() -> bool:
         logger.info("auth: token near expiry, refreshing")
         return await refresh_token()
     return False
+
+
+def _account_refresh_lock(account_id: str) -> threading.Lock:
+    """Return the per-account refresh lock, creating it on first use."""
+    with _account_refresh_locks_guard:
+        lock = _account_refresh_locks.get(account_id)
+        if lock is None:
+            lock = threading.Lock()
+            _account_refresh_locks[account_id] = lock
+        return lock
+
+
+async def refresh_account(account_id: str) -> bool:
+    """Exchange a fresh Cloud-IDE-JWT for one stored account and persist it.
+
+    Unlike :func:`refresh_token`, this targets a specific stored account so the
+    polling/checkin/credits paths can recover from a server-side token
+    invalidation (HTTP 401 or business code 1001) that ``expired_at`` alone
+    cannot predict.  Concurrent refreshes for the same account are serialized
+    with a non-blocking lock so a burst of failed calls results in one request.
+    """
+    lock = _account_refresh_lock(account_id)
+    if not lock.acquire(blocking=False):
+        return False
+    try:
+        with _STORE_LOCK:
+            record = dict(_accounts.get(account_id) or {})
+        if not record:
+            logger.warning("auth: refresh_account %s not found", account_id)
+            return False
+        rt = str(record.get("refresh_token") or "")
+        if not rt:
+            logger.warning("auth: refresh_account %s has no refresh token", account_id)
+            return False
+        host = str(
+            record.get("host")
+            or DEFAULT_BASE_URLS.get(
+                record.get("edition", "cn"), "https://trae-api-cn.mchost.guru"
+            )
+        ).rstrip("/")
+        client_id = str(record.get("client_id") or "ono9krqynydwx5")
+        user_id = str(record.get("user_id") or "")
+        url = f"{host}/cloudide/api/v3/trae/oauth/ExchangeToken"
+        payload = {
+            "ClientID": client_id,
+            "RefreshToken": rt,
+            "ClientSecret": "-",
+            "UserID": user_id,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        result = data.get("Result") or data.get("result") or {}
+        new_token = result.get("Token") or result.get("token") or ""
+        new_refresh = result.get("RefreshToken") or result.get("refreshToken") or rt
+        new_expire = result.get("TokenExpireAt") or result.get("tokenExpireAt") or ""
+        if not new_token:
+            logger.error("auth: exchange failed for %s: %s", account_id, data)
+            return False
+        normalized_expire = _normalize_expire(new_expire)
+        with _STORE_LOCK:
+            current = _accounts.get(account_id)
+            if current is None:
+                logger.warning("auth: refreshed account %s removed before update", account_id)
+                return False
+            current_refresh = current.get("refresh_token") or ""
+            if current_refresh and current_refresh != rt:
+                logger.warning(
+                    "auth: discarded stale refresh response for account %s", account_id
+                )
+                return False
+            current = dict(current)
+            current.update(
+                {
+                    "token": new_token,
+                    "refresh_token": new_refresh,
+                    "expired_at": normalized_expire,
+                    "client_id": client_id,
+                }
+            )
+            _accounts[account_id] = current
+            if _active_account == account_id:
+                _switch_record(current)
+            _save_accounts()
+        logger.info("auth: token refreshed for account %s", account_id)
+        return True
+    except Exception as exc:
+        logger.error("auth: refresh_account %s error: %s", account_id, exc)
+        return False
+    finally:
+        lock.release()
 
 
 def apply_oauth_callback(

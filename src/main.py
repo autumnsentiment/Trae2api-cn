@@ -5020,6 +5020,22 @@ def _checkin_response_is_rate_limited(data: dict) -> bool:
     )
 
 
+def _checkin_auth_failed(data: dict) -> bool:
+    """Detect a server-side token invalidation inside a business-code response."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("code") == 1001:
+        return True
+    text = str(data.get("message") or data.get("error") or "")
+    return "not able to authenticate" in text
+
+
+def _credits_auth_failed(exc: BaseException) -> bool:
+    """Detect a server-side token invalidation inside a credits fetch error."""
+    text = str(exc)
+    return "[401]" in text or "not able to authenticate" in text
+
+
 async def _fetch_credit_account_snapshot(
     account_id: str, rec: dict | None = None
 ) -> dict:
@@ -5029,7 +5045,14 @@ async def _fetch_credit_account_snapshot(
     if not token:
         raise KeyError("account not found or token missing")
 
-    full = await _fetch_full_credits(token)
+    try:
+        full = await _fetch_full_credits(token)
+    except Exception as exc:
+        if _credits_auth_failed(exc) and await auth.refresh_account(account_id):
+            fresh = auth.get_account_record(account_id)
+            full = await _fetch_full_credits(fresh.get("token") or "")
+        else:
+            raise
     patch = {key: value for key, value in full.items() if value is not None}
     merged = (
         auth.merge_account_credits(account_id, patch)
@@ -5079,6 +5102,12 @@ async def _fetch_checkin_status_snapshot(
             }
 
     status = await trae_client.fetch_checkin_credits_status(token, account_id)
+    if _checkin_auth_failed(status):
+        if await auth.refresh_account(account_id):
+            fresh = auth.get_account_record(account_id)
+            status = await trae_client.fetch_checkin_credits_status(
+                fresh.get("token") or "", account_id
+            )
     if _checkin_response_is_rate_limited(status):
         retry_after = _checkin_start_cooldown(account_id)
         return {
@@ -5299,6 +5328,16 @@ async def _claim_checkin_account(account_id: str) -> dict:
 
         if data is None:
             return _checkin_cooldown_payload(before, retry_after)
+
+        if _checkin_auth_failed(data) and await auth.refresh_account(account_id):
+            # Server-side token invalidation: rotate this account and retry the
+            # claim once instead of surfacing a transient auth error.
+            fresh = auth.get_account_record(account_id)
+            data, retry_after = await _claim_checkin_throttled(
+                account_id, fresh.get("token") or ""
+            )
+            if data is None:
+                return _checkin_cooldown_payload(before, retry_after)
 
         if data.get("code") == 9074:
             # A 9074 response is already a rate-limit signal.  Querying status
