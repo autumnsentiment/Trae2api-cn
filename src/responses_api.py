@@ -19,7 +19,11 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Mapping, Optional
 
-from .cli_client import ProtocolTextFilter, repair_tool_call_history
+from .cli_client import (
+    ProtocolTextFilter,
+    repair_tool_call_history,
+    sanitize_assistant_history_messages,
+)
 from .model_limits import clamp_max_completion_tokens
 
 
@@ -351,6 +355,19 @@ def _normalize_tools(
             )
         tool_type = str(raw_tool.get("type") or "")
         if tool_type == "function":
+            # Accept both Responses flat tools and Chat-style nested tools.
+            nested = raw_tool.get("function")
+            if isinstance(nested, Mapping):
+                flat = dict(raw_tool)
+                flat["function"] = None
+                flat["name"] = nested.get("name")
+                if nested.get("description") is not None:
+                    flat["description"] = nested.get("description")
+                if nested.get("parameters") is not None:
+                    flat["parameters"] = nested.get("parameters")
+                if "strict" in nested:
+                    flat["strict"] = nested["strict"]
+                raw_tool = flat
             add_binding("function", str(raw_tool.get("name") or ""), raw_tool)
         elif tool_type == "custom":
             add_binding("custom", str(raw_tool.get("name") or ""), raw_tool)
@@ -948,9 +965,11 @@ def normalize_request(
         raise ResponsesRequestError("input must be a string or array", "input")
 
     history_messages = repair_tool_call_history(
-        _merge_response_history(
-            history_messages,
-            current_messages,
+        sanitize_assistant_history_messages(
+            _merge_response_history(
+                history_messages,
+                current_messages,
+            )
         ),
         known_call_ids=set(call_bindings),
     )
@@ -1001,7 +1020,47 @@ def normalize_request(
     reasoning = body.get("reasoning")
     if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
         options.setdefault("reasoning_effort", reasoning.get("effort"))
-    for key in ("client_context", "clientContext", "session_id", "sessionId"):
+    for key in (
+        "client_context",
+        "clientContext",
+        "session_id",
+        "sessionId",
+        # Optional TraeWork Ode/Gpt provider fields. They are inert for the
+        # regular raw/remote paths and consumed by the native helper route.
+        "native_data",
+        "native_user_info",
+        "native_common_params",
+        "native_streamlined_common_params",
+        "native_client_info",
+        "connect_session_id",
+        "connectSessionId",
+        "native_session_id",
+        "native_channel_id",
+        "channel_id",
+        "workspace_folder",
+        "workspacePath",
+        "workspace_id",
+        "workspaceId",
+        "device_id",
+        "deviceId",
+        "agent_type",
+        "shell_execute_strategy",
+        "model_auto_selection",
+        "custom_model",
+        "model_config_source",
+        "modelConfigSource",
+        "model_is_preset",
+        "modelIsPreset",
+        "model_provider",
+        "modelProvider",
+        "ppe_env_name",
+        "ppeEnvName",
+        "envLane",
+        "agentEnv",
+        "forceSandboxType",
+        "version_code",
+        "versionCode",
+    ):
         if key in body:
             options[key] = body[key]
     if call_bindings:

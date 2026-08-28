@@ -16,6 +16,7 @@ data/
 logs/
 work/
 output/
+.native/
 deploy*.py
 check_*.py
 verify*.py

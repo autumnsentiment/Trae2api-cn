@@ -21,11 +21,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 import httpx
 
 from . import auth, raw_client
+from .cli_client import sanitize_assistant_history_messages
 from .model_limits import clamp_max_completion_tokens
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,12 @@ IDE_APP_ID = os.environ.get("TRAE_APP_ID", "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8
 TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID", "ono9krqynydwx5")
 TRAE_UG_API_HOST = os.environ.get("TRAE_UG_API_HOST", "https://api.trae.cn")
 TRAE_PAY_API_HOST = os.environ.get("TRAE_PAY_API_HOST", "https://api.trae.cn")
+# The commercial usage endpoint is separate from the entitlement/credits API.
+# Keep it independently configurable because TraeWork reports session charges
+# through the api5-normal host rather than api.trae.cn.
+TRAE_USAGE_API_HOST = os.environ.get(
+    "TRAE_USAGE_API_HOST", "https://api5-normal.mchost.guru"
+)
 
 # 按优先级依次尝试的 IDE 版上游端点（参考 laojichao/trae-local-api）
 IDE_ENDPOINTS = [
@@ -73,6 +80,13 @@ MODEL_ALIASES = {
     "DeepSeek-V4-Flash-Official": "DeepSeek-V4-Flash-Official",
     "deepseek-v4-pro": "DeepSeek-V4-Pro",
     "deepseek-v4-flash": "DeepSeek-V4-Flash",
+    "deepseek-v4-pro 正式版": "DeepSeek-V4-Pro-Official",
+    "deepseek-v4-flash 正式版": "DeepSeek-V4-Flash-Official",
+    "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
+    "seed-2.1-turbo": "Doubao-Seed-2.1-Turbo",
+    "seed-code": "Doubao-Seed-Code",
+    "seed-evolving": "Doubao-Seed-Evolving",
+    "qwen3.7-plus": "qwen-3.7-plus",
     "kimi-k2.6": "kimi-k2.6",
     "kimi-k3": "kimi-k3",
     "kimi-k2.7-code": "kimi-k2.7-code",
@@ -542,15 +556,102 @@ async def fetch_account_total_credits(token: str = "") -> dict:
     """Fetch all account credits (all packs, both general and work)."""
     return await fetch_account_credits(token, req_source=0)
 
-def build_web_headers(token: str) -> dict[str, str]:
+
+async def fetch_session_usage(
+    session_id: str,
+    token: str = "",
+    *,
+    base_url: str = "",
+) -> dict:
+    """Read the billable usage for one completed TraeWork turn.
+
+    ``session_id`` is the upstream *user-message/turn id* (usually
+    ``reply_to_message_id``), not the relay's fixed chat conversation UUID.
+    This endpoint is read-only and is used only as asynchronous billing
+    enrichment after the model response has already been returned.
+    """
+
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        raise ValueError("session_id is required")
+    token = str(token or auth.get_token() or "").strip()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
+    base = str(base_url or os.environ.get("TRAE_USAGE_API_HOST", TRAE_USAGE_API_HOST)).rstrip("/")
+    url = f"{base}/api/v1/commercial/get_session_usage"
+    headers = {
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "Content-Type": "application/json",
+    }
+    timeout = float(os.environ.get("TRAE_USAGE_QUERY_TIMEOUT_SECONDS", "15") or "15")
+    timeout = max(1.0, min(timeout, 60.0))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            url,
+            json={"session_id": session_id},
+            headers=headers,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            raise RuntimeError(f"Trae session usage [{response.status_code}]")
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"Trae session usage invalid json: {exc}") from exc
+
+    if not isinstance(payload, Mapping):
+        return {}
+    code = payload.get("code")
+    if code not in (None, 0, "0"):
+        raise RuntimeError(
+            f"Trae session usage: {payload.get('message') or payload.get('msg') or code}"
+        )
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        data = payload
+    usage = data.get("user_usage_group_by_session")
+    if not isinstance(usage, Mapping):
+        usage = data
+
+    # Return only billing-safe scalar fields.  Do not persist or log
+    # ``extra_info`` (which contains token details) or any upstream envelope.
+    credits = _credit_decimal(
+        usage.get("credits_float")
+        if isinstance(usage, Mapping)
+        else None
+    )
+    if credits is None or credits < 0:
+        return {}
+    return {
+        "credits_consumed": _json_credit_number(credits),
+        "credits_source": "session_usage",
+    }
+
+def _provider_specific(options: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    if isinstance(options, Mapping):
+        for key in ("provider_specific", "providerSpecificData"):
+            if key not in options:
+                continue
+            value = options.get(key)
+            if isinstance(value, Mapping):
+                return dict(value)
+    return auth.get_psd()
+
+
+def build_web_headers(
+    token: str, options: Optional[Mapping[str, Any]] = None
+) -> dict[str, str]:
     """构造参考 OmniRoute 网页版 remote 会话的请求头。"""
-    psd = auth.get_psd()
+    psd = _provider_specific(options)
     return {
         "Authorization": f"Cloud-IDE-JWT {token}",
         "Content-Type": "application/json",
         "X-Trae-Client-Type": "web",
-        "X-Preferenced-Language": psd.get("appLanguage") or os.environ.get("TRAE_WEB_LANGUAGE", "zh-CN"),
-        "x-user-region": psd.get("userRegion") or os.environ.get("TRAE_WEB_USER_REGION", "CN"),
+        "X-Preferenced-Language": psd.get("appLanguage")
+        or os.environ.get("TRAE_WEB_LANGUAGE")
+        or "zh-CN",
+        "x-user-region": psd.get("userRegion")
+        or os.environ.get("TRAE_WEB_USER_REGION")
+        or "CN",
         "Origin": web_origin(),
         "Referer": web_origin() + "/",
         "User-Agent": (
@@ -595,7 +696,7 @@ def _web_common_params(psd: dict, mode: str, session_id: str = "") -> str:
 def flatten_query(messages: list[dict]) -> str:
     """把 OpenAI 消息扁平化为 web remote 端点的 query JSON 字符串。"""
     parts: list[str] = []
-    for m in messages:
+    for m in sanitize_assistant_history_messages(messages):
         content_value = m.get("content", "")
         if content_value in (None, "", []) and not m.get("tool_calls"):
             for key in ("parts", "text", "prompt", "message", "input"):
@@ -631,7 +732,7 @@ def build_web_content(messages: list[dict]) -> list[dict]:
     agent understands the full conversation context including previous tool usage.
     """
     items: list[dict] = []
-    for m in messages:
+    for m in sanitize_assistant_history_messages(messages):
         role = m.get("role", "user")
         content = m.get("content", "")
         if content in (None, "", []) and not m.get("tool_calls"):
@@ -740,6 +841,7 @@ def register_web_lease(
     message_id: str,
     client: httpx.AsyncClient,
     token: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
 ) -> None:
     _WEB_LEASES[session_id] = {
         "account_id": account_id,
@@ -747,6 +849,7 @@ def register_web_lease(
         "message_id": message_id,
         "client": client,
         "token": token,
+        "provider_specific": dict(provider_specific or {}),
         "last_activity": time.monotonic(),
     }
 
@@ -784,7 +887,7 @@ async def stop_web_session(
     try:
         resp = await client.post(
             f"{base}/chat_sessions/{session_id}/stop",
-            headers=build_web_headers(token),
+            headers=build_web_headers(token, options),
             json={"chat_session_id": session_id, "user_message_id": message_id},
             timeout=10,
         )
@@ -809,7 +912,12 @@ async def reap_idle_web_sessions() -> int:
                         client,
                         session_id,
                         message_id,
-                        options={"_auth_token": lease.get("token") or ""},
+                        options={
+                            "_auth_token": lease.get("token") or "",
+                            "provider_specific": dict(
+                                lease.get("provider_specific") or {}
+                            ),
+                        },
                     )
                 except Exception:
                     pass
@@ -835,6 +943,10 @@ def _build_web_model_config(raw: dict) -> dict:
             cfg["features"] = {}
     name = cfg.get("name") or ""
     cfg["config_name"] = cfg.get("config_name") or name
+    # The CN model-list response uses ``name`` as the config identifier.  The
+    # remote executor also accepts/records ``model_name``; keeping both makes
+    # the selected model explicit instead of allowing a default fallback.
+    cfg["model_name"] = cfg.get("model_name") or name
     cfg["config_source"] = cfg.get("config_source") or 1
     cfg["provider"] = cfg.get("provider") or ""
     cfg["multimodal"] = bool(cfg.get("multimodal"))
@@ -846,7 +958,11 @@ def _build_web_model_config(raw: dict) -> dict:
     return cfg
 
 
-async def _fetch_web_model_configs(token_override: str = "") -> dict[str, dict]:
+async def _fetch_web_model_configs(
+    token_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    agent_type: str = "",
+) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
     base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
     token = token_override or auth.get_token()
@@ -854,7 +970,14 @@ async def _fetch_web_model_configs(token_override: str = "") -> dict[str, dict]:
         return {}
     url = f"{base}/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true"
     try:
-        async with httpx.AsyncClient(headers=build_web_headers(token), timeout=30) as client:
+        header_options = (
+            {"provider_specific": dict(provider_specific)}
+            if provider_specific is not None
+            else None
+        )
+        async with httpx.AsyncClient(
+            headers=build_web_headers(token, header_options), timeout=30
+        ) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
                 logger.warning("trae-client: web model list returned %s", resp.status_code)
@@ -864,16 +987,66 @@ async def _fetch_web_model_configs(token_override: str = "") -> dict[str, dict]:
         logger.warning("trae-client: web model list failed: %s", e)
         return {}
     out: dict[str, dict] = {}
-    for group in data.get("data", {}).get("list", []):
+
+    def _ingest_models(group: Mapping[str, Any]) -> None:
+        if not isinstance(group, Mapping):
+            return
         for raw in group.get("models", []):
+            if not isinstance(raw, Mapping):
+                continue
             name = (raw.get("name") or "").strip()
-            if name:
+            if name and name not in out:
                 out[name] = _build_web_model_config(raw)
+
+    def _group_function(group: Mapping[str, Any]) -> str:
+        if not isinstance(group, Mapping):
+            return ""
+        value = group.get("function") or group.get("agent_type") or ""
+        return str(value).strip().lower()
+
+    groups = data.get("data", {}).get("list", [])
+    requested = str(agent_type or "").strip().lower()
+    # Keep each agent tier separate.  Agent carries the 1M profile while Work
+    # remains the 200K fallback; selecting by tier must not reuse the Agent
+    # config from the account cache.
+    preferred = []
+    if requested:
+        preferred = [g for g in groups if _group_function(g) == requested]
+    if not preferred and requested:
+        # A requested tier may be represented by its lite sibling in older
+        # model lists, but must never silently fall back from Work to Agent.
+        sibling = (
+            requested[:-7] + "_lite"
+            if requested.endswith("_remote")
+            else requested[:-5] + "_remote"
+            if requested.endswith("_lite")
+            else ""
+        )
+        if sibling:
+            preferred = [g for g in groups if _group_function(g) == sibling]
+    if not preferred and requested:
+        return out
+    if not preferred:
+        agent_remote = [g for g in groups if _group_function(g) == "solo_agent_remote"]
+        agent_lite = [g for g in groups if _group_function(g) == "solo_agent_lite"]
+        preferred = agent_remote + agent_lite
+    for group in preferred:
+        _ingest_models(group)
+    # For the default Agent lookup, preserve the historical fallback to Work;
+    # an explicit Work lookup must stay in the Work tier.
+    if not requested:
+        for group in groups:
+            _ingest_models(group)
     return out
 
 
 async def _get_web_custom_model(
-    model_name: str, *, token_override: str = "", user_id_override: str = ""
+    model_name: str,
+    *,
+    token_override: str = "",
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    agent_type: str = "",
 ) -> Optional[dict]:
     """Return custom_model for a manual web model selection.
 
@@ -885,11 +1058,16 @@ async def _get_web_custom_model(
     if not model_name:
         return None
     token = token_override or auth.get_token()
-    account_key = _web_model_cache_key(token, user_id_override)
+    account_key = _web_model_cache_key(token, user_id_override) + ":" + str(agent_type or "default")
     now = time.time()
     cached = _WEB_MODEL_CACHE.get(account_key)
     if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
-        configs = await _fetch_web_model_configs(token)
+        fetch_kwargs: dict[str, Any] = {}
+        if provider_specific is not None:
+            fetch_kwargs["provider_specific"] = provider_specific
+        if agent_type:
+            fetch_kwargs["agent_type"] = agent_type
+        configs = await _fetch_web_model_configs(token, **fetch_kwargs)
         cached = (now, configs)
         _WEB_MODEL_CACHE[account_key] = cached
 
@@ -930,15 +1108,24 @@ async def _get_web_custom_model(
 
 
 async def resolve_model_config(
-    model_name: str, *, token_override: str = "", user_id_override: str = ""
+    model_name: str,
+    *,
+    token_override: str = "",
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    agent_type: str = "",
 ) -> Optional[dict]:
     """Resolve a public/display model label to Trae's exact config object."""
 
-    return await _get_web_custom_model(
-        model_name,
-        token_override=token_override,
-        user_id_override=user_id_override,
-    )
+    kwargs: dict[str, Any] = {
+        "token_override": token_override,
+        "user_id_override": user_id_override,
+    }
+    if provider_specific is not None:
+        kwargs["provider_specific"] = provider_specific
+    if agent_type:
+        kwargs["agent_type"] = agent_type
+    return await _get_web_custom_model(model_name, **kwargs)
 
 
 async def create_web_session(
@@ -959,14 +1146,25 @@ async def create_web_session(
         raise RuntimeError("No Cloud-IDE-JWT token available")
 
     mode, strategy, model_name = _resolve_mode(model)
+    requested_agent_type = str(
+        options.get("_remote_agent_type")
+        or options.get("remote_agent_type")
+        or ""
+    ).strip().lower()
+    agent_type = (
+        "solo_work_remote"
+        if requested_agent_type in {"solo_work_remote", "solo_work_lite", "work"}
+        or mode == "work"
+        else "solo_agent_remote"
+    )
     prepared_messages = _messages_with_client_runtime(messages, options)
-    psd = auth.get_psd()
+    psd = _provider_specific(options)
     initial_message = {
         "chat_session_id": "",
         "content": build_web_content(prepared_messages),
         "query": flatten_query(prepared_messages),
         "model_name": model_name,
-        "agent_type": "solo_agent_remote",
+        "agent_type": agent_type,
         "model_selection_strategy": strategy,
         "common_params": _web_common_params(psd, mode),
     }
@@ -977,11 +1175,14 @@ async def create_web_session(
             or options.get("_account_id")
             or ""
         ).strip()
-        custom_model = await _get_web_custom_model(
-            model_name,
-            token_override=token,
-            user_id_override=bound_user_id,
-        )
+        lookup_kwargs: dict[str, Any] = {
+            "token_override": token,
+            "user_id_override": bound_user_id,
+            "provider_specific": psd,
+        }
+        if agent_type != "solo_agent_remote" or requested_agent_type:
+            lookup_kwargs["agent_type"] = agent_type
+        custom_model = await _get_web_custom_model(model_name, **lookup_kwargs)
         if custom_model:
             initial_message["custom_model"] = custom_model
     body = {
@@ -994,7 +1195,7 @@ async def create_web_session(
     }
     resp = await client.post(
         f"{base}/chat_sessions",
-        headers=build_web_headers(token),
+        headers=build_web_headers(token, options),
         json=body,
         timeout=60,
     )
@@ -1024,7 +1225,9 @@ async def stream_web_events(
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
-    async with client.stream("GET", url, headers=build_web_headers(token), timeout=timeout) as resp:
+    async with client.stream(
+        "GET", url, headers=build_web_headers(token, options), timeout=timeout
+    ) as resp:
         if resp.status_code != 200:
             body = await resp.aread()
             raise RuntimeError(f"Trae web events stream [{resp.status_code}]: {body[:500]}")
@@ -1189,7 +1392,10 @@ def convert_openai_messages(
 ) -> list[dict]:
     """Convert OpenAI messages without losing external tool-call history."""
     result: list[dict] = []
-    for m in _messages_with_client_runtime(messages, options):
+    prepared_messages = sanitize_assistant_history_messages(
+        _messages_with_client_runtime(messages, options)
+    )
+    for m in prepared_messages:
         role = m.get("role", "user")
         content = m.get("content", "")
         if isinstance(content, list):

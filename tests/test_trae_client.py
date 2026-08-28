@@ -172,24 +172,42 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
                 return {"data": {"chat_session_id": "session-b", "message_id": "message-b"}}
 
         class FakeClient:
+            request = None
+
             async def post(self, *_args, **_kwargs):
+                self.request = _kwargs
                 return FakeResponse()
 
         lookup = AsyncMock(
             return_value={"name": "requested-model", "config_name": "config-b"}
         )
+        provider_specific = {
+            "webId": "bound-web",
+            "bizUserId": "bound-biz",
+            "appLanguage": "ja-JP",
+            "userRegion": "JP",
+        }
+        fake_client = FakeClient()
         with (
             patch.object(trae_client, "_get_web_custom_model", new=lookup),
-            patch.object(trae_client.auth, "get_psd", return_value={}),
-            patch.object(trae_client, "build_web_headers", return_value={}),
+            patch.object(
+                trae_client.auth,
+                "get_psd",
+                return_value={
+                    "webId": "wrong-global-web",
+                    "appLanguage": "wrong-global-language",
+                    "userRegion": "wrong-global-region",
+                },
+            ),
         ):
             session_id, message_id = await trae_client.create_web_session(
-                FakeClient(),
+                fake_client,
                 "requested-model",
                 [{"role": "user", "content": "hello"}],
                 options={
                     "_auth_token": token_b,
                     "_auth_user_id": "account-b",
+                    "provider_specific": provider_specific,
                 },
             )
 
@@ -198,7 +216,134 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
             "requested-model",
             token_override=token_b,
             user_id_override="account-b",
+            provider_specific=provider_specific,
         )
+        common = json.loads(
+            fake_client.request["json"]["initial_message"]["common_params"]
+        )
+        self.assertEqual(common["web_id"], "bound-web")
+        self.assertEqual(common["biz_user_id"], "bound-biz")
+        self.assertEqual(fake_client.request["headers"]["X-Preferenced-Language"], "ja-JP")
+        self.assertEqual(fake_client.request["headers"]["x-user-region"], "JP")
+
+    def test_web_headers_preserve_bound_empty_provider_metadata(self):
+        with patch.object(
+            trae_client.auth,
+            "get_psd",
+            return_value={"appLanguage": "wrong", "userRegion": "wrong"},
+        ):
+            headers = trae_client.build_web_headers(
+                "token", {"provider_specific": {}}
+            )
+
+        self.assertEqual(headers["X-Preferenced-Language"], "zh-CN")
+        self.assertEqual(headers["x-user-region"], "CN")
+
+
+class SessionUsageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_session_usage_matches_traework_request_and_response(self):
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "code": 0,
+                    "data": {
+                        "user_usage_group_by_session": {
+                            "credits_float": 0.92,
+                            "extra_info": {
+                                "input_token": 29558,
+                                "output_token": 11,
+                            },
+                        }
+                    },
+                }
+
+        class Client:
+            request = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, url, **kwargs):
+                self.request = (url, kwargs)
+                return Response()
+
+        client = Client()
+        with patch("src.trae_client.httpx.AsyncClient", return_value=client):
+            result = await trae_client.fetch_session_usage(
+                "user-message-1",
+                "jwt-token",
+                base_url="https://usage.example",
+            )
+
+        url, request = client.request
+        self.assertEqual(
+            url,
+            "https://usage.example/api/v1/commercial/get_session_usage",
+        )
+        self.assertEqual(request["json"], {"session_id": "user-message-1"})
+        self.assertEqual(
+            request["headers"],
+            {
+                "Authorization": "Cloud-IDE-JWT jwt-token",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(
+            result,
+            {"credits_consumed": 0.92, "credits_source": "session_usage"},
+        )
+        self.assertNotIn("extra_info", result)
+
+    async def test_fetch_session_usage_preserves_explicit_zero(self):
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"user_usage_group_by_session": {"credits_float": 0}}
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        with patch("src.trae_client.httpx.AsyncClient", return_value=Client()):
+            result = await trae_client.fetch_session_usage("turn-0", "jwt-token")
+
+        self.assertEqual(result["credits_consumed"], 0)
+
+    async def test_fetch_session_usage_rejects_business_error(self):
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"code": 2001, "message": "record not found"}
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        with patch("src.trae_client.httpx.AsyncClient", return_value=Client()):
+            with self.assertRaisesRegex(RuntimeError, "record not found"):
+                await trae_client.fetch_session_usage("missing", "jwt-token")
 
 
 class AccountCreditsParserTests(unittest.TestCase):
@@ -522,8 +667,8 @@ class IdeRequestContextTests(unittest.TestCase):
                 384000,
             )
         )
-        self.assertEqual(body["max_tokens"], 131072)
-        self.assertEqual(ide_request["max_output_tokens"], 131072)
+        self.assertEqual(body["max_tokens"], 64000)
+        self.assertEqual(ide_request["max_output_tokens"], 64000)
 
     def test_implicit_sessions_do_not_collide_on_same_prompt(self):
         first = trae_client.generate_session_id_from_messages(
@@ -582,6 +727,93 @@ class IdeRequestContextTests(unittest.TestCase):
             asyncio.run(trae_client.create_web_session(None, "auto", messages))
         with self.assertRaisesRegex(RuntimeError, "IDE endpoints"):
             asyncio.run(trae_client.send_chat_request(messages, "auto", False))
+
+
+class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_remote_group_wins_over_same_name_work(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "list": [
+                            {
+                                "function": "solo_work_remote",
+                                "models": [
+                                    {
+                                        "name": "glm-5.3",
+                                        "max_tokens": 32000,
+                                        "context_window_size": {"default": 200000},
+                                    }
+                                ],
+                            },
+                            {
+                                "function": "solo_agent_remote",
+                                "models": [
+                                    {
+                                        "name": "glm-5.3",
+                                        "max_tokens": 64000,
+                                        "context_window_size": {
+                                            "default": 200000,
+                                            "max": 1000000,
+                                        },
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, url):
+                return FakeResponse()
+
+        with patch.object(trae_client.httpx, "AsyncClient", return_value=FakeClient()):
+            configs = await trae_client._fetch_web_model_configs(token_override="token-x")
+
+        cfg = configs["glm-5.3"]
+        self.assertEqual(cfg["max_tokens"], 64000)
+        self.assertEqual(cfg["context_window_size"]["max"], 1000000)
+
+    async def test_fallback_keeps_work_group_when_agent_absent(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "list": [
+                            {
+                                "function": "solo_work_remote",
+                                "models": [{"name": "glm-5.3", "max_tokens": 32000}],
+                            }
+                        ]
+                    }
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, url):
+                return FakeResponse()
+
+        with patch.object(trae_client.httpx, "AsyncClient", return_value=FakeClient()):
+            configs = await trae_client._fetch_web_model_configs(token_override="token-x")
+
+        self.assertEqual(configs["glm-5.3"]["max_tokens"], 32000)
 
 
 if __name__ == "__main__":

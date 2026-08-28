@@ -702,6 +702,32 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
         self.assertIn("history only", messages[1]["content"])
         self.assertTrue(options["_tool_protocol_requested"])
 
+    def test_normalize_accepts_chat_nested_tool_shape(self):
+        chat_tool = {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 file from the caller workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+        messages, options, context = responses_api.normalize_request(
+            {
+                "model": "auto",
+                "input": "Use read_file.",
+                "tools": [chat_tool],
+                "tool_choice": {"type": "function", "name": "read_file"},
+            }
+        )
+        self.assertEqual(options["tools"][0]["type"], "function")
+        self.assertEqual(options["tools"][0]["function"]["name"], "read_file")
+        self.assertEqual(context.bindings["read_file"].response_type, "function")
+        self.assertEqual(context.bindings["read_file"].name, "read_file")
+
     def test_inherited_tool_names_are_reserved_for_new_tools(self):
         _, _, context = responses_api.normalize_request(
             {
@@ -945,7 +971,7 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
                 "max_output_tokens": 384000,
             }
         )
-        self.assertEqual(options["max_tokens"], 131072)
+        self.assertEqual(options["max_tokens"], 64000)
 
     def test_stream_function_call_emits_argument_delta_and_done_events(self):
         captured = {}

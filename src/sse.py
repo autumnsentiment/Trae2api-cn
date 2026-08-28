@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator, Optional
@@ -90,9 +91,211 @@ async def _iter_stream_lines(response) -> AsyncIterator[Any]:
 class EmptyUpstreamResponse(RuntimeError):
     """Raised before any chunks are emitted when an upstream turn is empty."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        usage: Optional[dict] = None,
+        observed_model_event: bool = False,
+    ):
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.usage = dict(usage) if isinstance(usage, dict) else None
+        self.observed_model_event = bool(observed_model_event)
+
+
+class IncompleteUpstreamResponse(EmptyUpstreamResponse):
+    """Raised when an upstream stream ends without a terminal event.
+
+    Trae can emit a cumulative response snapshot with a ``stop_reason`` before
+    it has sent the actual terminal SSE event.  Treating that snapshot as the
+    end of the stream silently drops the remaining answer.  This exception is
+    an ``EmptyUpstreamResponse`` subclass so existing retry paths can recover
+    from a truncated upstream attempt.
+    """
+
 
 class RepeatedCompletedToolResponse(EmptyUpstreamResponse):
     """Raised when the only upstream output repeats an already completed call."""
+
+
+class ModelProviderMismatch(RuntimeError):
+    """Raised when Trae reports a provider different from the requested model."""
+
+
+_EVENT_NAME_ALIASES = {
+    "keepalive": "keepalive",
+    "modelconfig": "model_config",
+    "planitem": "plan_item",
+    "requestwaitinqueue": "request_wait_in_queue",
+    "responsedone": "done",
+    "streamdone": "done",
+    "tokenusage": "token_usage",
+}
+
+
+def _normalize_event_name(value: Any) -> str:
+    """Normalize raw, remote, and native event spellings to snake_case."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
+    return _EVENT_NAME_ALIASES.get(text.replace("_", ""), text)
+
+
+def _payload_event_name(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("event", "event_type", "eventType", "type"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return _normalize_event_name(value)
+    return ""
+
+
+def _usage_turn_id(payload: Any) -> str:
+    """Extract Trae's billable user-message id without exposing it downstream."""
+
+    if not isinstance(payload, dict):
+        return ""
+    for key in (
+        "reply_to_message_id",
+        "replyToMessageId",
+        "user_message_id",
+        "userMessageId",
+    ):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for key in ("model_config", "modelConfig", "data"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            value = _usage_turn_id(nested)
+            if value:
+                return value
+    return ""
+
+
+def _capture_upstream_metadata(target: Any, payload: Any) -> None:
+    if not isinstance(target, dict):
+        return
+    turn_id = _usage_turn_id(payload)
+    if turn_id:
+        target["usage_turn_id"] = turn_id
+
+
+def _provider_model_name(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    direct = (
+        payload.get("provider_model_name")
+        or payload.get("providerModelName")
+        or payload.get("model_provider_name")
+        or payload.get("modelProviderName")
+    )
+    if direct:
+        return str(direct).strip()
+    timing = payload.get("timing_cost") or payload.get("timingCost")
+    if isinstance(timing, dict):
+        value = (
+            timing.get("provider_model_name")
+            or timing.get("providerModelName")
+            or timing.get("model_provider_name")
+            or timing.get("modelProviderName")
+        )
+        if value:
+            return str(value).strip()
+    model_config = payload.get("model_config") or payload.get("modelConfig")
+    if isinstance(model_config, dict):
+        value = (
+            model_config.get("provider_model_name")
+            or model_config.get("providerModelName")
+            or model_config.get("model_provider_name")
+            or model_config.get("modelProviderName")
+            or model_config.get("model_name")
+            or model_config.get("modelName")
+        )
+        if value:
+            return str(value).strip()
+    event_name = _payload_event_name(payload)
+    if event_name == "model_config":
+        value = payload.get("model_name") or payload.get("modelName")
+        if value:
+            return str(value).strip()
+    for key in ("provider_model",):
+        value = payload.get(key)
+        if value:
+            return str(value).strip()
+    timing_data = payload.get("data")
+    if isinstance(timing_data, dict):
+        for key in (
+            "provider_model_name",
+            "providerModelName",
+            "model_provider_name",
+            "modelProviderName",
+        ):
+            value = timing_data.get(key)
+            if value:
+                return str(value).strip()
+        if event_name == "model_config":
+            value = timing_data.get("model_name") or timing_data.get("modelName")
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def _model_family(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("trae/"):
+        text = text[5:]
+    # Runtime ids append build variants after a double underscore. They do not
+    # represent a different public model family.
+    text = text.split("__", 1)[0].replace("_", "-")
+    # The raw gateway prefixes Alibaba-hosted DeepSeek variants with ``ali-``.
+    if text.startswith("ali-deepseek-v4-"):
+        text = text[4:]
+    # Provider deployments may append ``Official`` and/or a release date while
+    # retaining the same DeepSeek public model identity.
+    deepseek = re.fullmatch(
+        r"(deepseek-v4-(?:pro|flash))(?:-(?:official|\d{4,8}))*", text
+    )
+    if deepseek:
+        return deepseek.group(1)
+    if text.endswith("-official"):
+        text = text[: -len("-official")]
+    return text
+
+
+def _check_provider_model(requested: str, actual: str) -> None:
+    if not actual or not requested:
+        return
+    if str(os.environ.get("TRAE_STRICT_MODEL_MATCH", "true")).strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return
+    # The public API accepts aliases (for example ``gpt-4o`` and
+    # ``claude-sonnet-4``) that Trae maps to a concrete remote config. Compare
+    # the provider against that effective config rather than the alias text.
+    effective_requested = requested
+    try:
+        from .trae_client import convert_model_name
+
+        effective_requested = convert_model_name(str(requested or "")) or requested
+    except Exception:
+        pass
+    requested_family = _model_family(effective_requested)
+    if requested_family in {"", "auto", "work", "auto-work", "solo-work"}:
+        return
+    actual_family = _model_family(actual)
+    if requested_family == actual_family:
+        return
+    raise ModelProviderMismatch(
+        f"Trae selected provider model {actual!r} for requested model {requested!r}"
+    )
 
 
 def make_id(prefix: str = "chatcmpl") -> str:
@@ -115,6 +318,7 @@ def openai_chunk(
     finish_reason=None,
     usage=None,
     error=None,
+    provider_model_name: Optional[str] = None,
 ):
     chunk = {
         "id": prefix_id,
@@ -127,6 +331,8 @@ def openai_chunk(
         chunk["usage"] = usage
     if error is not None:
         chunk["error"] = error
+    if provider_model_name:
+        chunk["provider_model_name"] = provider_model_name
     return "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
 
 
@@ -137,6 +343,7 @@ def openai_completion(
     finish_reason: str = "stop",
     usage=None,
     tool_calls: Optional[list[dict]] = None,
+    provider_model_name: Optional[str] = None,
 ):
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
@@ -174,6 +381,8 @@ def openai_completion(
         "completion_tokens": estimate_tokens(text),
         "total_tokens": estimate_tokens(text),
     }
+    if provider_model_name:
+        resp["provider_model_name"] = provider_model_name
     return resp
 
 
@@ -195,9 +404,23 @@ def _map_usage(usage: Any) -> Optional[dict]:
                 return max(0, value)
         return None
 
-    prompt = number("prompt_tokens", "input_tokens", "inputTokens")
-    completion = number("completion_tokens", "output_tokens", "outputTokens")
-    total = number("total_tokens", "totalTokens") or prompt + completion
+    prompt = number(
+        "prompt_tokens",
+        "input_tokens",
+        "input_token",
+        "inputTokens",
+        "inputToken",
+    )
+    completion = number(
+        "completion_tokens",
+        "output_tokens",
+        "output_token",
+        "outputTokens",
+        "outputToken",
+    )
+    total = number(
+        "total_tokens", "total_token", "totalTokens", "totalToken"
+    ) or prompt + completion
     mapped = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
@@ -208,6 +431,8 @@ def _map_usage(usage: Any) -> Optional[dict]:
         "consumed_credits",
         "credit_cost",
         "credits_cost",
+        "credits_float",
+        "creditsFloat",
     )
     if credits is not None:
         mapped["credits_consumed"] = credits
@@ -217,19 +442,29 @@ def _map_usage(usage: Any) -> Optional[dict]:
 def _payload_finish_reason(data: Any) -> Optional[str]:
     if not isinstance(data, dict):
         return None
-    for key in ("finish_reason", "stop_reason"):
+    for key in ("finish_reason", "stop_reason", "finishReason", "stopReason"):
         value = data.get(key)
         if value:
             return str(value)
     message = data.get("message")
     if isinstance(message, dict):
-        for key in ("finish_reason", "stop_reason"):
+        for key in (
+            "finish_reason",
+            "stop_reason",
+            "finishReason",
+            "stopReason",
+        ):
             value = message.get(key)
             if value:
                 return str(value)
         response_meta = message.get("response_meta")
         if isinstance(response_meta, dict):
-            for key in ("finish_reason", "stop_reason"):
+            for key in (
+                "finish_reason",
+                "stop_reason",
+                "finishReason",
+                "stopReason",
+            ):
                 value = response_meta.get(key)
                 if value:
                     return str(value)
@@ -614,7 +849,9 @@ def _visible_text(text: Any) -> str:
     return _strip_tool_call_blocks(text) if isinstance(text, str) else ""
 
 
-def _hold_incomplete_tool_block(text: str) -> str:
+def _hold_incomplete_tool_block(
+    text: str, *, hold_escape_prefix: bool = True
+) -> str:
     """Keep a split XML tool block out of visible text until it is complete."""
     lowered = text.lower()
     pairs = (
@@ -640,6 +877,12 @@ def _hold_incomplete_tool_block(text: str) -> str:
         suffix = lowered[last_lt:]
         if any(opening.startswith(suffix) for opening, _ in pairs):
             earliest = min(earliest, last_lt)
+    if hold_escape_prefix:
+        # An escaped wait frame can split inside its leading backslash run,
+        # before the first ``<`` makes the protocol prefix recognizable.
+        escape_prefix = re.search(r"\\+[ \t\r\n]*$", text)
+        if escape_prefix:
+            earliest = min(earliest, escape_prefix.start())
     return text[:earliest]
 
 
@@ -650,12 +893,19 @@ class ProtocolTextAccumulator:
         self.raw = ""
         self.visible = ""
 
-    def _result(self) -> tuple[str, list[dict]]:
-        visible = _hold_incomplete_tool_block(_visible_text(self.raw))
+    def _result(self, *, final: bool = False) -> tuple[str, list[dict]]:
+        visible = _hold_incomplete_tool_block(
+            _visible_text(self.raw), hold_escape_prefix=not final
+        )
         delta = _cli_text_delta(self.visible, visible)
         self.visible = visible
         calls = _extract_tool_calls({"response": self.raw}) if self.raw else []
         return delta, calls
+
+    def finalize(self) -> tuple[str, list[dict]]:
+        """Release a harmless trailing escape run at logical text EOF."""
+
+        return self._result(final=True)
 
     def add_delta(self, value: Any) -> tuple[str, list[dict]]:
         text = value if isinstance(value, str) else ""
@@ -745,6 +995,8 @@ async def translate_ide_stream(
     parallel_tool_calls: Any = None,
     fail_on_empty: bool = False,
     completed_tool_signatures: Any = None,
+    require_terminal: bool = True,
+    upstream_metadata: Optional[dict] = None,
 ):
     """Translate /api/ide chat or llm_raw_chat SSE into OpenAI SSE."""
     prefix_id = make_id()
@@ -758,7 +1010,10 @@ async def translate_ide_stream(
     response_text = ProtocolTextAccumulator()
     final_usage = None
     final_reason = "stop"
+    provider_model_name = ""
     saw_completed_repeat = False
+    saw_terminal = False
+    terminal_event_pending = False
     started = not fail_on_empty
     pending_queue_chunks: list[str] = []
 
@@ -777,22 +1032,36 @@ async def translate_ide_stream(
         raw = line.strip()
         if not raw:
             continue
-        if raw.startswith("event:"):
-            pending_event = raw[6:].strip()
+        if raw.lower().startswith("event:"):
+            pending_event = _normalize_event_name(raw[6:].strip())
+            # Keep the event line itself as a terminal marker.  The normal SSE
+            # form carries a final data frame after ``event: done``; retaining
+            # this pending bit also handles a clean close immediately after
+            # the event line without misclassifying it as truncation.
+            terminal_event_pending = pending_event == "done"
             continue
-        if not raw.startswith("data:"):
+        if not raw.lower().startswith("data:"):
             continue
         payload = raw[5:].strip()
-        if payload == "[DONE]":
+        if payload.upper() == "[DONE]":
+            saw_terminal = True
             break
         try:
             obj = json.loads(payload)
         except Exception:
+            if terminal_event_pending:
+                saw_terminal = True
+                break
             continue
         if not isinstance(obj, dict):
+            if terminal_event_pending:
+                saw_terminal = True
+                break
             continue
-        event_type = obj.get("event") or pending_event
+        event_type = pending_event or _payload_event_name(obj)
         pending_event = None
+        terminal_event_pending = False
+        _capture_upstream_metadata(upstream_metadata, obj)
         if event_type == "error":
             raise RuntimeError(
                 str(obj.get("message") or obj.get("error") or "Trae raw upstream returned an error event")
@@ -815,6 +1084,11 @@ async def translate_ide_stream(
         if event_type == "token_usage":
             final_usage = _map_usage(obj.get("usage") or obj)
             continue
+
+        reported_provider = _provider_model_name({**obj, "event": event_type})
+        if reported_provider:
+            provider_model_name = reported_provider
+            _check_provider_model(model, reported_provider)
 
         reasoning = obj.get("reasoning_content") if isinstance(obj.get("reasoning_content"), str) else ""
         raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
@@ -863,20 +1137,96 @@ async def translate_ide_stream(
             final_usage = _map_usage(obj.get("usage"))
         if obj.get("finish_reason"):
             final_reason = str(obj.get("finish_reason"))
-        # Trae sometimes attaches a finish_reason to an intermediate
-        # cumulative snapshot.  Only an explicit done event, stop_reason, or
-        # the [DONE] sentinel above terminates the upstream stream; otherwise
-        # consuming the rest is required to avoid truncating the answer.
-        if event_type == "done" or obj.get("stop_reason"):
-            final_reason = str(obj.get("finish_reason") or obj.get("stop_reason") or final_reason)
+        # Trae sometimes attaches a finish_reason/stop_reason to an
+        # intermediate cumulative snapshot.  It is metadata, not a terminal
+        # boundary.  Only an explicit done event or the [DONE] sentinel above
+        # terminates the upstream stream; otherwise consuming the rest is
+        # required to avoid truncating the answer.
+        if event_type == "done":
+            saw_terminal = True
+            final_reason = _payload_finish_reason(obj) or final_reason
             break
 
+    reasoning_delta, reasoning_calls = reasoning_text.finalize()
+    response_delta, response_calls = response_text.finalize()
+    final_calls = reasoning_calls + response_calls
+    if _contains_completed_tool_repeat(final_calls, completed_tool_signatures):
+        saw_completed_repeat = True
+    final_tool_chunks = list(
+        _emit_tool_deltas(
+            prefix_id,
+            model,
+            tool_calls,
+            final_calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        )
+    )
+    if final_tool_chunks and not started:
+        started = True
+        yield openai_chunk(prefix_id, model, {"role": "assistant"})
+        for pending in pending_queue_chunks:
+            yield pending
+        pending_queue_chunks.clear()
+    for chunk in final_tool_chunks:
+        yield chunk
+
+    final_text_delta = tracker.merge(reasoning_delta, response_delta)
+    if final_text_delta:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
+        completion_bytes += len(final_text_delta.encode("utf-8"))
+        content_count += 1
+        yield openai_chunk(prefix_id, model, {"content": final_text_delta})
+
+    if terminal_event_pending:
+        saw_terminal = True
+    if not saw_terminal and require_terminal:
+        observed_model_event = bool(
+            content_count
+            or tool_calls.has_calls
+            or final_usage is not None
+            or provider_model_name
+            or saw_completed_repeat
+            or (
+                isinstance(upstream_metadata, dict)
+                and upstream_metadata.get("usage_turn_id")
+            )
+        )
+        raise IncompleteUpstreamResponse(
+            "Trae raw upstream ended before its terminal event",
+            retryable=not observed_model_event,
+            usage=final_usage,
+            observed_model_event=observed_model_event,
+        )
     if content_count == 0 and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
-            "Trae upstream repeated only already completed tool calls"
+            "Trae upstream repeated only already completed tool calls",
+            retryable=False,
+            usage=final_usage,
+            observed_model_event=True,
         )
     if fail_on_empty and content_count == 0 and not tool_calls.has_calls:
-        raise EmptyUpstreamResponse("Trae raw upstream returned no text or tool call")
+        observed_model_event = bool(
+            final_usage is not None
+            or provider_model_name
+            or (
+                isinstance(upstream_metadata, dict)
+                and upstream_metadata.get("usage_turn_id")
+            )
+        )
+        raise EmptyUpstreamResponse(
+            "Trae raw upstream returned no text or tool call",
+            retryable=not observed_model_event,
+            usage=final_usage,
+            observed_model_event=observed_model_event,
+        )
 
     required_error = _required_tool_error(tool_choice, tool_calls.has_calls)
     if required_error:
@@ -901,6 +1251,7 @@ async def translate_ide_stream(
         {},
         finish_reason=_finish_reason(final_reason, tool_calls.has_calls),
         usage=usage if forward_usage else None,
+        provider_model_name=provider_model_name,
     )
     yield "data: [DONE]\n\n"
 
@@ -918,6 +1269,43 @@ def _web_finish_summary(data: dict) -> str:
     return ""
 
 
+def _web_message_text(data: dict) -> str:
+    """Extract visible assistant text from remote message/content events."""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("message", "agent_message", "assistant_message"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            data = nested
+            break
+    content = data.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    for key in ("text", "response", "answer", "output"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for block in value:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+            if parts:
+                return "".join(parts)
+    return ""
+
 async def translate_web_events(
     event_iter,
     model: str,
@@ -926,19 +1314,25 @@ async def translate_web_events(
     tool_choice: Any = None,
     parallel_tool_calls: Any = None,
     completed_tool_signatures: Any = None,
+    fail_on_empty: bool = False,
 ):
     prefix_id = make_id()
     order: list[str] = []
     thoughts: dict[str, str] = {}
     streamed_text = ""
+    message_text = ProtocolTextAccumulator()
     usage = None
     error_event = None
     final_summary = ""
     final_reason = "stop"
+    provider_model_name = ""
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
+    started = not fail_on_empty
 
-    yield openai_chunk(prefix_id, model, {"role": "assistant"})
+    if started:
+        yield openai_chunk(prefix_id, model, {"role": "assistant"})
     async for event, data in event_iter:
+        event = _normalize_event_name(event)
         if not isinstance(data, dict):
             data = {}
         # The remote Trae SSE emits explicit ``heartbeat`` events while the
@@ -951,12 +1345,16 @@ async def translate_web_events(
         if event == "error":
             error_event = data
             break
+        reported_provider = _provider_model_name({**data, "event": event})
+        if reported_provider:
+            provider_model_name = reported_provider
+            _check_provider_model(model, reported_provider)
         if event == "token_usage":
             usage = _map_usage(data.get("usage") or data)
             continue
         if event == "plan_item":
             emitted_tool = False
-            for chunk in _emit_tool_deltas(
+            plan_chunks = list(_emit_tool_deltas(
                 prefix_id,
                 model,
                 tool_calls,
@@ -965,7 +1363,11 @@ async def translate_web_events(
                 tool_choice,
                 parallel_tool_calls,
                 completed_tool_signatures,
-            ):
+            ))
+            if plan_chunks and not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for chunk in plan_chunks:
                 emitted_tool = True
                 yield chunk
             if emitted_tool and allowed_tools is not None:
@@ -983,25 +1385,91 @@ async def translate_web_events(
                     thoughts[pid] = thought
                     piece = _cli_text_delta(previous, thought)
                 if piece:
+                    if not started:
+                        started = True
+                        yield openai_chunk(prefix_id, model, {"role": "assistant"})
                     streamed_text += piece
                     yield openai_chunk(prefix_id, model, {"content": piece})
             summary = _web_finish_summary(data)
             if summary:
                 final_summary = summary
+        if event in {"message", "assistant_message", "response", "text", "output"}:
+            text = _web_message_text(data)
+            if text:
+                message_delta, message_calls = message_text.add_snapshot(text)
+                for chunk in _emit_tool_deltas(
+                    prefix_id,
+                    model,
+                    tool_calls,
+                    message_calls,
+                    allowed_tools,
+                    tool_choice,
+                    parallel_tool_calls,
+                    completed_tool_signatures,
+                ):
+                    if not started:
+                        started = True
+                        yield openai_chunk(prefix_id, model, {"role": "assistant"})
+                    yield chunk
+                if message_delta:
+                    if not started:
+                        started = True
+                        yield openai_chunk(prefix_id, model, {"role": "assistant"})
+                    streamed_text += message_delta
+                    yield openai_chunk(prefix_id, model, {"content": message_delta})
         if event == "done":
             final_reason = _payload_finish_reason(data) or final_reason
             break
 
+    if final_summary:
+        summary_calls = _extract_tool_calls({"response": final_summary})
+        if summary_calls:
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for chunk in _emit_tool_deltas(
+                prefix_id,
+                model,
+                tool_calls,
+                summary_calls,
+                allowed_tools,
+                tool_choice,
+                parallel_tool_calls,
+                completed_tool_signatures,
+            ):
+                yield chunk
+        final_summary = _visible_text(final_summary).strip()
     # Do not present a web agent's remote tool result as the external client's
     # tool result. The API client owns execution and the following turn.
     if not tool_calls.has_calls:
         if not streamed_text and final_summary:
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
             yield openai_chunk(prefix_id, model, {"content": final_summary})
         elif final_summary:
             full = "".join(thoughts.get(item, "") for item in order)
             summary = final_summary.rstrip()
             if not full.rstrip().endswith(summary) and not streamed_text.rstrip().endswith(summary):
+                if not started:
+                    started = True
+                    yield openai_chunk(prefix_id, model, {"role": "assistant"})
                 yield openai_chunk(prefix_id, model, {"content": "\n\n" + final_summary})
+
+    if fail_on_empty and not streamed_text and not tool_calls.has_calls:
+        observed_model_event = bool(usage is not None or provider_model_name)
+        message = "Trae remote upstream returned no text or tool call"
+        if error_event:
+            message = (
+                f"Trae remote upstream error: {error_event.get('code', '')}: "
+                f"{error_event.get('message', '')}"
+            )
+        raise EmptyUpstreamResponse(
+            message,
+            retryable=not observed_model_event,
+            usage=usage,
+            observed_model_event=observed_model_event,
+        )
 
     if error_event:
         yield openai_chunk(
@@ -1026,12 +1494,19 @@ async def translate_web_events(
             )
             yield "data: [DONE]\n\n"
             return
+        if not tool_calls.has_calls and not streamed_text:
+            yield openai_chunk(
+                prefix_id,
+                model,
+                {"content": "(trae upstream returned an empty response)"},
+            )
         yield openai_chunk(
             prefix_id,
             model,
             {},
             finish_reason=_finish_reason(final_reason, tool_calls.has_calls),
             usage=usage if forward_usage else None,
+            provider_model_name=provider_model_name,
         )
     yield "data: [DONE]\n\n"
 
@@ -1055,7 +1530,8 @@ async def translate_cli_stream(
 
     yield openai_chunk(prefix_id, model, {"role": "assistant"})
     async for event in event_iter:
-        if event.type == "error":
+        event_type = _normalize_event_name(event.type)
+        if event_type == "error":
             if not saw_output and not tool_calls.has_calls:
                 raise RuntimeError(event.error or "Trae CLI failed")
             yield openai_chunk(
@@ -1067,7 +1543,7 @@ async def translate_cli_stream(
             )
             yield "data: [DONE]\n\n"
             return
-        if event.type == "text":
+        if event_type == "text":
             text_delta, text_calls = text_state.add_delta(event.text or "")
             for chunk in _emit_tool_deltas(
                 prefix_id,
@@ -1085,7 +1561,7 @@ async def translate_cli_stream(
                 saw_output = True
                 yield openai_chunk(prefix_id, model, {"content": text_delta})
             continue
-        if event.type != "json" or not event.data:
+        if event_type != "json" or not event.data:
             continue
         result = event.data
         result_usage = _cli_extract_usage(result)
@@ -1116,6 +1592,23 @@ async def translate_cli_stream(
         # marker: the CLI may emit cumulative snapshots with that field set
         # before the final snapshot.  Keep consuming until the process/stream
         # reaches EOF so later text and tool arguments are not truncated.
+
+    text_delta, text_calls = text_state.finalize()
+    for chunk in _emit_tool_deltas(
+        prefix_id,
+        model,
+        tool_calls,
+        text_calls,
+        allowed_tools,
+        tool_choice,
+        parallel_tool_calls,
+        completed_tool_signatures,
+    ):
+        saw_output = True
+        yield chunk
+    if text_delta:
+        saw_output = True
+        yield openai_chunk(prefix_id, model, {"content": text_delta})
 
     required_error = _required_tool_error(tool_choice, tool_calls.has_calls)
     if required_error:
@@ -1154,9 +1647,10 @@ async def collect_nonstream_cli(
     text_state = ProtocolTextAccumulator()
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
     async for event in event_iter:
-        if event.type == "error":
+        event_type = _normalize_event_name(event.type)
+        if event_type == "error":
             raise RuntimeError(event.error or "Trae CLI failed")
-        if event.type == "text" and event.text:
+        if event_type == "text" and event.text:
             _, text_calls = text_state.add_delta(event.text)
             tool_calls.add(
                 _filter_for_accumulator(
@@ -1168,7 +1662,7 @@ async def collect_nonstream_cli(
                     completed_tool_signatures,
                 )
             )
-        elif event.type == "json" and event.data:
+        elif event_type == "json" and event.data:
             _, text_calls = text_state.add_snapshot(
                 _cli_extract_text(event.data)
             )
@@ -1193,6 +1687,17 @@ async def collect_nonstream_cli(
                 # Do not close/break on a snapshot finish_reason.  The CLI
                 # stream has no uniformly reliable terminal event; EOF is the
                 # authoritative boundary for non-stream collection.
+    _, final_text_calls = text_state.finalize()
+    tool_calls.add(
+        _filter_for_accumulator(
+            tool_calls,
+            final_text_calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        )
+    )
     _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
     content = text_state.visible.strip()
     if not content and not tool_calls.has_calls:
@@ -1221,6 +1726,8 @@ async def collect_nonstream_ide(
     parallel_tool_calls: Any = None,
     fail_on_empty: bool = False,
     completed_tool_signatures: Any = None,
+    require_terminal: bool = True,
+    upstream_metadata: Optional[dict] = None,
 ) -> dict:
     prefix_id = make_id()
     tracker = ThinkingTracker()
@@ -1231,33 +1738,53 @@ async def collect_nonstream_ide(
     usage = None
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
     pending_event = None
+    terminal_event_pending = False
+    saw_terminal = False
     saw_completed_repeat = False
+    provider_model_name = ""
     async for line in _iter_stream_lines(response):
         if line is _STREAM_HEARTBEAT:
             continue
         if not line:
             continue
         line = line.strip()
-        if line.startswith("event:"):
-            pending_event = line[6:].strip()
+        if line.lower().startswith("event:"):
+            pending_event = _normalize_event_name(line[6:].strip())
+            terminal_event_pending = pending_event == "done"
             continue
-        if not line.startswith("data:"):
+        if not line.lower().startswith("data:"):
             continue
         payload = line[5:].strip()
-        if payload == "[DONE]":
+        if payload.upper() == "[DONE]":
+            saw_terminal = True
             break
         try:
             obj = json.loads(payload)
         except Exception:
+            if terminal_event_pending:
+                saw_terminal = True
+                break
             continue
         if not isinstance(obj, dict):
+            if terminal_event_pending:
+                saw_terminal = True
+                break
             continue
-        event_type = obj.get("event") or pending_event
+        event_type = pending_event or _payload_event_name(obj)
         pending_event = None
+        terminal_event_pending = False
+        _capture_upstream_metadata(upstream_metadata, obj)
         if event_type == "error":
             raise RuntimeError(
                 str(obj.get("message") or obj.get("error") or "Trae raw upstream returned an error event")
             )
+        if event_type == "token_usage":
+            usage = _map_usage(obj.get("usage") or obj)
+            continue
+        reported_provider = _provider_model_name({**obj, "event": event_type})
+        if reported_provider:
+            provider_model_name = reported_provider
+            _check_provider_model(model, reported_provider)
         reasoning = obj.get("reasoning_content") or ""
         raw_response = obj.get("response") or ""
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
@@ -1283,20 +1810,72 @@ async def collect_nonstream_ide(
             finish_reason = str(obj.get("finish_reason"))
         if obj.get("usage"):
             usage = _map_usage(obj.get("usage"))
-        # See translate_ide_stream: finish_reason can be carried by an
-        # intermediate cumulative snapshot, so only explicit done/stop_reason
+        # See translate_ide_stream: finish_reason/stop_reason can be carried by
+        # an intermediate cumulative snapshot, so only an explicit done event
         # ends this response.  [DONE] is handled above.
-        if event_type == "done" or obj.get("stop_reason"):
-            finish_reason = str(
-                obj.get("finish_reason") or obj.get("stop_reason") or finish_reason
-            )
+        if event_type == "done":
+            saw_terminal = True
+            finish_reason = _payload_finish_reason(obj) or finish_reason
             break
+    reasoning_delta, reasoning_calls = reasoning_text.finalize()
+    response_delta, response_calls = response_text.finalize()
+    final_calls = reasoning_calls + response_calls
+    if _contains_completed_tool_repeat(final_calls, completed_tool_signatures):
+        saw_completed_repeat = True
+    tool_calls.add(
+        _filter_for_accumulator(
+            tool_calls,
+            final_calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        )
+    )
+    if reasoning_delta or response_delta:
+        full += tracker.merge(reasoning_delta, response_delta)
+    if terminal_event_pending:
+        saw_terminal = True
+    if not saw_terminal and require_terminal:
+        observed_model_event = bool(
+            full
+            or tool_calls.has_calls
+            or usage is not None
+            or provider_model_name
+            or saw_completed_repeat
+            or (
+                isinstance(upstream_metadata, dict)
+                and upstream_metadata.get("usage_turn_id")
+            )
+        )
+        raise IncompleteUpstreamResponse(
+            "Trae raw upstream ended before its terminal event",
+            retryable=not observed_model_event,
+            usage=usage,
+            observed_model_event=observed_model_event,
+        )
     if not full and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
-            "Trae upstream repeated only already completed tool calls"
+            "Trae upstream repeated only already completed tool calls",
+            retryable=False,
+            usage=usage,
+            observed_model_event=True,
         )
     if fail_on_empty and not full and not tool_calls.has_calls:
-        raise EmptyUpstreamResponse("Trae raw upstream returned no text or tool call")
+        observed_model_event = bool(
+            usage is not None
+            or provider_model_name
+            or (
+                isinstance(upstream_metadata, dict)
+                and upstream_metadata.get("usage_turn_id")
+            )
+        )
+        raise EmptyUpstreamResponse(
+            "Trae raw upstream returned no text or tool call",
+            retryable=not observed_model_event,
+            usage=usage,
+            observed_model_event=observed_model_event,
+        )
     _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
     if not full and not tool_calls.has_calls:
         full = "(trae upstream returned an empty response)"
@@ -1313,6 +1892,7 @@ async def collect_nonstream_ide(
         _finish_reason(finish_reason, tool_calls.has_calls),
         usage,
         tool_calls.calls(),
+        provider_model_name=provider_model_name,
     )
 
 
@@ -1323,16 +1903,20 @@ async def collect_nonstream_web(
     tool_choice: Any = None,
     parallel_tool_calls: Any = None,
     completed_tool_signatures: Any = None,
+    fail_on_empty: bool = False,
 ) -> dict:
     prefix_id = make_id()
     order: list[str] = []
     thoughts: dict[str, str] = {}
+    message_text = ProtocolTextAccumulator()
     usage = None
     error_event = None
     final_summary = ""
     final_reason = "stop"
+    provider_model_name = ""
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
     async for event, data in event_iter:
+        event = _normalize_event_name(event)
         if not isinstance(data, dict):
             data = {}
         if event in {"heartbeat", "keepalive", "ping"}:
@@ -1343,6 +1927,10 @@ async def collect_nonstream_web(
         if event == "error":
             error_event = data
             break
+        reported_provider = _provider_model_name({**data, "event": event})
+        if reported_provider:
+            provider_model_name = reported_provider
+            _check_provider_model(model, reported_provider)
         if event == "token_usage":
             usage = _map_usage(data.get("usage") or data)
             continue
@@ -1370,6 +1958,21 @@ async def collect_nonstream_web(
             summary = _web_finish_summary(data)
             if summary:
                 final_summary = summary
+        if event in {"message", "assistant_message", "response", "text", "output"}:
+            text = _web_message_text(data)
+            if text:
+                _, message_calls = message_text.add_snapshot(text)
+                filtered_calls = _filter_for_accumulator(
+                    tool_calls,
+                    message_calls,
+                    allowed_tools,
+                    tool_choice,
+                    parallel_tool_calls,
+                    completed_tool_signatures,
+                )
+                tool_calls.add(filtered_calls)
+                if filtered_calls and allowed_tools is not None:
+                    break
         if event == "done":
             final_reason = _payload_finish_reason(data) or final_reason
             break
@@ -1377,11 +1980,43 @@ async def collect_nonstream_web(
         raise RuntimeError(f"trae {error_event.get('code','')}: {error_event.get('message','')}")
     _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
     content = "".join(thoughts.get(item, "") for item in order)
+    message_content = message_text.visible.strip()
+    if message_content:
+        if not content:
+            content = message_content
+        elif not content.rstrip().endswith(message_content.rstrip()):
+            content = content.rstrip() + "\n\n" + message_content
+    if final_summary:
+        summary_calls = _extract_tool_calls({"response": final_summary})
+        summary_calls = _filter_for_accumulator(
+            tool_calls,
+            summary_calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        )
+        tool_calls.add(summary_calls)
+        final_summary = _visible_text(final_summary).strip()
     if not tool_calls.has_calls:
         if not content:
             content = final_summary
         elif final_summary and not content.rstrip().endswith(final_summary.rstrip()):
             content = content.rstrip() + "\n\n" + final_summary
+    if fail_on_empty and not content and not tool_calls.has_calls:
+        observed_model_event = bool(usage is not None or provider_model_name)
+        message = "Trae remote upstream returned no text or tool call"
+        if error_event:
+            message = (
+                f"Trae remote upstream error: {error_event.get('code', '')}: "
+                f"{error_event.get('message', '')}"
+            )
+        raise EmptyUpstreamResponse(
+            message,
+            retryable=not observed_model_event,
+            usage=usage,
+            observed_model_event=observed_model_event,
+        )
     if not content and not tool_calls.has_calls:
         content = "(trae upstream returned an empty response)"
     if usage is None:
@@ -1397,4 +2032,5 @@ async def collect_nonstream_web(
         _finish_reason(final_reason, tool_calls.has_calls),
         usage,
         tool_calls.calls(),
+        provider_model_name=provider_model_name,
     )

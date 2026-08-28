@@ -551,6 +551,18 @@ _KIMI_TOOL_PARAMETER_RE = re.compile(
     r"<parameter(?:\s+[^>]*)?>\s*(?P<body>[\s\S]*?)\s*</parameter>",
     flags=re.IGNORECASE,
 )
+
+# Some context-compaction paths escape the internal tool protocol one or more
+# times before replaying it as assistant text. A projection that ignores those
+# escapes and whitespace also covers CR/LF insertion and cross-block splits.
+_INTERNAL_WAIT_CANONICAL_RE = re.compile(
+    r"(?:<tool_call><[0-9a-f]{8,64}>wait</tool_call>"
+    r"(?:<[0-9a-f]{8,64}>)?)+",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_WAIT_OPEN = "<tool_call>"
+_INTERNAL_WAIT_CLOSE = "</tool_call>"
+_INTERNAL_WAIT_HEX = frozenset("0123456789abcdef")
 _HISTORY_TOOL_MARKER_RE = re.compile(
     r"Previous client tool request\(s\):\s*",
     flags=re.IGNORECASE,
@@ -569,6 +581,254 @@ _CLIENT_TOOL_HISTORY_CALL_LINE_RE = re.compile(
     flags=re.IGNORECASE | re.MULTILINE,
 )
 _TOOL_USE_TAG_RE = re.compile(r"<(?P<tag>[A-Za-z_][A-Za-z0-9_-]*)>\s*([\s\S]*?)\s*</(?P=tag)>", re.IGNORECASE)
+
+
+def _project_internal_protocol(text: str) -> tuple[str, list[int]]:
+    """Return protocol-significant text plus its indexes in the source."""
+
+    projected: list[str] = []
+    source_indexes: list[int] = []
+    for index, char in enumerate(text):
+        if char == "\\" or char.isspace():
+            continue
+        projected.append(char.casefold())
+        source_indexes.append(index)
+    return "".join(projected), source_indexes
+
+
+def _consume_internal_literal(
+    value: str, position: int, literal: str
+) -> tuple[int, str]:
+    remaining = value[position:]
+    if len(remaining) < len(literal):
+        if literal.startswith(remaining):
+            return len(value), "partial"
+        return position, "invalid"
+    if value.startswith(literal, position):
+        return position + len(literal), "complete"
+    return position, "invalid"
+
+
+def _consume_internal_sentinel(value: str, position: int) -> tuple[int, str]:
+    if position >= len(value):
+        return position, "partial"
+    if value[position] != "<":
+        return position, "invalid"
+    position += 1
+    digits = 0
+    while (
+        position < len(value)
+        and value[position] in _INTERNAL_WAIT_HEX
+        and digits < 64
+    ):
+        position += 1
+        digits += 1
+    if position >= len(value):
+        return position, "partial"
+    if digits < 8 or value[position] != ">":
+        return position, "invalid"
+    return position + 1, "complete"
+
+
+def _internal_wait_prefix_status(value: str) -> str:
+    """Classify a projected suffix as an internal wait frame or its prefix."""
+
+    position = 0
+    while True:
+        position, status = _consume_internal_literal(
+            value, position, _INTERNAL_WAIT_OPEN
+        )
+        if status != "complete":
+            return status
+        position, status = _consume_internal_sentinel(value, position)
+        if status != "complete":
+            return status
+        position, status = _consume_internal_literal(value, position, "wait")
+        if status != "complete":
+            return status
+        position, status = _consume_internal_literal(
+            value, position, _INTERNAL_WAIT_CLOSE
+        )
+        if status != "complete":
+            return status
+        if position == len(value):
+            return "complete"
+
+        # The opaque trailing sentinel is optional. A following ``<t...`` is
+        # the next frame; a following ``<hex...`` is the trailing sentinel.
+        if value[position] != "<":
+            return "invalid"
+        if position + 1 == len(value):
+            return "partial"
+        if value[position + 1] in _INTERNAL_WAIT_HEX:
+            position, status = _consume_internal_sentinel(value, position)
+            if status != "complete":
+                return status
+            if position == len(value):
+                return "complete"
+
+
+def _internal_wait_residue_spans(text: str) -> list[tuple[int, int]]:
+    """Locate complete frames and a trailing truncated frame in source text."""
+
+    projected, source_indexes = _project_internal_protocol(text)
+    if not projected:
+        return []
+
+    spans: list[tuple[int, int]] = []
+
+    def source_start(projected_index: int) -> int:
+        start = source_indexes[projected_index]
+        while start > 0 and text[start - 1] == "\\":
+            start -= 1
+        return start
+
+    for match in _INTERNAL_WAIT_CANONICAL_RE.finditer(projected):
+        end = source_indexes[match.end() - 1] + 1
+        if match.end() == len(projected):
+            # A stream chunk can stop in the escape run immediately before an
+            # optional trailing sentinel. Keep that tail with the frame until
+            # the next chunk proves whether a sentinel follows.
+            end = len(text)
+        spans.append(
+            (
+                source_start(match.start()),
+                end,
+            )
+        )
+
+    # Hold/remove a frame cut at EOF. This is also what prevents the first
+    # half of a split streaming frame from becoming an irreversible delta.
+    candidate_indexes: list[int] = []
+    full_open = projected.rfind(_INTERNAL_WAIT_OPEN)
+    if full_open >= 0:
+        candidate_indexes.append(full_open)
+    for length in range(len(_INTERNAL_WAIT_OPEN) - 1, 0, -1):
+        if projected.endswith(_INTERNAL_WAIT_OPEN[:length]):
+            candidate_indexes.append(len(projected) - length)
+            break
+    for index in candidate_indexes:
+        if _internal_wait_prefix_status(projected[index:]) == "partial":
+            spans.append((source_start(index), len(text)))
+            break
+
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _remove_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(text[cursor:start])
+        cursor = max(cursor, end)
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _strip_internal_wait_residue(text: str) -> str:
+    """Remove complete or truncated escaped internal wait frames."""
+
+    return _remove_text_spans(text, _internal_wait_residue_spans(text))
+
+
+_ASSISTANT_TEXT_KEYS = ("content", "text", "value", "parts")
+
+
+def _collect_assistant_text_leaves(content: Any, leaves: list[str]) -> None:
+    if isinstance(content, str):
+        leaves.append(content)
+    elif isinstance(content, (list, tuple)):
+        for item in content:
+            _collect_assistant_text_leaves(item, leaves)
+    elif isinstance(content, Mapping):
+        for key in _ASSISTANT_TEXT_KEYS:
+            if key in content:
+                _collect_assistant_text_leaves(content[key], leaves)
+
+
+def _replace_assistant_text_leaves(content: Any, replacements) -> Any:
+    if isinstance(content, str):
+        return next(replacements)
+    if isinstance(content, list):
+        return [
+            _replace_assistant_text_leaves(item, replacements) for item in content
+        ]
+    if isinstance(content, tuple):
+        return tuple(
+            _replace_assistant_text_leaves(item, replacements) for item in content
+        )
+    if isinstance(content, Mapping):
+        cleaned = dict(content)
+        for key in _ASSISTANT_TEXT_KEYS:
+            if key in cleaned:
+                cleaned[key] = _replace_assistant_text_leaves(
+                    cleaned[key], replacements
+                )
+        return cleaned
+    return content
+
+
+def sanitize_assistant_history_content(content: Any) -> Any:
+    """Remove internal wait frames while preserving the caller's content shape."""
+
+    leaves: list[str] = []
+    _collect_assistant_text_leaves(content, leaves)
+    if not leaves:
+        return content
+
+    combined = "".join(leaves)
+    spans = _internal_wait_residue_spans(combined)
+    if not spans:
+        return content
+
+    replacements: list[str] = []
+    offset = 0
+    for leaf in leaves:
+        leaf_end = offset + len(leaf)
+        local_spans = [
+            (max(start, offset) - offset, min(end, leaf_end) - offset)
+            for start, end in spans
+            if start < leaf_end and end > offset
+        ]
+        replacements.append(_remove_text_spans(leaf, local_spans))
+        offset = leaf_end
+    return _replace_assistant_text_leaves(content, iter(replacements))
+
+
+def sanitize_assistant_history_text(content: Any) -> str:
+    """Return assistant text with context-compaction wait residue removed."""
+
+    return _content_to_text(sanitize_assistant_history_content(content))
+
+
+def sanitize_assistant_history_messages(messages: Any) -> list[Any]:
+    """Sanitize assistant text fields without changing user or tool messages."""
+
+    if not isinstance(messages, list):
+        return []
+    cleaned_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            cleaned_messages.append(message)
+            continue
+        cleaned = dict(message)
+        for key in ("content", "parts", "text", "prompt", "message", "input"):
+            if key in cleaned:
+                cleaned[key] = sanitize_assistant_history_content(cleaned[key])
+        cleaned_messages.append(cleaned)
+    return cleaned_messages
 
 # The raw/CLI upstream sometimes echoes the history envelope that the relay
 # put in its prompt.  It is not user-visible assistant text.  In practice the
@@ -1160,7 +1420,7 @@ def _parse_text_tool_body(body: str, fallback_name: str = "", index: int = 0) ->
 
 def extract_text_tool_calls(content: Any) -> list[dict]:
     """Extract tool calls encoded in Trae's text/XML fallback formats."""
-    text = _content_to_text(content)
+    text = _strip_internal_wait_residue(_content_to_text(content))
     if not text:
         return []
     calls: list[dict] = []
@@ -1297,6 +1557,7 @@ def strip_tool_call_blocks(content: Any) -> str:
     text = _content_to_text(content)
     if not text:
         return ""
+    text = _strip_internal_wait_residue(text)
     text = _TEXT_TOOL_BLOCK_RE.sub("", text)
     text = _NAMED_TOOL_BLOCK_RE.sub("", text)
     text = _KIMI_TOOL_PARAMETER_RE.sub("", text)
@@ -1481,9 +1742,11 @@ def extract_usage(result: dict) -> Optional[dict]:
                 return max(0, value)
         return None
 
-    prompt = num("input_tokens", "inputTokens", "prompt_tokens")
-    completion = num("output_tokens", "outputTokens", "completion_tokens")
-    total = num("total_tokens", "totalTokens")
+    prompt = num("input_tokens", "input_token", "inputTokens", "prompt_tokens")
+    completion = num(
+        "output_tokens", "output_token", "outputTokens", "completion_tokens"
+    )
+    total = num("total_tokens", "total_token", "totalTokens")
     if not total:
         total = prompt + completion
     mapped = {
@@ -1496,6 +1759,7 @@ def extract_usage(result: dict) -> Optional[dict]:
         "consumed_credits",
         "credit_cost",
         "credits_cost",
+        "credits_float",
     )
     if credits is not None:
         mapped["credits_consumed"] = credits

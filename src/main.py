@@ -12,6 +12,7 @@ main.py - Trae CN Relay 中转站
   UPSTREAM_MODE=remote/9router - 只用 9router 风格 remote 会话
   UPSTREAM_MODE=web  - 只用旧版 CN remote 会话（兼容保留）
   UPSTREAM_MODE=ide  - 只用 trae2api 风格 /api/ide/v1/chat
+  UPSTREAM_MODE=traework-native - Windows helper 承载 TraeWork ai-agent.dll
 """
 
 import asyncio
@@ -33,7 +34,7 @@ import zlib
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -44,10 +45,19 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.responses import FileResponse
 
-from . import auth, cli_client, raw_client, responses_api, trae_client, trae_remote_client
+from . import (
+    auth,
+    cli_client,
+    raw_client,
+    responses_api,
+    trae_client,
+    trae_remote_client,
+    traework_native_bridge,
+)
 from .model_limits import clamp_max_completion_tokens
 from .sse import (
     EmptyUpstreamResponse,
+    ModelProviderMismatch,
     RepeatedCompletedToolResponse,
     collect_nonstream_cli,
     collect_nonstream_ide,
@@ -65,7 +75,8 @@ logger = logging.getLogger("trae-cn-relay")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 API_KEYS = [k.strip() for k in os.environ.get("RELAY_API_KEYS", "").split(",") if k.strip()]
-UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "raw") or "raw").lower()
+UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "remote") or "remote").lower()
+
 FORWARD_USAGE = (os.environ.get("FORWARD_USAGE", "true") or "true").lower() == "true"
 CHECKIN_INTERVAL = float(os.environ.get("TRAE_CHECKIN_INTERVAL_SECONDS", "60") or "60")
 CHECKIN_RETRY_AFTER = float(
@@ -96,6 +107,52 @@ CHAT_OPTION_FIELDS = (
     "user",
     "logprobs",
     "top_logprobs",
+    # TraeWork model-selection aliases passed through to the raw transport.
+    # Raw session ids are intentionally not caller-overridable: the relay pins
+    # one upstream conversation to each account/model pair.
+    "traeRawConfigName",
+    "traeRawModelName",
+    "rawModelName",
+    "configName",
+    "displayName",
+    "modelName",
+    "provider",
+    "configSource",
+    # TraeWork native Ode/Gpt payload aliases. These are ignored by raw/remote
+    # transports and are consumed only by the opt-in Windows helper route.
+    "native_data",
+    "native_user_info",
+    "native_common_params",
+    "native_streamlined_common_params",
+    "native_client_info",
+    "connect_session_id",
+    "connectSessionId",
+    "native_session_id",
+    "native_channel_id",
+    "channel_id",
+    "workspace_folder",
+    "workspacePath",
+    "workspace_id",
+    "workspaceId",
+    "device_id",
+    "deviceId",
+    "agent_type",
+    "shell_execute_strategy",
+    "model_auto_selection",
+    "custom_model",
+    "model_config_source",
+    "modelConfigSource",
+    "model_is_preset",
+    "modelIsPreset",
+    "model_provider",
+    "modelProvider",
+    "ppe_env_name",
+    "ppeEnvName",
+    "envLane",
+    "agentEnv",
+    "forceSandboxType",
+    "version_code",
+    "versionCode",
 )
 
 # Per-request usage tracking. Records are stored separately from account data so
@@ -149,6 +206,7 @@ class _UpstreamSessionLease:
     auth_token: str
     last_client_activity: float
     active_streams: int = 0
+    provider_specific: dict[str, Any] = field(default_factory=dict)
 
 
 _UPSTREAM_SESSION_LEASES: OrderedDict[str, _UpstreamSessionLease] = OrderedDict()
@@ -160,6 +218,15 @@ def _credit_settle_seconds() -> float:
     except (TypeError, ValueError):
         value = 1.0
     return max(0.0, min(value, 10.0))
+
+
+def _session_usage_enabled() -> bool:
+    return str(os.environ.get("TRAE_USAGE_SESSION_QUERY", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 # Web login auth
 TRAE_AUTH_URL = os.environ.get("TRAE_AUTH_URL", "https://www.trae.cn/authorization")
@@ -1449,7 +1516,7 @@ def _stream_error_event(response) -> str:
     return "data: " + json.dumps({"error": error}, ensure_ascii=False) + "\n\n"
 
 
-def _stream_start_event() -> str:
+def _stream_start_event(model: str) -> str:
     """Send a parseable SSE frame while the first Trae frame is pending.
 
     A comment-only keepalive is legal SSE, but a few terminal clients treat it
@@ -1464,8 +1531,14 @@ def _stream_start_event() -> str:
                 "id": "",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": "",
-                "choices": [],
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }
+                ],
             },
             ensure_ascii=False,
         )
@@ -1505,7 +1578,7 @@ async def _deferred_dispatch_stream(
         # data frame before comment heartbeats so zcode/OpenCode does not treat
         # the stream as an empty cached response and cancel the task.
         if not task.done():
-            yield _stream_start_event()
+            yield _stream_start_event(model)
             sent_start_event = True
         interval = _stream_heartbeat_seconds()
         while True:
@@ -1546,20 +1619,31 @@ async def _deferred_dispatch_stream(
                 # heartbeat. Put one parseable OpenAI start event before that
                 # first comment so zcode does not classify the stream as empty.
                 if not sent_start_event and chunk.lstrip().startswith(":"):
-                    yield _stream_start_event()
+                    yield _stream_start_event(model)
                     sent_start_event = True
                 yield chunk
         stream_status = "completed"
     except asyncio.CancelledError:
-        stream_status = "client_cancelled"
-        logger.warning(
-            "public stream cancelled id=%s upstream_ready=%s task_done=%s chunks=%d elapsed_ms=%d",
-            request_id,
-            response is not None,
-            task.done(),
-            upstream_chunks,
-            int((time.monotonic() - started_at) * 1000),
-        )
+        if saw_done:
+            # The upstream already emitted [DONE]; a client disconnecting
+            # during final teardown is not an aborted model turn.
+            stream_status = "completed"
+            logger.info(
+                "public stream cancelled after done id=%s chunks=%d elapsed_ms=%d",
+                request_id,
+                upstream_chunks,
+                int((time.monotonic() - started_at) * 1000),
+            )
+        else:
+            stream_status = "client_cancelled"
+            logger.warning(
+                "public stream cancelled id=%s upstream_ready=%s task_done=%s chunks=%d elapsed_ms=%d",
+                request_id,
+                response is not None,
+                task.done(),
+                upstream_chunks,
+                int((time.monotonic() - started_at) * 1000),
+            )
         if not task.done():
             task.cancel()
         raise
@@ -1816,6 +1900,30 @@ def _capture_chat_session_auth(session_id: str, token: str) -> None:
     _touch_chat_session(session_id)
 
 
+def _rebind_chat_session_account(
+    session_id: str,
+    account_id: str,
+    billing_id: str,
+    token: str,
+    provider_specific: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Keep the relay session lease aligned with a retry account."""
+
+    if not session_id:
+        return
+    with _CHAT_SESSION_LOCK:
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is None:
+            return
+        lease.account_id = str(account_id or lease.account_id)
+        lease.billing_id = str(billing_id or lease.billing_id or lease.account_id)
+        lease.auth_token = str(token or lease.auth_token)
+        if provider_specific is not None:
+            lease.provider_specific = dict(provider_specific)
+        lease.last_client_activity = time.monotonic()
+        _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
+
+
 def _begin_chat_stream(session_id: str) -> None:
     if not session_id:
         return
@@ -1942,6 +2050,11 @@ def _bind_chat_session(
                 billing_id=billing_id,
                 auth_token=token,
                 last_client_activity=now,
+                provider_specific=dict(
+                    record.get("provider_specific")
+                    or record.get("providerSpecificData")
+                    or {}
+                ),
             )
             _UPSTREAM_SESSION_LEASES[session_id] = lease
         else:
@@ -1963,6 +2076,12 @@ def _bind_chat_session(
         bound["_billing_id"] = lease.billing_id
     if lease.auth_token:
         bound["_auth_token"] = lease.auth_token
+    if UPSTREAM_MODE != "cli":
+        # Keep account metadata pinned with the credential. The global auth
+        # state may switch before the remote request has built its headers.
+        # An explicit empty mapping prevents fallback to another account's
+        # mutable global metadata.
+        bound["provider_specific"] = dict(lease.provider_specific)
     return bound
 
 
@@ -1976,6 +2095,7 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
             return _openai_error(
                 400, "tools must be an array", "invalid_request_error", "tools"
             )
+        normalized_tools = []
         for index, tool in enumerate(tools):
             param = f"tools.{index}"
             if not isinstance(tool, dict) or tool.get("type") != "function":
@@ -1987,12 +2107,13 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
                 )
             function = tool.get("function")
             if not isinstance(function, dict):
-                return _openai_error(
-                    400,
-                    f"{param}.function must be an object",
-                    "invalid_request_error",
-                    f"{param}.function",
-                )
+                # Accept the compact Responses-style flat tool shape and
+                # normalize it to the Chat-completions nested function shape.
+                function = {
+                    key: tool.get(key)
+                    for key in ("name", "description", "parameters", "strict")
+                    if key in tool
+                }
             name = function.get("name")
             if not isinstance(name, str) or not name.strip():
                 return _openai_error(
@@ -2017,6 +2138,9 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
                     f"{param}.function.parameters",
                 )
             tool_names.add(name)
+            normalized_tools.append({"type": "function", "function": dict(function)})
+        if normalized_tools:
+            options["tools"] = normalized_tools
 
     if "tool_choice" in options:
         tool_choice = options["tool_choice"]
@@ -2037,6 +2161,9 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
                 )
         elif isinstance(tool_choice, dict):
             function = tool_choice.get("function")
+            if not isinstance(function, dict):
+                # Accept the compact Responses-style flat tool_choice shape too.
+                function = tool_choice
             name = function.get("name") if isinstance(function, dict) else None
             if tool_choice.get("type") != "function" or not isinstance(name, str):
                 return _openai_error(
@@ -2052,6 +2179,7 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
                     "invalid_request_error",
                     "tool_choice",
                 )
+            options["tool_choice"] = {"type": "function", "function": {"name": name}}
         else:
             return _openai_error(
                 400,
@@ -2154,11 +2282,17 @@ def _usage_values(usage: Any) -> dict[str, Any]:
             "total_tokens": 0,
             "credits_consumed": None,
         }
-    prompt = _first_number(usage, "prompt_tokens", "input_tokens", "inputTokens") or 0
-    completion = _first_number(
-        usage, "completion_tokens", "output_tokens", "outputTokens"
+    prompt = _first_number(
+        usage, "prompt_tokens", "input_tokens", "input_token", "inputTokens"
     ) or 0
-    total = _first_number(usage, "total_tokens", "totalTokens")
+    completion = _first_number(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+        "output_token",
+        "outputTokens",
+    ) or 0
+    total = _first_number(usage, "total_tokens", "total_token", "totalTokens")
     if total is None:
         total = prompt + completion
     credits = _first_number(
@@ -2167,6 +2301,7 @@ def _usage_values(usage: Any) -> dict[str, Any]:
         "consumed_credits",
         "credit_cost",
         "credits_cost",
+        "credits_float",
     )
     billing = usage.get("billing") or usage.get("cost")
     if credits is None and isinstance(billing, Mapping):
@@ -2176,6 +2311,7 @@ def _usage_values(usage: Any) -> dict[str, Any]:
             "consumed_credits",
             "credit_cost",
             "credits_cost",
+            "credits_float",
         )
     return {
         "prompt_tokens": int(prompt),
@@ -2329,19 +2465,43 @@ async def _enrich_usage_credits(
     account_id: str,
     token: str,
     before_task: asyncio.Task | None,
+    *,
+    usage_turn_id: str = "",
+    credit_safe: bool = True,
 ) -> None:
     try:
+        settle = _credit_settle_seconds()
+        if settle:
+            await asyncio.sleep(settle)
+        if usage_turn_id and _session_usage_enabled():
+            try:
+                session_usage = await trae_client.fetch_session_usage(
+                    usage_turn_id,
+                    token,
+                )
+                credits = _number_value(session_usage.get("credits_consumed"))
+                if credits is not None and credits >= 0:
+                    await _cancel_usage_task(
+                        before_task,
+                        _USAGE_SNAPSHOT_TASKS,
+                    )
+                    before_task = None
+                    _update_usage_record(
+                        request_id,
+                        credits_consumed=_credit_round(credits),
+                        credits_source="session_usage",
+                    )
+                    return
+            except Exception as exc:
+                logger.debug("session usage enrichment unavailable: %s", exc)
+        if not credit_safe or not _credit_snapshot_is_safe(account_id):
+            return
         before = None
         if before_task is not None:
             try:
                 before = await before_task
             except Exception:
                 before = None
-        settle = _credit_settle_seconds()
-        if settle:
-            await asyncio.sleep(settle)
-        if not _credit_snapshot_is_safe(account_id):
-            return
         after = await _fetch_used_credits(token)
         if before is None or after is None or after < before:
             return
@@ -2353,6 +2513,7 @@ async def _enrich_usage_credits(
             credits_after=_credit_round(after),
         )
     finally:
+        await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
         _end_credit_snapshot(account_id)
 
 
@@ -2398,9 +2559,13 @@ class _UsageTracker:
         self.stream = bool(stream)
         self.started = time.perf_counter()
         self.usage = _usage_values({})
+        self.usage_turn_id = ""
         self.saw_usage = False
         self.status = "in_progress"
         self._finished = False
+        self._credit_snapshot_started = bool(
+            self.account_id and self.account_id != "default" and self.token
+        )
         self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
         self._before_task = (
             _spawn_usage_task(
@@ -2415,11 +2580,71 @@ class _UsageTracker:
         self.saw_usage = True
         values = _usage_values(usage)
         # Upstream streams may send cumulative usage more than once. Keep the
-        # latest complete snapshot instead of creating duplicate records.
+        # latest complete token snapshot instead of creating duplicate records.
+        # A later token-only frame must not erase explicit credit evidence
+        # reported by an earlier frame.
         if values["total_tokens"] >= self.usage["total_tokens"]:
+            explicit_credits = self.usage.get("credits_consumed")
             self.usage.update(values)
+            if (
+                values.get("credits_consumed") is None
+                and explicit_credits is not None
+            ):
+                self.usage["credits_consumed"] = explicit_credits
         elif values.get("credits_consumed") is not None:
             self.usage["credits_consumed"] = values["credits_consumed"]
+
+    def bind_usage_turn(self, usage_turn_id: Any) -> None:
+        value = str(usage_turn_id or "").strip()
+        if value and not self.usage_turn_id:
+            self.usage_turn_id = value
+
+    async def rebind(self, options: Optional[Mapping[str, Any]] = None) -> None:
+        """Move billing/credit tracking to the account used by a retry.
+
+        Remote account rotation can happen after the tracker has started its
+        before-credit snapshot.  Cancel that snapshot and restart it for the
+        new JWT so the eventual usage row and credit delta follow the account
+        that actually handled the request.
+        """
+        options = options or {}
+        token = str(options.get("_auth_token") or "").strip()
+        account_id = str(options.get("_account_id") or "").strip()
+        billing_id = str(options.get("_billing_id") or "").strip()
+        token_identity = _account_id_from_token(token)
+        if token_identity:
+            billing_id = token_identity
+            account_id = token_identity
+        elif billing_id:
+            account_id = billing_id
+        if not account_id and token:
+            account_id = str(auth.get_active_account_id() or "default")
+        if not token and account_id:
+            token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+        if not account_id and not token:
+            return
+        if account_id == self.account_id and token == self.token:
+            return
+
+        old_account = self.account_id
+        await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+        self._before_task = None
+        if self._credit_snapshot_started:
+            _end_credit_snapshot(old_account)
+
+        self.account_id = account_id or self.account_id
+        self.billing_id = billing_id or self.account_id
+        self.token = token or self.token
+        self.usage_turn_id = ""
+        self._credit_snapshot_started = bool(
+            self.account_id and self.account_id != "default" and self.token
+        )
+        self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
+        if self._credit_safe:
+            self._before_task = _spawn_usage_task(
+                _fetch_used_credits(self.token),
+                _USAGE_SNAPSHOT_TASKS,
+            )
 
     async def finish(self, status: str | None = None) -> None:
         if self._finished:
@@ -2443,21 +2668,31 @@ class _UsageTracker:
             duration_ms=round((time.perf_counter() - self.started) * 1000, 1),
             tokens_source="upstream" if self.saw_usage else "unknown",
         )
-        if explicit_credits is not None or not self._credit_safe:
+        if explicit_credits is not None:
             try:
                 await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
             finally:
                 self._before_task = None
-                _end_credit_snapshot(self.account_id)
-        else:
+                if self._credit_snapshot_started:
+                    _end_credit_snapshot(self.account_id)
+        elif self.usage_turn_id or self._credit_safe:
             _spawn_usage_task(
                 _enrich_usage_credits(
                     self.request_id,
                     self.account_id,
                     self.token,
                     self._before_task,
+                    usage_turn_id=self.usage_turn_id,
+                    credit_safe=self._credit_safe,
                 )
             )
+        else:
+            try:
+                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+            finally:
+                self._before_task = None
+                if self._credit_snapshot_started:
+                    _end_credit_snapshot(self.account_id)
 
     async def begin(self) -> None:
         if self._before_task is not None:
@@ -2512,15 +2747,156 @@ def _track_usage_from_chunk(chunk: str, model: str) -> None:
     )
 
 
+def _bind_usage_turn(usage_turn_id: Any) -> None:
+    tracker = _USAGE_TRACKER.get()
+    if tracker is not None:
+        tracker.bind_usage_turn(usage_turn_id)
+
+
+def _bind_usage_turn_from_metadata(metadata: Any) -> None:
+    if isinstance(metadata, Mapping):
+        _bind_usage_turn(metadata.get("usage_turn_id"))
+
+
+def _remote_only_models() -> set[str]:
+    """Return explicit overrides for remote manual selection."""
+    raw = os.environ.get("TRAE_REMOTE_ONLY_MODELS", "")
+    configured: set[str] = set()
+    for item in raw.split(","):
+        value = item.strip().lower()
+        if value.startswith("trae/"):
+            value = value[5:]
+        if value:
+            configured.add(value)
+    return configured
+
+
+def _raw_history_limit_int(
+    options: Mapping[str, Any],
+    names: tuple[str, ...],
+    env_name: str,
+    default: int,
+) -> int:
+    value = None
+    for name in names:
+        value = options.get(name)
+        if value is not None:
+            break
+    if value is None:
+        value = os.environ.get(env_name, str(default))
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_remote_query(
+    messages: list[Mapping[str, Any]],
+    options: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Truncate oldest non-system messages so the flattened query fits upstream.
+
+    Trae's remote session silently ends the event stream (no text, no ``done``)
+    when initial_message.query exceeds roughly 500k chars.  Keep the system
+    prompt and the newest turns intact and drop the oldest conversation from
+    the front until ``flatten_query`` is under the configured cap.
+    """
+
+    raw_limit = _raw_history_limit_int(
+        options,
+        ("trae_remote_query_max_chars", "traeRemoteQueryMaxChars"),
+        "TRAE_REMOTE_QUERY_MAX_CHARS",
+        480_000,
+    )
+    if raw_limit <= 0:
+        return [dict(m) for m in messages], 0
+    bounded = [dict(m) for m in messages]
+    removed = 0
+    while True:
+        query = trae_client.flatten_query(bounded)
+        if len(query) <= raw_limit:
+            return bounded, removed
+        non_system = [
+            index
+            for index, message in enumerate(bounded)
+            if str(message.get("role") or "user") not in {"system", "developer"}
+        ]
+        if len(non_system) <= 1:
+            return bounded, removed
+        head = non_system[0]
+        drop = {head}
+        head_message = bounded[head]
+        if str(head_message.get("role") or "") == "assistant" and (
+            head_message.get("tool_calls") or head_message.get("function_call")
+        ):
+            if head + 1 < len(bounded):
+                following = bounded[head + 1]
+                if str(following.get("role") or "") == "tool":
+                    drop.add(head + 1)
+        bounded = [m for index, m in enumerate(bounded) if index not in drop]
+        removed += len(drop)
+
+
+def _requires_remote_model(model: str) -> bool:
+    """Return whether an explicit operator override forces remote routing."""
+
+    configured = _remote_only_models()
+    if not configured:
+        return False
+    if "*" in configured:
+        return True
+    value = str(model or "").strip()
+    if value.lower().startswith("trae/"):
+        value = value[5:]
+    candidates = {value.lower()} if value else set()
+    try:
+        mapped = str(trae_client.convert_model_name(value) or "").strip().lower()
+    except Exception:
+        mapped = ""
+    if mapped:
+        candidates.add(mapped)
+    return bool(candidates & configured)
+
+
+def _chunk_marks_terminal(chunk: Any) -> bool:
+    """Whether an SSE chunk proves the response reached its end.
+
+    Chat Completions ends with ``data: [DONE]``; the Responses translation
+    ends with a ``response.completed``/``response.incomplete`` event.  Both
+    mean the upstream finished and billed the turn even if the API client
+    disconnects a moment later.
+    """
+    if isinstance(chunk, (bytes, bytearray)):
+        try:
+            text = bytes(chunk).decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+    elif isinstance(chunk, str):
+        text = chunk
+    else:
+        text = str(chunk)
+    return (
+        "data: [DONE]" in text
+        or "event: response.completed" in text
+        or "event: response.incomplete" in text
+    )
+
+
 async def _tracked_stream(source, tracker: _UsageTracker):
     context_token = _USAGE_TRACKER.set(tracker)
     status = "completed"
+    saw_terminal = False
     try:
         await tracker.begin()
         async for chunk in source:
+            if not saw_terminal and _chunk_marks_terminal(chunk):
+                saw_terminal = True
             yield chunk
     except asyncio.CancelledError:
-        status = "cancelled"
+        status = "completed" if saw_terminal else "cancelled"
+        raise
+    except GeneratorExit:
+        status = "completed" if saw_terminal else "cancelled"
         raise
     except Exception:
         status = "error"
@@ -2591,8 +2967,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     options = dict(options or {})
     token = str(options.get("_auth_token") or "").strip()
     account_id = str(options.get("_account_id") or "").strip()
+    record = auth.get_account_record(account_id) if account_id else {}
     if not token and account_id:
-        token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+        token = str((record or {}).get("token") or "").strip()
     if not token and not account_id:
         token = str(auth.get_token() or "").strip()
     token_identity = _account_id_from_token(token)
@@ -2611,6 +2988,16 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     session_id = ""
     translation_options = _tool_translation_options(options, messages)
     bound_options = {**options, "_auth_token": token, "_account_id": account_id}
+    provider_specific = bound_options.get("provider_specific")
+    if provider_specific is None and "providerSpecificData" in bound_options:
+        provider_specific = bound_options.get("providerSpecificData")
+    if not isinstance(provider_specific, Mapping):
+        provider_specific = (record or {}).get("provider_specific") or (
+            record or {}
+        ).get("providerSpecificData")
+    bound_options["provider_specific"] = (
+        dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
+    )
     try:
         session_id, message_id = await trae_client.create_web_session(
             client,
@@ -2618,8 +3005,14 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
             messages,
             options=bound_options,
         )
+        _bind_usage_turn(message_id)
         trae_client.register_web_lease(
-            account_id, session_id, message_id, client, token=token
+            account_id,
+            session_id,
+            message_id,
+            client,
+            token=token,
+            provider_specific=bound_options.get("provider_specific"),
         )
         event_iter = trae_client.stream_web_events(
             client, session_id, message_id, options=bound_options
@@ -2706,17 +3099,132 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
     remote_options = dict(options)
-    provider_specific = record.get("provider_specific") or record.get("providerSpecificData")
-    if isinstance(provider_specific, dict):
-        remote_options["provider_specific"] = provider_specific
+    # A session lease may carry provider metadata captured from the account
+    # store before the JWT identity is normalized. Prefer that bound snapshot;
+    # only consult the mutable account lookup as a fallback.
+    provider_specific = remote_options.get("provider_specific") or remote_options.get(
+        "providerSpecificData"
+    )
+    if not isinstance(provider_specific, Mapping):
+        provider_specific = record.get("provider_specific") or record.get(
+            "providerSpecificData"
+        )
+    remote_options["provider_specific"] = (
+        dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
+    )
     await trae_client.acquire_web_slot(
         account_id,
         timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
     )
+    slot_released = False
+    cleanup_started = False
+
+    def release_slot_once() -> None:
+        """Release the account slot exactly once across all exit paths."""
+
+        nonlocal slot_released
+        if slot_released:
+            return
+        slot_released = True
+        trae_client.release_web_slot(account_id)
+
     client = httpx.AsyncClient(timeout=None)
     session_id = ""
     message_id = ""
+
+    async def close_remote_session() -> None:
+        """Stop and close one remote attempt without leaking its account slot."""
+
+        nonlocal cleanup_started
+        if cleanup_started:
+            return
+        cleanup_started = True
+        try:
+            if session_id:
+                await trae_remote_client.stop_session(
+                    client,
+                    token,
+                    session_id,
+                    message_id,
+                    options=remote_options,
+                )
+        finally:
+            try:
+                await client.aclose()
+            finally:
+                release_slot_once()
+
     translation_options = _tool_translation_options(options, messages)
+    explicit_remote_type = str(
+        remote_options.get("_remote_agent_type")
+        or remote_options.get("remote_agent_type")
+        or ""
+    ).strip().lower()
+    explicit_work = explicit_remote_type in {
+        "solo_work_remote",
+        "solo_work_lite",
+        "work",
+    } or str(model or "").strip().lower() in {"work", "auto-work", "solo-work"}
+    work_fallback_enabled = (
+        os.environ.get("TRAE_REMOTE_WORK_FALLBACK", "1").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    can_work_fallback = work_fallback_enabled and not explicit_work
+    can_work_fallback = can_work_fallback and (
+        trae_remote_client.remote_agent_type(model, remote_options)
+        == "solo_agent_remote"
+    )
+    work_fallback_used = False
+
+    def work_fallback_options(base: Mapping[str, Any]) -> dict[str, Any]:
+        fallback = dict(base)
+        fallback["_remote_agent_type"] = "solo_work_remote"
+        fallback["_session_variant"] = "work-fallback"
+        return fallback
+
+    # Inject caller-owned tool definitions as a system prompt so the
+    # remote upstream sees the available tools even though its transport
+    # only accepts text messages.
+    prepared_messages = trae_client._messages_with_client_runtime(messages, options)
+    compact_options = dict(options)
+    # The agent-remote session advertises a 1M-token window, but the upstream
+    # silently drops sessions whose flattened query exceeds ~500k chars.
+    # Bound history by message count and content size first, then trim the
+    # flattened query to the hard cap so large tool sessions still respond.
+    compact_options.setdefault(
+        "trae_raw_max_messages",
+        os.environ.get("TRAE_REMOTE_MAX_MESSAGES", "500"),
+    )
+    compact_options.setdefault(
+        "trae_raw_max_history_chars",
+        os.environ.get("TRAE_REMOTE_MAX_HISTORY_CHARS", "480000"),
+    )
+    compact_options.setdefault(
+        "trae_remote_query_max_chars",
+        os.environ.get("TRAE_REMOTE_QUERY_MAX_CHARS", "480000"),
+    )
+    original_message_count = len(prepared_messages)
+    prepared_messages, omitted_history = raw_client._compact_raw_history(
+        prepared_messages, compact_options
+    )
+    prepared_messages, query_trimmed = _bounded_remote_query(
+        prepared_messages, compact_options
+    )
+    if omitted_history:
+        logger.info(
+            "remote history compacted input_messages=%d output_messages=%d omitted=%d",
+            original_message_count,
+            len(prepared_messages),
+            omitted_history,
+        )
+    if query_trimmed:
+        logger.warning(
+            "remote query trimmed for upstream size input_messages=%d output_messages=%d dropped=%d query_chars=%d",
+            original_message_count,
+            len(prepared_messages),
+            query_trimmed,
+            len(trae_client.flatten_query(prepared_messages)),
+        )
     try:
         logger.info(
             "remote create start id=%s account=%s model=%s messages=%d last_chars=%d",
@@ -2726,13 +3234,37 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             len(messages),
             len(str(messages[-1].get("content") or "")) if messages else 0,
         )
-        session_id, message_id = await trae_remote_client.create_session(
-            client,
-            token,
-            model,
-            messages,
-            options=remote_options,
-        )
+        try:
+            session_id, message_id = await trae_remote_client.create_session(
+                client,
+                token,
+                model,
+                prepared_messages,
+                options=remote_options,
+            )
+        except Exception as create_exc:
+            if not can_work_fallback:
+                raise
+            logger.warning(
+                "remote Agent create failed; falling back to Work id=%s model=%s error=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+                create_exc,
+            )
+            # No session id was returned, so the failed create cannot be
+            # stopped. Reuse the acquired account slot with a fresh client.
+            await client.aclose()
+            client = httpx.AsyncClient(timeout=None)
+            remote_options = work_fallback_options(remote_options)
+            work_fallback_used = True
+            session_id, message_id = await trae_remote_client.create_session(
+                client,
+                token,
+                model,
+                prepared_messages,
+                options=remote_options,
+            )
+        _bind_usage_turn(message_id)
         logger.info(
             "remote create ok id=%s chat_session=%s message=%s",
             str(options.get("_relay_request_id") or ""),
@@ -2748,13 +3280,226 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         )
         if stream:
             async def gen():
+                nonlocal work_fallback_used
+                request_id = str(options.get("_relay_request_id") or "")
+                started_at = time.monotonic()
+                chunk_count = 0
+                tool_chunk_count = 0
+                saw_done = False
+                stream_status = "running"
                 try:
-                    async for chunk in translate_web_events(
-                        event_iter, model, FORWARD_USAGE, **translation_options
-                    ):
-                        _track_usage_from_chunk(chunk, model)
-                        yield chunk
+                    try:
+                        async for chunk in translate_web_events(
+                            event_iter,
+                            model,
+                            FORWARD_USAGE,
+                            fail_on_empty=True,
+                            **translation_options,
+                        ):
+                            _track_usage_from_chunk(chunk, model)
+                            chunk_count += 1
+                            if '"tool_calls"' in chunk:
+                                tool_chunk_count += 1
+                            if "data: [DONE]" in chunk:
+                                saw_done = True
+                                stream_status = "completed"
+                            yield chunk
+                        stream_status = "completed"
+                    except EmptyUpstreamResponse as exc:
+                        if exc.usage is not None:
+                            _track_usage_from_result({"usage": exc.usage}, model)
+                        if (
+                            not exc.retryable
+                            or work_fallback_used
+                            or not can_work_fallback
+                        ):
+                            logger.warning(
+                                "remote empty response is not safe to retry "
+                                "id=%s model=%s observed_model_event=%s fallback_used=%s",
+                                request_id,
+                                model,
+                                exc.observed_model_event,
+                                work_fallback_used,
+                            )
+                            raise
+                        logger.warning(
+                            "remote upstream ended before any model event; "
+                            "%s once id=%s model=%s",
+                            "falling back to Work" if can_work_fallback and not work_fallback_used else "retrying",
+                            request_id,
+                            model,
+                        )
+                        await close_remote_session()
+                        slot_reacquired = False
+                        retry_client = None
+                        retry_session_id = ""
+                        retry_message_id = ""
+                        try:
+                            await trae_client.acquire_web_slot(
+                                account_id,
+                                timeout=float(
+                                    os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")
+                                ),
+                            )
+                            slot_reacquired = True
+                            retry_options = dict(remote_options)
+                            retry_model = model
+                            if can_work_fallback and not work_fallback_used:
+                                retry_options = work_fallback_options(retry_options)
+                                work_fallback_used = True
+                            retry_token = token
+                            # Prefer the same-account Work fallback.  Account
+                            # rotation remains the outer retry policy after a
+                            # Work attempt is exhausted.
+                            if auth.get_polling_status().get("enabled") and not (
+                                can_work_fallback and work_fallback_used
+                            ):
+                                next_snapshot = _next_retry_account_snapshot(
+                                    {_retry_account_key(options, 0)}, 1
+                                )
+                                if next_snapshot is not None:
+                                    next_account_id, record = next_snapshot
+                                    retry_token = (
+                                        str(record.get("token") or "") or retry_token
+                                    )
+                                    retry_billing_id = (
+                                        _account_id_from_token(retry_token)
+                                        or next_account_id
+                                    )
+                                    retry_options = dict(retry_options)
+                                    retry_options["_account_id"] = next_account_id
+                                    retry_options["_billing_id"] = retry_billing_id
+                                    retry_options["_auth_token"] = retry_token
+                                    retry_options["_auth_user_id"] = retry_billing_id
+                                    retry_provider = (
+                                        record.get("provider_specific")
+                                        or record.get("providerSpecificData")
+                                        or {}
+                                    )
+                                    if isinstance(retry_provider, Mapping):
+                                        retry_options["provider_specific"] = dict(
+                                            retry_provider
+                                        )
+                                    retry_tracker = _USAGE_TRACKER.get()
+                                    if retry_tracker is not None:
+                                        await retry_tracker.rebind(retry_options)
+                                    _rebind_chat_session_account(
+                                        str(
+                                            retry_options.get("session_id")
+                                            or retry_options.get("sessionId")
+                                            or ""
+                                        ),
+                                        next_account_id,
+                                        retry_billing_id,
+                                        retry_token,
+                                        retry_provider,
+                                    )
+                            retry_client = httpx.AsyncClient(timeout=None)
+                            logger.info(
+                                "remote empty retry start id=%s model=%s account=%s",
+                                request_id,
+                                model,
+                                str(retry_options.get("_account_id") or ""),
+                            )
+                            retry_session_id, retry_message_id = (
+                                await trae_remote_client.create_session(
+                                    retry_client,
+                                    retry_token,
+                                    retry_model,
+                                    prepared_messages,
+                                    options=retry_options,
+                                )
+                            )
+                            _bind_usage_turn(retry_message_id)
+                            retry_event_iter = trae_remote_client.stream_events(
+                                retry_client,
+                                retry_token,
+                                retry_session_id,
+                                retry_message_id,
+                                options=retry_options,
+                            )
+                            try:
+                                async for chunk in translate_web_events(
+                                    retry_event_iter,
+                                    model,
+                                    FORWARD_USAGE,
+                                    fail_on_empty=True,
+                                    **translation_options,
+                                ):
+                                    _track_usage_from_chunk(chunk, model)
+                                    chunk_count += 1
+                                    if '"tool_calls"' in chunk:
+                                        tool_chunk_count += 1
+                                    if "data: [DONE]" in chunk:
+                                        saw_done = True
+                                        stream_status = "completed"
+                                    yield chunk
+                                stream_status = "completed"
+                            finally:
+                                if retry_session_id:
+                                    try:
+                                        await trae_remote_client.stop_session(
+                                            retry_client,
+                                            retry_token,
+                                            retry_session_id,
+                                            retry_message_id,
+                                            options=retry_options,
+                                        )
+                                    except Exception:
+                                        pass
+                        finally:
+                            if slot_reacquired:
+                                trae_client.release_web_slot(account_id)
+                            if retry_client is not None:
+                                await retry_client.aclose()
+                except asyncio.CancelledError:
+                    stream_status = "client_cancelled"
+                    raise
+                except GeneratorExit:
+                    stream_status = "client_closed" if not saw_done else "completed"
+                    raise
+                except Exception:
+                    stream_status = "error"
+                    raise
                 finally:
+                    logger.info(
+                        "public stream closed id=%s status=%s chunks=%d "
+                        "tool_chunks=%d done=%s elapsed_ms=%d",
+                        request_id,
+                        stream_status,
+                        chunk_count,
+                        tool_chunk_count,
+                        saw_done,
+                        int((time.monotonic() - started_at) * 1000),
+                    )
+                    await close_remote_session()
+
+            return StreamingResponse(
+                gen(), media_type="text/event-stream", headers=_sse_headers()
+            )
+        try:
+            result = await collect_nonstream_web(
+                event_iter,
+                model,
+                fail_on_empty=True,
+                **translation_options,
+            )
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        except EmptyUpstreamResponse as exc:
+            if exc.usage is not None:
+                _track_usage_from_result({"usage": exc.usage}, model)
+            if not (can_work_fallback and not work_fallback_used and exc.retryable):
+                raise
+            logger.warning(
+                "remote upstream ended before any model event; falling back to Work "
+                "id=%s model=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+            )
+            work_fallback_used = True
+            try:
+                if session_id:
                     await trae_remote_client.stop_session(
                         client,
                         token,
@@ -2762,42 +3507,38 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         message_id,
                         options=remote_options,
                     )
-                    await client.aclose()
-                    trae_client.release_web_slot(account_id)
-
-            return StreamingResponse(
-                gen(), media_type="text/event-stream", headers=_sse_headers()
+            except Exception:
+                pass
+            session_id = ""
+            message_id = ""
+            remote_options = work_fallback_options(remote_options)
+            session_id, message_id = await trae_remote_client.create_session(
+                client,
+                token,
+                model,
+                prepared_messages,
+                options=remote_options,
             )
-        try:
-            result = await collect_nonstream_web(
-                event_iter, model, **translation_options
-            )
-            _track_usage_from_result(result, model)
-            return JSONResponse(content=result)
-        finally:
-            await trae_remote_client.stop_session(
+            _bind_usage_turn(message_id)
+            fallback_events = trae_remote_client.stream_events(
                 client,
                 token,
                 session_id,
                 message_id,
                 options=remote_options,
             )
-            await client.aclose()
-            trae_client.release_web_slot(account_id)
+            result = await collect_nonstream_web(
+                fallback_events,
+                model,
+                fail_on_empty=True,
+                **translation_options,
+            )
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        finally:
+            await close_remote_session()
     except Exception:
-        if session_id:
-            try:
-                await trae_remote_client.stop_session(
-                    client,
-                    token,
-                    session_id,
-                    message_id,
-                    options=remote_options,
-                )
-            except Exception:
-                pass
-        await client.aclose()
-        trae_client.release_web_slot(account_id)
+        await close_remote_session()
         raise
 
 
@@ -2806,15 +3547,22 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
     ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
     response = ide_resp.response
     translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
     if stream:
         async def gen():
             try:
                 async for chunk in translate_ide_stream(
-                    response, model, FORWARD_USAGE, **translation_options
+                    response,
+                    model,
+                    FORWARD_USAGE,
+                    upstream_metadata=upstream_metadata,
+                    **translation_options,
                 ):
+                    _bind_usage_turn_from_metadata(upstream_metadata)
                     _track_usage_from_chunk(chunk, model)
                     yield chunk
             finally:
+                _bind_usage_turn_from_metadata(upstream_metadata)
                 ide_resp.close()
         return StreamingResponse(
             gen(),
@@ -2822,11 +3570,73 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
             headers=_sse_headers(),
         )
     try:
-        result = await collect_nonstream_ide(response, model, **translation_options)
+        result = await collect_nonstream_ide(
+            response,
+            model,
+            upstream_metadata=upstream_metadata,
+            **translation_options,
+        )
+        _bind_usage_turn_from_metadata(upstream_metadata)
         _track_usage_from_result(result, model)
         return JSONResponse(content=result)
     finally:
+        _bind_usage_turn_from_metadata(upstream_metadata)
         ide_resp.close()
+
+
+async def run_traework_native_chat(
+    messages, model, stream: bool, options: Optional[dict] = None
+):
+    """TraeWork native AHA bridge backed by an external Windows helper.
+
+    The helper owns ai_agent.dll and sscronet.dll and returns the native SSE
+    event stream. Linux deployments receive a clear 502 instead of attempting
+    to load a Windows PE DLL.
+    """
+
+    native_resp = await traework_native_bridge.send_native_chat_request(
+        messages,
+        model,
+        stream=stream,
+        options=options,
+    )
+    translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
+    if stream:
+        async def gen():
+            try:
+                async for chunk in translate_ide_stream(
+                    native_resp.response,
+                    model,
+                    FORWARD_USAGE,
+                    upstream_metadata=upstream_metadata,
+                    **translation_options,
+                ):
+                    _bind_usage_turn_from_metadata(upstream_metadata)
+                    _track_usage_from_chunk(chunk, model)
+                    yield chunk
+            finally:
+                _bind_usage_turn_from_metadata(upstream_metadata)
+                native_resp.close()
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+    try:
+        result = await collect_nonstream_ide(
+            native_resp.response,
+            model,
+            upstream_metadata=upstream_metadata,
+            **translation_options,
+        )
+        _bind_usage_turn_from_metadata(upstream_metadata)
+        _track_usage_from_result(result, model)
+        return JSONResponse(content=result)
+    finally:
+        _bind_usage_turn_from_metadata(upstream_metadata)
+        native_resp.close()
 
 
 async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = None):
@@ -2849,6 +3659,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
         str(getattr(raw_resp, "auth_token", "") or ""),
     )
     translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
     if stream:
         async def gen():
             current = raw_resp
@@ -2866,9 +3677,12 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                             current.response,
                             model,
                             FORWARD_USAGE,
-                            fail_on_empty=attempt == 0,
+                            fail_on_empty=True,
+                            require_terminal=False,
+                            upstream_metadata=upstream_metadata,
                             **translation_options,
                         ):
+                            _bind_usage_turn_from_metadata(upstream_metadata)
                             chunk_count += 1
                             if '"tool_calls"' in chunk:
                                 tool_chunk_count += 1
@@ -2879,21 +3693,32 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                             yield chunk
                         stream_status = "completed"
                         return
-                    except RepeatedCompletedToolResponse:
-                        if attempt:
-                            raise RuntimeError(
-                                "Trae upstream repeated an already completed tool call "
-                                "after the relay recovery retry"
-                            )
+                    except RepeatedCompletedToolResponse as exc:
+                        if exc.usage is not None:
+                            _track_usage_from_result({"usage": exc.usage}, model)
                         logger.warning(
-                            "raw upstream repeated only completed tool calls; retrying once with recovery guidance"
+                            "raw upstream repeated an already completed tool call; "
+                            "automatic replay is disabled to avoid a second billed turn"
+                        )
+                        raise RuntimeError(str(exc)) from exc
+                    except EmptyUpstreamResponse as exc:
+                        _bind_usage_turn_from_metadata(upstream_metadata)
+                        if exc.usage is not None:
+                            _track_usage_from_result({"usage": exc.usage}, model)
+                        if attempt or not exc.retryable:
+                            logger.warning(
+                                "raw upstream response is not safe to retry "
+                                "attempt=%d observed_model_event=%s",
+                                attempt + 1,
+                                exc.observed_model_event,
+                            )
+                            raise
+                        logger.warning(
+                            "raw upstream ended before any model event; retrying once"
                         )
                         retry_options = dict(options or {})
-                        retry_options["_recover_suppressed_tool_call"] = True
-                    except EmptyUpstreamResponse:
-                        logger.warning("raw upstream returned an empty response; retrying once")
-                        retry_options = dict(options or {})
                     finally:
+                        _bind_usage_turn_from_metadata(upstream_metadata)
                         current.close()
 
                     try:
@@ -2906,16 +3731,8 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                         )
                     except Exception as exc:
                         logger.warning("raw empty-response retry failed: %s", exc)
-                        async for chunk in translate_ide_stream(
-                            [], model, FORWARD_USAGE, **translation_options
-                        ):
-                            chunk_count += 1
-                            if "data: [DONE]" in chunk:
-                                saw_done = True
-                            _track_usage_from_chunk(chunk, model)
-                            yield chunk
                         stream_status = "empty_retry_failed"
-                        return
+                        raise
             except asyncio.CancelledError:
                 stream_status = "client_cancelled"
                 raise
@@ -2948,26 +3765,41 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
             result = await collect_nonstream_ide(
                 current.response,
                 model,
-                fail_on_empty=attempt == 0,
+                fail_on_empty=True,
+                require_terminal=False,
+                upstream_metadata=upstream_metadata,
                 **translation_options,
             )
+            _bind_usage_turn_from_metadata(upstream_metadata)
             _track_usage_from_result(result, model)
             return JSONResponse(content=result)
-        except RepeatedCompletedToolResponse:
-            if attempt:
-                raise RuntimeError(
-                    "Trae upstream repeated an already completed tool call "
-                    "after the relay recovery retry"
-                )
+        except RepeatedCompletedToolResponse as exc:
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            if exc.usage is not None:
+                _track_usage_from_result({"usage": exc.usage}, model)
             logger.warning(
-                "raw upstream repeated only completed tool calls; retrying once with recovery guidance"
+                "raw upstream repeated an already completed tool call; "
+                "automatic replay is disabled to avoid a second billed turn"
+            )
+            raise RuntimeError(str(exc)) from exc
+        except EmptyUpstreamResponse as exc:
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            if exc.usage is not None:
+                _track_usage_from_result({"usage": exc.usage}, model)
+            if attempt or not exc.retryable:
+                logger.warning(
+                    "raw upstream response is not safe to retry "
+                    "attempt=%d observed_model_event=%s",
+                    attempt + 1,
+                    exc.observed_model_event,
+                )
+                raise
+            logger.warning(
+                "raw upstream ended before any model event; retrying once"
             )
             retry_options = dict(options or {})
-            retry_options["_recover_suppressed_tool_call"] = True
-        except EmptyUpstreamResponse:
-            logger.warning("raw upstream returned an empty response; retrying once")
-            retry_options = dict(options or {})
         finally:
+            _bind_usage_turn_from_metadata(upstream_metadata)
             current.close()
         try:
             current = await raw_client.send_raw_chat_request(
@@ -2991,56 +3823,203 @@ def _openai_error(status: int, message: str, error_type: str, param: Optional[st
     return JSONResponse(body, status_code=status)
 
 
-async def _run_web_with_retry(messages, model, stream: bool, options: Optional[dict] = None):
+def _retry_account_key(options: Optional[Mapping[str, Any]], fallback_index: int) -> str:
+    options = options or {}
+    token = str(options.get("_auth_token") or "")
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        # The JWT owner is the account Trae actually bills. Two stale account
+        # rows that reference the same JWT must not receive this request twice.
+        return token_identity
+    if token:
+        return "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+    account_id = str(
+        options.get("_account_id")
+        or options.get("_billing_id")
+        or auth.get_active_account_id()
+        or ""
+    )
+    if account_id:
+        return account_id
+    return f"attempt-{fallback_index}"
+
+
+def _polling_retry_limit(options: Optional[Mapping[str, Any]]) -> int:
+    """Count usable polling accounts without granting an extra retry."""
+
+    account_ids: set[str] = set()
+    anonymous_accounts = 0
+    for account in auth.list_accounts():
+        if isinstance(account, Mapping):
+            if account.get("is_valid") is False:
+                continue
+            account_id = str(account.get("id") or "")
+            if account_id:
+                account_ids.add(account_id)
+            else:
+                anonymous_accounts += 1
+        else:
+            anonymous_accounts += 1
+    bound_account = str((options or {}).get("_account_id") or "")
+    if bound_account:
+        account_ids.add(bound_account)
+    return max(1, len(account_ids) + anonymous_accounts)
+
+
+def _next_retry_account_snapshot(
+    attempted_accounts: set[str], max_rotations: int
+) -> tuple[str, dict] | None:
+    """Rotate to an account that has not already received this request."""
+
+    for rotation_index in range(max(1, max_rotations)):
+        auth.next_polling_account()
+        account_id, record = auth.get_active_account_snapshot()
+        safe_record = dict(record) if isinstance(record, Mapping) else {}
+        candidate_options = {
+            "_account_id": str(account_id or ""),
+            "_auth_token": str(safe_record.get("token") or ""),
+        }
+        account_key = _retry_account_key(candidate_options, rotation_index)
+        if account_key not in attempted_accounts:
+            return str(account_id or ""), safe_record
+    return None
+
+
+async def _run_web_with_retry(
+    messages,
+    model,
+    stream: bool,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
     """web 上游 429 并发限制时轮询切换账号重试。"""
+    tracker = tracker or _USAGE_TRACKER.get()
     if auth.get_polling_status().get("enabled"):
-        attempts = max(1, len(auth.list_accounts()))
-        for _ in range(attempts + 1):
+        attempts = _polling_retry_limit(options)
+        attempted_accounts: set[str] = set()
+        for attempt_index in range(attempts):
+            account_key = _retry_account_key(options, attempt_index)
+            if account_key in attempted_accounts:
+                break
+            attempted_accounts.add(account_key)
             try:
                 return await run_web_session(messages, model, stream, options)
             except RuntimeError as e:
                 err = str(e)
                 if "solo_agent_parallel_limit" in err or "429" in err:
+                    if attempt_index + 1 >= attempts:
+                        break
                     logger.warning("web 429 parallel limit, rotating account: %s", err)
-                    auth.next_polling_account()
+                    next_snapshot = _next_retry_account_snapshot(
+                        attempted_accounts, attempts
+                    )
+                    if next_snapshot is None:
+                        break
                     # Rebind options from the newly rotated account so the
                     # retry uses the correct token and billing identity.
-                    account_id, record = auth.get_active_account_snapshot()
+                    account_id, record = next_snapshot
                     token = str(record.get("token") or "")
                     billing_id = _account_id_from_token(token) or account_id
+                    provider_specific = (
+                        record.get("provider_specific")
+                        or record.get("providerSpecificData")
+                        or {}
+                    )
                     options = dict(options or {})
                     options["_account_id"] = account_id
                     options["_billing_id"] = billing_id
                     options["_auth_token"] = token
+                    options["_auth_user_id"] = billing_id
+                    if isinstance(provider_specific, Mapping):
+                        options["provider_specific"] = dict(provider_specific)
+                    if tracker is not None:
+                        await tracker.rebind(options)
+                    _rebind_chat_session_account(
+                        str(options.get("session_id") or options.get("sessionId") or ""),
+                        account_id,
+                        billing_id,
+                        token,
+                        provider_specific,
+                    )
                     continue
                 raise
         raise RuntimeError("All web accounts busy: Trae parallel limit reached")
     return await run_web_session(messages, model, stream, options)
 
 
-async def _run_remote_with_retry(messages, model, stream, options: Optional[dict] = None):
+async def _run_remote_with_retry(
+    messages,
+    model,
+    stream,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
     """Retry 9router-style remote sessions on the provider's parallel limit."""
+    tracker = tracker or _USAGE_TRACKER.get()
     if auth.get_polling_status().get("enabled"):
-        attempts = max(1, len(auth.list_accounts()))
-        for _ in range(attempts + 1):
+        attempts = _polling_retry_limit(options)
+        attempted_accounts: set[str] = set()
+
+        async def rotate_remote_account(reason: str) -> bool:
+            nonlocal options
+            logger.warning("remote %s, rotating account", reason)
+            next_snapshot = _next_retry_account_snapshot(
+                attempted_accounts, attempts
+            )
+            if next_snapshot is None:
+                return False
+            account_id, record = next_snapshot
+            token = str(record.get("token") or "")
+            billing_id = _account_id_from_token(token) or account_id
+            provider_specific = (
+                record.get("provider_specific")
+                or record.get("providerSpecificData")
+                or {}
+            )
+            options = dict(options or {})
+            options["_account_id"] = account_id
+            options["_billing_id"] = billing_id
+            options["_auth_token"] = token
+            options["_auth_user_id"] = billing_id
+            if isinstance(provider_specific, Mapping):
+                options["provider_specific"] = dict(provider_specific)
+            if tracker is not None:
+                await tracker.rebind(options)
+            _rebind_chat_session_account(
+                str(options.get("session_id") or options.get("sessionId") or ""),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+            return True
+
+        for attempt_index in range(attempts):
+            account_key = _retry_account_key(options, attempt_index)
+            if account_key in attempted_accounts:
+                break
+            attempted_accounts.add(account_key)
             try:
                 return await run_remote_session(messages, model, stream, options)
+            except EmptyUpstreamResponse as exc:
+                if not exc.retryable or attempt_index + 1 >= attempts:
+                    raise
+                if not await rotate_remote_account(
+                    "upstream returned an empty response"
+                ):
+                    raise
+                continue
             except RuntimeError as exc:
                 message = str(exc)
-                if "parallel" in message.lower() or "429" in message:
-                    logger.warning("remote parallel limit, rotating account: %s", message)
-                    auth.next_polling_account()
-                    # Rebind options from the newly rotated account so the
-                    # retry uses the correct token and billing identity.
-                    account_id, record = auth.get_active_account_snapshot()
-                    token = str(record.get("token") or "")
-                    billing_id = _account_id_from_token(token) or account_id
-                    options = dict(options or {})
-                    options["_account_id"] = account_id
-                    options["_billing_id"] = billing_id
-                    options["_auth_token"] = token
-                    continue
-                raise
+                if "parallel" not in message.lower() and "429" not in message:
+                    raise
+                if attempt_index + 1 >= attempts:
+                    break
+                if not await rotate_remote_account("parallel limit"):
+                    break
+                continue
         raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
     return await run_remote_session(messages, model, stream, options)
 
@@ -3215,6 +4194,13 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         _tool_protocol_requested(options, messages),
         str(options.get("session_id") or options.get("sessionId") or "")[:16],
     )
+    if not str(model or "").strip():
+        return _openai_error(
+            400,
+            "model is required and cannot be blank",
+            "invalid_request_error",
+            "model",
+        )
     if not trae_client.is_model_supported(model):
         return _openai_error(400, f"Unsupported model: {model}", "invalid_request_error", "model")
 
@@ -3222,14 +4208,42 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     # may execute their own tools on the relay host, so they are never valid
     # fallbacks for a request that advertises caller-owned tools.
     tool_protocol_requested = _tool_protocol_requested(options, messages)
-    if tool_protocol_requested and UPSTREAM_MODE in ("web", "remote", "9router", "trae-remote", "ide"):
-        return _openai_error(
-            400,
-            f"UPSTREAM_MODE={UPSTREAM_MODE} cannot safely proxy caller-owned tool policy; "
-            "use auto, raw, or cli",
-            "invalid_request_error",
-            "tools",
+    # Caller-owned tools are now supported on all upstream paths.
+    # Remote/web routes inject tool definitions as a system prompt via
+    # `_messages_with_client_runtime` and filter tool calls from the
+    # upstream text response with `_filter_tool_calls`.
+    if tool_protocol_requested:
+        logger.info(
+            "dispatch tool protocol id=%s mode=%s model=%s",
+            str(options.get("_relay_request_id") or ""),
+            UPSTREAM_MODE,
+            model,
         )
+
+    # Raw v2 is the default for every model. Operators can opt specific models
+    # (or ``*``) into the account-bound remote executor for diagnostics.
+    if _requires_remote_model(model) and UPSTREAM_MODE in (
+        "raw",
+        "direct",
+        "auto",
+        "ide",
+    ):
+        logger.info(
+            "dispatch remote-only model id=%s model=%s account=%s",
+            str(options.get("_relay_request_id") or ""),
+            model,
+            str(options.get("_account_id") or "default"),
+        )
+        try:
+            return await _run_remote_with_retry(messages, model, stream, options)
+        except ModelProviderMismatch as exc:
+            logger.error(
+                "remote provider model mismatch id=%s requested=%s error=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+                exc,
+            )
+            return _openai_error(502, str(exc), "upstream_model_mismatch", "model")
 
     # ``auto`` is the direct-proxy mode: every model request reaches Trae's
     # native llm_utils_chat endpoint. Legacy modes remain explicit opt-ins for
@@ -3246,6 +4260,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         modes = ["web"]
     elif UPSTREAM_MODE == "ide":
         modes = ["ide"]
+    elif UPSTREAM_MODE in ("traework-native", "native", "traework"):
+        modes = ["traework-native"]
     else:
         modes = ["raw"]
 
@@ -3265,7 +4281,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             # Web and remote routes must receive the lease-bound credential;
             # otherwise a concurrent account switch can make the upstream bill
             # one token while the usage tracker records another.
-            if mode not in ("remote", "web", "ide"):
+            if mode not in ("remote", "web", "ide", "traework-native"):
                 mode_options.pop("_auth_token", None)
                 mode_options.pop("_account_id", None)
             if mode == "cli":
@@ -3274,6 +4290,10 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 return await _run_web_with_retry(messages, model, stream, mode_options)
             if mode == "remote":
                 return await _run_remote_with_retry(messages, model, stream, mode_options)
+            if mode == "traework-native":
+                return await run_traework_native_chat(
+                    messages, model, stream, mode_options
+                )
             return await run_ide_chat(messages, model, stream, mode_options)
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
@@ -3325,6 +4345,8 @@ async def handle_chat(req: Request):
                 return _openai_error(400, "messages is required", "invalid_request_error")
     else:
         options_from_response = {}
+
+    messages = cli_client.sanitize_assistant_history_messages(messages)
 
     model = body.get("model") or "auto"
     stream = bool(body.get("stream", False))
@@ -3408,6 +4430,8 @@ async def handle_responses(req: Request):
         return _openai_error(
             400, str(exc), "invalid_request_error", exc.param
         )
+
+    messages = cli_client.sanitize_assistant_history_messages(messages)
 
     options = _apply_tool_header_hints(req, options)
     option_error = _validate_chat_options(options)
@@ -3614,6 +4638,14 @@ async def status():
         "base_url": state.host,
         "web_base": WEB_BASE,
         "upstream_mode": UPSTREAM_MODE,
+        "traework_native": {
+            "enabled": traework_native_bridge.NativeBridgeConfig.from_env().enabled,
+            "platform_supported": traework_native_bridge.NativeBridgeConfig.from_env().enabled_for_platform,
+            "install_dir_configured": bool(
+                traework_native_bridge.NativeBridgeConfig.from_env().install_dir
+            ),
+            "helper_url": traework_native_bridge.NativeBridgeConfig.from_env().bridge_url,
+        },
         "tool_execution": "client",
         "capabilities": {
             "openai_tool_calls": True,
@@ -3629,6 +4661,8 @@ async def status():
                 if UPSTREAM_MODE in ("raw", "direct", "auto")
                 else ["cli"]
                 if UPSTREAM_MODE == "cli"
+                else ["traework-native"]
+                if UPSTREAM_MODE in ("traework-native", "native", "traework")
                 else []
             ),
             "terminal_session_leases": True,

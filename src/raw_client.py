@@ -9,42 +9,90 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
+import threading
 import uuid
-from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Optional
 
 import httpx
 
 from . import auth
 from .cli_client import strip_tool_call_blocks
-from .model_limits import clamp_max_completion_tokens
 
 
 logger = logging.getLogger(__name__)
 
 
-RAW_CHAT_ENDPOINT = "/api/agent/v3/llm_utils_chat"
-RAW_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+# ``llm_raw_chat`` is the text-only transport used by TraeWork.  Unlike the
+# legacy llm_utils endpoint it binds the selected model through both the body
+# and the Extra header, and it rejects OpenAI tool fields in the JSON body.
+RAW_CHAT_ENDPOINT = "/api/ide/v2/llm_raw_chat"
+RAW_APP_ID = "7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0"
 RAW_IDE_VERSION = "3.3.67"
-RAW_IDE_VERSION_CODE = "20260401"
-RAW_GENERATION_FIELDS = (
-    "temperature",
-    "top_p",
-    "stop",
-    "presence_penalty",
-    "frequency_penalty",
-    "seed",
-    "reasoning_effort",
-    "stream_options",
-    "response_format",
-    "service_tier",
-    "user",
-    "logprobs",
-    "top_logprobs",
-)
+RAW_IDE_VERSION_CODE = "20260206"
+RAW_IDE_FUNCTION = "chat"
+
+
+@dataclass
+class _RawSessionGate:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    users: int = 0
+
+
+_RAW_SESSION_GATES: dict[str, _RawSessionGate] = {}
+_RAW_SESSION_GATES_LOCK = threading.Lock()
+_RAW_SESSION_GATE_POLL_SECONDS = 0.01
+
+
+def _unregister_raw_session_gate(session_id: str, gate: _RawSessionGate) -> None:
+    with _RAW_SESSION_GATES_LOCK:
+        if _RAW_SESSION_GATES.get(session_id) is not gate:
+            return
+        gate.users = max(0, gate.users - 1)
+        if gate.users == 0:
+            _RAW_SESSION_GATES.pop(session_id, None)
+
+
+async def _acquire_raw_session_gate(session_id: str) -> Callable[[], None]:
+    """Serialize streams that share Trae's model-bound raw conversation."""
+
+    with _RAW_SESSION_GATES_LOCK:
+        gate = _RAW_SESSION_GATES.get(session_id)
+        if gate is None:
+            gate = _RawSessionGate()
+            _RAW_SESSION_GATES[session_id] = gate
+        gate.users += 1
+
+    acquired = False
+    try:
+        while not gate.lock.acquire(blocking=False):
+            await asyncio.sleep(_RAW_SESSION_GATE_POLL_SECONDS)
+        acquired = True
+    except BaseException:
+        if acquired:
+            gate.lock.release()
+        _unregister_raw_session_gate(session_id, gate)
+        raise
+
+    released = False
+    release_guard = threading.Lock()
+
+    def release() -> None:
+        nonlocal released
+        with release_guard:
+            if released:
+                return
+            released = True
+        try:
+            gate.lock.release()
+        finally:
+            _unregister_raw_session_gate(session_id, gate)
+
+    return release
 
 
 @dataclass(frozen=True)
@@ -52,6 +100,8 @@ class RawModel:
     config_name: str
     raw_model_name: str
     display_name: str
+    config_source: int = 1
+    provider: str = ""
 
 
 @dataclass
@@ -61,10 +111,27 @@ class RawChatResponse:
     response: httpx.Response
     client: httpx.Client
     auth_token: str = ""
+    release_session: Optional[Callable[[], None]] = field(default=None, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def close(self) -> None:
-        self.response.close()
-        self.client.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            release_session = self.release_session
+            self.release_session = None
+        try:
+            self.response.close()
+        finally:
+            try:
+                self.client.close()
+            finally:
+                if release_session is not None:
+                    release_session()
 
     def __enter__(self) -> "RawChatResponse":
         return self
@@ -74,17 +141,27 @@ class RawChatResponse:
 
 
 _KNOWN_MODELS = {
+    # These names are the exact raw ids used by TraeWork's bundled client.
     "auto": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
-    "coding": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
+    "coding": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
     "glm-5.2": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
+    # glm-5.3 is resolved against the account model list when available.
     "glm-5.3": RawModel("glm-5.3", "glm-5.3", "GLM-5.3"),
-    "glm-5.1": RawModel("glm-5.1", "glm-5.1", "GLM-5.1"),
-    "kimi-k2.6": RawModel("kimi-k2.6", "kimi-k2.6", "Kimi-K2.6"),
+    "glm-5.1": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
+    "kimi-k2.6": RawModel("kimi-k2.6", "kimi-k2.6__v2", "Kimi-K2.6"),
     "kimi-k2.7-code": RawModel(
         "kimi-k2.7-code", "kimi-k2.7-code", "Kimi-K2.7-Code"
     ),
     "deepseek-v4-pro": RawModel(
-        "DeepSeek-V4-Pro", "DeepSeek-V4-Pro", "DeepSeek-V4-Pro"
+        "DeepSeek-V4-Pro", "DeepSeek-V4-Pro__v2", "DeepSeek-V4-Pro"
+    ),
+    "deepseek-v4-flash": RawModel(
+        "DeepSeek-V4-Flash", "DeepSeek-V4-Flash__v2", "DeepSeek-V4-Flash"
+    ),
+    "deepseek-v4-flash-official": RawModel(
+        "DeepSeek-V4-Flash-Official",
+        "DeepSeek-V4-Flash-Official",
+        "DeepSeek-V4-Flash \u6b63\u5f0f\u7248",
     ),
 }
 
@@ -127,21 +204,53 @@ def resolve_raw_model(model: str, options: Optional[Mapping[str, Any]] = None) -
             mapped = trae_client.convert_model_name(without_provider) or ""
         except Exception:
             mapped = ""
+    if known is None and mapped:
+        # Aliases such as gpt-4o may resolve to a Trae config name that also
+        # has an exact raw id. Re-check the mapped name so those aliases get
+        # the __v2-style raw id instead of falling back to the config name.
+        known = _KNOWN_MODELS.get(mapped.lower())
     default_name = mapped or without_provider or "glm-5.2"
 
-    config_name = _option(options, "config_name", "configName")
+    config_name = _option(
+        options,
+        "trae_raw_config_name",
+        "traeRawConfigName",
+        "config_name",
+        "configName",
+    )
     if not config_name:
         config_name = default_name
 
-    raw_model_name = _option(options, "raw_model_name", "rawModelName")
+    raw_model_name = _option(
+        options,
+        "trae_raw_model_name",
+        "traeRawModelName",
+        "raw_model_name",
+        "rawModelName",
+    )
     if not raw_model_name:
         raw_model_name = known.raw_model_name if known else config_name
 
-    display_name = _option(options, "display_name", "displayName")
+    display_name = _option(
+        options, "display_name", "displayName", "model_name", "modelName"
+    )
     if not display_name:
         display_name = known.display_name if known else (mapped or without_provider or config_name)
 
-    return RawModel(str(config_name), str(raw_model_name), str(display_name))
+    try:
+        config_source = int(
+            _option(options, "config_source", "configSource", default=1) or 1
+        )
+    except (TypeError, ValueError):
+        config_source = 1
+    provider = str(_option(options, "provider", default="") or "")
+    return RawModel(
+        str(config_name),
+        str(raw_model_name),
+        str(display_name),
+        config_source,
+        provider,
+    )
 
 
 async def resolve_raw_model_for_request(
@@ -156,26 +265,47 @@ async def resolve_raw_model_for_request(
     """
 
     options = options or {}
-    explicit_raw = _option(options, "raw_model_name", "rawModelName")
+    explicit_raw = _option(
+        options,
+        "trae_raw_model_name",
+        "traeRawModelName",
+        "raw_model_name",
+        "rawModelName",
+    )
     resolved = resolve_raw_model(model, options)
     if explicit_raw:
         return resolved
 
     requested = (model or "auto").strip()
     normalized = requested[5:].lower() if requested.lower().startswith("trae/") else requested.lower()
+    known = _KNOWN_MODELS.get(normalized)
     static_config = _DISPLAY_MODEL_ALIASES.get(normalized)
     if static_config:
         return RawModel(static_config, static_config, resolved.display_name)
+    if known is None:
+        # Aliases such as gpt-4o resolve offline to a known raw model.  Treat
+        # them like the direct known mapping so the account model list cannot
+        # override the pinned raw id with a missing or older value.
+        try:
+            from . import trae_client
 
-    known = _KNOWN_MODELS.get(normalized)
-    if known or resolved.raw_model_name != requested:
+            mapped = trae_client.convert_model_name(normalized)
+            if mapped and mapped.lower() != normalized:
+                known = _KNOWN_MODELS.get(mapped.lower())
+        except Exception:
+            pass
+    if known is not None and normalized != "glm-5.3":
+        # These models have exact offline raw ids (for example glm-5.1 maps to
+        # glm-5__v2).  The account model list often omits raw_model_name for
+        # them and can otherwise make the raw upstream fall back to the
+        # account default model.
         return resolved
 
     token = str(options.get("_auth_token") or auth.get_token() or "").strip()
     try:
         from . import trae_client
 
-        lookup_kwargs: dict[str, str] = {"token_override": token}
+        lookup_kwargs: dict[str, Any] = {"token_override": token}
         bound_user_id = str(
             options.get("_auth_user_id")
             or options.get("_billing_id")
@@ -184,6 +314,11 @@ async def resolve_raw_model_for_request(
         ).strip()
         if bound_user_id:
             lookup_kwargs["user_id_override"] = bound_user_id
+        provider_specific = options.get("provider_specific")
+        if provider_specific is None and "providerSpecificData" in options:
+            provider_specific = options.get("providerSpecificData")
+        if isinstance(provider_specific, Mapping):
+            lookup_kwargs["provider_specific"] = dict(provider_specific)
         config = await trae_client.resolve_model_config(requested, **lookup_kwargs)
         config_name = str(
             (config or {}).get("config_name")
@@ -191,10 +326,65 @@ async def resolve_raw_model_for_request(
             or ""
         ).strip()
         if config_name:
-            return RawModel(config_name, config_name, resolved.display_name)
+            raw_model_name = str(
+                (config or {}).get("raw_model_name")
+                or (config or {}).get("rawModelName")
+                or (config or {}).get("model_name")
+                or (known.raw_model_name if known else "")
+                or config_name
+            ).strip()
+            display_name = str(
+                (config or {}).get("display_name")
+                or (config or {}).get("display_model_name")
+                or resolved.display_name
+                or config_name
+            ).strip()
+            try:
+                config_source = int((config or {}).get("config_source") or 1)
+            except (TypeError, ValueError):
+                config_source = 1
+            return RawModel(
+                config_name,
+                raw_model_name,
+                display_name,
+                config_source,
+                str((config or {}).get("provider") or ""),
+            )
     except Exception as exc:
         logger.warning("raw model config lookup failed for %s: %s", requested, exc)
     return resolved
+
+
+def raw_session_id(
+    model: RawModel, options: Optional[Mapping[str, Any]] = None
+) -> str:
+    """Return a stable raw session scoped to account and model.
+
+    Trae binds model configuration to the raw conversation id. Keep exactly one
+    derived conversation per account/model pair so client-generated session ids
+    cannot silently re-bootstrap that model as the upstream default (Kimi).
+    Caller conversation ids and raw-session aliases are deliberately ignored.
+    This keeps the model lock stable across every public API request.
+    """
+
+    options = options or {}
+    account_identity = str(
+        options.get("_billing_id")
+        or options.get("_auth_user_id")
+        or options.get("_account_id")
+        or ""
+    )
+    if not account_identity:
+        token = str(options.get("_auth_token") or "")
+        account_identity = (
+            "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+            if token
+            else "default"
+        )
+    material_parts = [account_identity, model.config_name, model.raw_model_name]
+    material = "\x1f".join(material_parts)
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return str(uuid.UUID(digest[:32]))
 
 
 def resolve_raw_base_url(options: Optional[Mapping[str, Any]] = None) -> str:
@@ -413,6 +603,7 @@ def _normalized_tools(tools: Any) -> list[dict[str, Any]]:
     if not isinstance(tools, list):
         return []
     normalized: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
     for tool in tools:
         if not isinstance(tool, Mapping):
             continue
@@ -432,14 +623,109 @@ def _normalized_tools(tools: Any) -> list[dict[str, Any]]:
             )
         if not name:
             continue
+        normalized_name = str(name)
+        if normalized_name in seen_names:
+            continue
+        seen_names.add(normalized_name)
         normalized.append(
             {
-                "name": str(name),
+                "name": normalized_name,
                 "description": str(description or ""),
                 "input_schema": schema,
             }
         )
     return normalized
+
+
+def _tool_schema_budget() -> int:
+    try:
+        value = int(os.environ.get("TRAE_RAW_MAX_TOOL_SCHEMA_CHARS", "48000"))
+    except (TypeError, ValueError):
+        value = 48000
+    return max(1024, value)
+
+
+def _compact_tool_signature(tool: Mapping[str, Any]) -> dict[str, Any]:
+    schema = tool.get("input_schema")
+    properties = schema.get("properties") if isinstance(schema, Mapping) else None
+    fields: dict[str, Any] = {}
+    if isinstance(properties, Mapping):
+        for name, raw_hint in properties.items():
+            hint: dict[str, Any] = {}
+            if isinstance(raw_hint, Mapping):
+                value_type = raw_hint.get("type")
+                if isinstance(value_type, (str, list)):
+                    hint["type"] = value_type
+                enum = raw_hint.get("enum")
+                if isinstance(enum, list) and len(enum) <= 20:
+                    hint["enum"] = enum
+                if value_type == "array" and isinstance(raw_hint.get("items"), Mapping):
+                    item_type = raw_hint["items"].get("type")
+                    if isinstance(item_type, str):
+                        hint["items"] = item_type
+            fields[str(name)] = hint or "any"
+    required = schema.get("required") if isinstance(schema, Mapping) else None
+    signature: dict[str, Any] = {
+        "name": str(tool.get("name") or ""),
+        "fields": fields,
+    }
+    if isinstance(required, list):
+        signature["required"] = [str(value) for value in required]
+    return signature
+
+
+def _tool_definitions_prompt(tool_defs: list[dict[str, Any]]) -> tuple[str, bool, int]:
+    """Serialize tool schemas within a bounded prompt budget.
+
+    Normal tool sets keep their complete OpenAI schemas. Very large catalogs
+    retain every tool name and as many compact field signatures as fit, with
+    discovery/environment tools ordered first.
+    """
+
+    full = json.dumps(
+        tool_defs, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    budget = _tool_schema_budget()
+    if len(full) <= budget:
+        return full, False, 0
+
+    names = [str(tool.get("name") or "") for tool in tool_defs]
+    priority_names = {
+        "tool_search",
+        "search_tools",
+        "list_tools",
+        "plugin_search",
+        "shell",
+        "shell_exec",
+        "exec_command",
+        "environment",
+        "get_environment",
+    }
+    signatures = [_compact_tool_signature(tool) for tool in tool_defs]
+    signatures.sort(
+        key=lambda item: (str(item.get("name") or "").lower() not in priority_names,)
+    )
+    payload: dict[str, Any] = {
+        "available_tools": names,
+        "signatures": [],
+        "omitted_signatures": len(signatures),
+    }
+    for signature in signatures:
+        candidate = dict(payload)
+        candidate["signatures"] = [*payload["signatures"], signature]
+        candidate["omitted_signatures"] = len(signatures) - len(
+            candidate["signatures"]
+        )
+        encoded = json.dumps(
+            candidate, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+        if len(encoded) > budget:
+            continue
+        payload = candidate
+    encoded = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    return encoded, True, int(payload["omitted_signatures"])
 
 
 def build_runtime_system_prompt(
@@ -453,32 +739,50 @@ def build_runtime_system_prompt(
     """Describe the caller-owned tool runtime and schemas to the raw model."""
 
     tool_defs = _normalized_tools(tools)
+    context = dict(client_context)
+    context.setdefault("tool_discovery", build_tool_discovery(tool_defs))
+    discovery = context.get("tool_discovery")
+    if tool_defs and isinstance(discovery, Mapping):
+        # The schema payload below already carries all tool names.
+        discovery = dict(discovery)
+        discovery.pop("declared_tools", None)
+        context["tool_discovery"] = discovery
     lines = [
-        "You are the language-model backend for an external Trae-compatible terminal client.",
-        "The external client owns the authoritative workspace and executes every filesystem, shell, edit, write, browser, and sub-agent tool.",
-        "Do not run or simulate tools in the upstream server environment, and do not describe that server's Linux filesystem as the user's environment.",
-        "Discover the local environment and installed plugin capabilities automatically from the client context and declared tools; do not ask the user to enumerate them first.",
-        "When a client tool_search or plugin discovery tool is available, call it proactively before claiming a capability is unavailable. When local OS, cwd, runtime, or executable facts are needed, use an available client shell or environment tool to inspect them.",
-        "Use only the client tools listed below. Request a tool call and wait for the client to return its result; never fabricate command output.",
-        "Never repeat a completed tool call with the same name and arguments after a successful result, and never repeat identical final-answer text in a loop.",
-        "A tool result is not a final answer when the user's requested checklist still has pending steps; continue with the next needed client tool until the checklist is complete.",
-        "Never echo relay-internal tool-history labels or protocol envelopes as an answer. If another tool is needed, emit a native tool call and wait for its result.",
-        "After a tool result arrives, continue from that result. For a final answer, do not emit a tool-call block.",
-        "Client context (authoritative JSON):",
-        json.dumps(client_context, ensure_ascii=False, separators=(",", ":"), default=str),
+        "You are Trae Code connected to the user's local application.",
+        "The external client application that started this conversation provides the client tools below.",
+        "Caller client context (JSON):",
+        json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str),
+        "Discover the local environment through the available client tools when the request requires it.",
+        "If a tool can answer the question, call it proactively and wait for the external client result.",
+        "Never repeat a completed tool call; do not describe that server's Linux filesystem as the caller workspace.",
+        "To use one, emit exactly one JSON block as your entire response and include no other text:",
+        '<opencode_tool_call>{"id":"call_unique","name":"tool_name","input":{}}</opencode_tool_call>',
+        "Fill input according to the selected tool schema and wait for the client result before continuing.",
     ]
-    discovery = build_tool_discovery(tools)
-    lines.extend(
-        [
-            "Auto-discovered client tool and plugin catalog (JSON):",
-            json.dumps(discovery, ensure_ascii=False, separators=(",", ":")),
-        ]
-    )
     if tool_defs and not native_tools:
+        tool_payload, compacted, omitted_signatures = _tool_definitions_prompt(
+            tool_defs
+        )
+        if compacted:
+            schema_label = (
+                "Available client tools and compact input signatures (JSON). "
+                "The full schema catalog exceeded the relay input budget"
+            )
+            if omitted_signatures:
+                schema_label += (
+                    f"; {omitted_signatures} signature(s) are name-only. "
+                    "Use an available tool_search/plugin discovery tool before "
+                    "guessing arguments"
+                )
+            schema_label += ":"
+        else:
+            schema_label = "Available client tool definitions and input schemas (JSON):"
         lines.extend(
             [
-                "Available client tool definitions and input schemas (JSON):",
-                json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"), default=str),
+                schema_label,
+                tool_payload,
+                "To call a tool, emit exactly one block per call in this format and no final answer in the same turn: <opencode_tool_call>{\"id\":\"call_unique\",\"name\":\"tool_name\",\"input\":{}}</opencode_tool_call>. Fill input according to the selected tool schema.",
+            "After the client returns a tool result, continue from that result until the user's request is complete.",
             ]
         )
     elif not tool_defs:
@@ -495,6 +799,98 @@ def build_runtime_system_prompt(
     if parallel_tool_calls is False:
         lines.append("Request at most one tool per turn.")
     return "\n".join(lines)
+
+
+def _raw_history_limit(
+    options: Mapping[str, Any], names: tuple[str, ...], env_name: str, default: int
+) -> int:
+    value = _option(options, *names, default=None)
+    if value is None:
+        value = os.environ.get(env_name, str(default))
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _raw_history_message_size(message: Mapping[str, Any]) -> int:
+    text = _content_to_text(message.get("content"))
+    if str(message.get("role") or "user") == "assistant" and text:
+        text = strip_tool_call_blocks(text)
+    tool_payload = message.get("tool_calls") or message.get("function_call")
+    if tool_payload:
+        text += json.dumps(
+            tool_payload, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+    return len(text)
+
+
+def _compact_raw_history(
+    messages: list[dict[str, Any]], options: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], int]:
+    """Keep unique system constraints and a bounded contiguous recent history."""
+
+    max_messages = _raw_history_limit(
+        options,
+        ("trae_raw_max_messages", "traeRawMaxMessages"),
+        "TRAE_RAW_MAX_MESSAGES",
+        80,
+    )
+    max_chars = _raw_history_limit(
+        options,
+        ("trae_raw_max_history_chars", "traeRawMaxHistoryChars"),
+        "TRAE_RAW_MAX_HISTORY_CHARS",
+        120000,
+    )
+    valid = [dict(message) for message in messages if isinstance(message, Mapping)]
+    if not valid:
+        return [], 0
+
+    system_indexes: list[int] = []
+    non_system_indexes: list[int] = []
+    seen_system: set[tuple[str, str]] = set()
+    for index, message in enumerate(valid):
+        role = str(message.get("role") or "user")
+        if role in {"system", "developer"}:
+            key = ("system", _content_to_text(message.get("content")))
+            if key not in seen_system:
+                seen_system.add(key)
+                system_indexes.append(index)
+        else:
+            non_system_indexes.append(index)
+
+    candidates = non_system_indexes[-max_messages:] if max_messages else non_system_indexes
+    if max_chars and candidates:
+        remaining = max(
+            0,
+            max_chars
+            - sum(_raw_history_message_size(valid[index]) for index in system_indexes),
+        )
+        kept_reversed: list[int] = []
+        used = 0
+        for index in reversed(candidates):
+            size = _raw_history_message_size(valid[index])
+            if kept_reversed and used + size > remaining:
+                break
+            kept_reversed.append(index)
+            used += size
+        candidates = list(reversed(kept_reversed))
+
+    # Do not begin a retained continuation with an orphaned tool result when
+    # the matching assistant call is the immediately preceding message.
+    if candidates and str(valid[candidates[0]].get("role") or "") == "tool":
+        first_position = non_system_indexes.index(candidates[0])
+        if first_position:
+            previous = non_system_indexes[first_position - 1]
+            previous_message = valid[previous]
+            if str(previous_message.get("role") or "") == "assistant" and (
+                previous_message.get("tool_calls") or previous_message.get("function_call")
+            ):
+                candidates.insert(0, previous)
+
+    keep = set(system_indexes) | set(candidates)
+    compacted = [message for index, message in enumerate(valid) if index in keep]
+    return compacted, len(valid) - len(compacted)
 
 
 def _serialize_tool_calls(tool_calls: Any) -> str:
@@ -661,12 +1057,21 @@ def build_raw_messages(
     if not messages:
         raise ValueError("messages cannot be empty")
     options = options or {}
+    original_message_count = len(messages)
+    messages, omitted_history = _compact_raw_history(messages, options)
+    if omitted_history:
+        logger.info(
+            "raw history compacted input_messages=%d output_messages=%d omitted=%d",
+            original_message_count,
+            len(messages),
+            omitted_history,
+        )
     tool_catalog = (
         options["tools"]
         if "tools" in options
         else options.get("_inherited_tools")
     )
-    native_tools = bool(
+    has_tool_protocol = bool(
         "tools" in options
         or "_inherited_tools" in options
         or any(
@@ -680,13 +1085,15 @@ def build_raw_messages(
         )
     )
     result: list[dict[str, Any]] = []
-    if native_tools or "client_context" in options or "clientContext" in options:
+    if has_tool_protocol or "client_context" in options or "clientContext" in options:
         runtime_prompt = build_runtime_system_prompt(
             tool_catalog,
             build_client_context(options),
             options.get("tool_choice"),
             options.get("parallel_tool_calls"),
-            native_tools=native_tools,
+            # llm_raw_chat has no native tools field. Schemas and the output
+            # envelope must therefore be explicit in the system message.
+            native_tools=False,
         )
         if options.get("_recover_suppressed_tool_call"):
             runtime_prompt += (
@@ -721,34 +1128,28 @@ def build_raw_messages(
             text = strip_tool_call_blocks(text)
         if role == "developer":
             role = "system"
+        elif role == "tool":
+            call_id = str(
+                message.get("tool_call_id") or message.get("toolCallId") or "unknown"
+            )
+            tool_name = str(message.get("name") or "tool")
+            text = f"Client tool result [{call_id}] {tool_name}:\n{text}"
+            role = "user"
         elif role not in ("system", "user", "assistant"):
-            if role == "tool":
-                # Trae accepts tool results as a native role with the original
-                # call id. This preserves the continuation relationship.
-                role = "tool"
-            else:
-                role = "user"
+            role = "user"
+        if role == "assistant":
+            call_context = _serialize_tool_call_context(tool_calls)
+            if not call_context and isinstance(message.get("function_call"), Mapping):
+                call_context = _serialize_tool_call_context([message["function_call"]])
+            if call_context:
+                text = "\n\n".join(part for part in (text, call_context) if part)
         native_message: dict[str, Any] = {"role": role}
         if text:
             native_message["content"] = [{"type": "text", "text": text}]
         elif role in ("system", "user"):
             continue
-        if role == "assistant":
-            native_calls = _native_assistant_tool_calls(tool_calls)
-            if not native_calls and isinstance(message.get("function_call"), Mapping):
-                native_calls = _native_assistant_tool_calls([message["function_call"]])
-            if native_calls:
-                native_message["tool_calls"] = native_calls
-            if not text and not native_calls:
-                continue
-        elif role == "tool":
-            native_message["tool_call_id"] = str(
-                message.get("tool_call_id") or message.get("toolCallId") or ""
-            )
-            if message.get("name"):
-                native_message["name"] = str(message["name"])
-            if not text:
-                native_message["content"] = [{"type": "text", "text": ""}]
+        if role == "assistant" and not text:
+            continue
         result.append(native_message)
     return result
 
@@ -760,59 +1161,40 @@ def build_raw_chat_body(
     *,
     session_id: Optional[str] = None,
 ) -> dict[str, Any]:
+    """Build the exact six-field payload accepted by ``llm_raw_chat``.
+
+    TraeWork carries tool schemas and tool history in text messages.  Sending
+    OpenAI ``tools`` or generation options beside these fields makes the raw
+    endpoint reject the request before the model can produce any output.
+    """
+
     options = options or {}
     resolved_model = resolve_raw_model(model, options)
     session_id = session_id or str(
         _option(options, "session_id", "sessionId", default=uuid.uuid4())
     )
-    request_id = str(uuid.uuid4())
     body: dict[str, Any] = {
+        "config_name": resolved_model.config_name,
+        "conversation_id": session_id,
         "messages": build_raw_messages(messages, options),
-        "model": resolved_model.raw_model_name,
-        "function": str(
-            _option(options, "raw_function", "function", default=None)
-            or os.environ.get("TRAE_RAW_FUNCTION")
-            or "inline_chat"
-        ),
-        "request_id": request_id,
+        "model_name": resolved_model.raw_model_name,
         "session_id": session_id,
         "stream": True,
     }
-    max_tokens = clamp_max_completion_tokens(
-        _option(options, "max_tokens", "maxTokens", "max_completion_tokens"),
-        resolved_model.raw_model_name,
-    )
-    if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
-        body["max_tokens"] = int(max_tokens)
-    tool_catalog = options.get("tools") if "tools" in options else options.get("_inherited_tools")
-    tool_choice = options.get("tool_choice")
-    selected_tool_name = _named_tool_choice(tool_choice)
-    if "tools" in options or "_inherited_tools" in options:
-        native_tools = _native_tool_definitions(tool_catalog)
-        if selected_tool_name:
-            native_tools = [
-                tool
-                for tool in native_tools
-                if str((tool.get("function") or {}).get("name") or "")
-                == selected_tool_name
-            ]
-        body["tools"] = native_tools
-    if "tool_choice" in options:
-        # Trae's protobuf/JSON adapter declares tool_choice as a string. Map
-        # OpenAI's named object to a required choice and expose only that
-        # definition upstream, preserving the named-choice semantics.
-        body["tool_choice"] = "required" if selected_tool_name else str(tool_choice)
-    if "parallel_tool_calls" in options:
-        body["parallel_tool_calls"] = bool(options.get("parallel_tool_calls"))
-    for key in RAW_GENERATION_FIELDS:
-        if key in options and options[key] is not None:
-            body[key] = copy.deepcopy(options[key])
     logger.info(
-        "raw body prepared id=%s keys=%s tools=%d native_history=%s",
-        str(options.get("_relay_request_id") or request_id),
+        "raw body prepared id=%s keys=%s tools=%d history_tools=%s",
+        str(options.get("_relay_request_id") or session_id),
         ",".join(sorted(body.keys())),
-        len(body.get("tools") or []),
-        any(isinstance(message, Mapping) and (message.get("tool_calls") or message.get("role") == "tool") for message in messages),
+        len(
+            _normalized_tools(
+                options.get("tools") or options.get("_inherited_tools")
+            )
+        ),
+        any(
+            isinstance(message, Mapping)
+            and (message.get("tool_calls") or message.get("role") == "tool")
+            for message in messages
+        ),
     )
     return body
 
@@ -823,6 +1205,8 @@ def build_raw_headers(
     raw_model: RawModel,
     request_id: str,
     options: Optional[Mapping[str, Any]] = None,
+    *,
+    session_id: str = "",
 ) -> dict[str, str]:
     options = options or {}
     app_id = str(
@@ -841,6 +1225,11 @@ def build_raw_headers(
         or os.environ.get("TRAE_RAW_IDE_VERSION")
         or os.environ.get("TRAE_IDE_VERSION")
         or RAW_IDE_VERSION
+    )
+    ide_function = str(
+        _option(options, "ide_function", "ideFunction", default=None)
+        or os.environ.get("TRAE_RAW_IDE_FUNCTION")
+        or RAW_IDE_FUNCTION
     )
     # Reuse the same device/request headers as the normal IDE client.  The
     # upstream accepts these headers as a client fingerprint; the old raw
@@ -877,8 +1266,38 @@ def build_raw_headers(
     put("Connection", "keep-alive")
     put("X-App-Id", app_id)
     put("X-Ide-Version-Code", ide_version_code)
-    put("X-Ide-Version", ide_version)
+    put("X-Ide-Function", ide_function)
+    if ide_version:
+        put("X-Ide-Version", ide_version)
+    else:
+        for key in list(headers):
+            if key.lower() == "x-ide-version":
+                del headers[key]
     put("X-Request-Id", request_id)
+    if session_id:
+        extra = {
+            "agent_loop_id": session_id,
+            "api_host": base_url,
+            "api_key": token,
+            "base_url": f"{base_url}/trae-cli/api/v1/llm/proxy",
+            "config_name": raw_model.config_name,
+            "config_source": raw_model.config_source,
+            "display_name": raw_model.display_name,
+            "model_name": raw_model.raw_model_name,
+            "real_api_key": "",
+            "real_base_url": "",
+            "session_id": session_id,
+            "user_prompt_submit_id": session_id,
+        }
+        put(
+            "Extra",
+            json.dumps(
+                # HTTP header values must remain ASCII.  The JSON body can
+                # carry UTF-8 directly, but model display names such as
+                # ``DeepSeek-V4-Flash 正式版`` also appear in Extra.
+                extra, ensure_ascii=True, separators=(",", ":"), default=str
+            ),
+        )
     if user_id:
         put("X-Uid", user_id)
     else:
@@ -917,11 +1336,25 @@ async def send_raw_chat_request(
     options = options or {}
     base_url = resolve_raw_base_url(options)
     raw_model = await resolve_raw_model_for_request(model, options)
+    session_options = dict(options)
+    session_options.setdefault("_auth_token", token)
+    upstream_session_id = raw_session_id(raw_model, session_options)
     body_options = dict(options)
+    body_options.setdefault("config_name", raw_model.config_name)
     body_options.setdefault("raw_model_name", raw_model.raw_model_name)
-    body = build_raw_chat_body(messages, model, body_options)
-    request_id = str(body["request_id"])
-    headers = build_raw_headers(base_url, token, raw_model, request_id, options)
+    body_options.setdefault("display_name", raw_model.display_name)
+    body = build_raw_chat_body(
+        messages, model, body_options, session_id=upstream_session_id
+    )
+    request_id = str(uuid.uuid4())
+    headers = build_raw_headers(
+        base_url,
+        token,
+        raw_model,
+        request_id,
+        options,
+        session_id=upstream_session_id,
+    )
     logger.info(
         "raw upstream request id=%s url=%s body_bytes=%d messages=%d model=%s fields=%s tools=%d",
         str((options or {}).get("_relay_request_id") or request_id),
@@ -930,15 +1363,23 @@ async def send_raw_chat_request(
         len(body.get("messages") or []),
         raw_model.raw_model_name,
         ",".join(sorted(body.keys())),
-        len(body.get("tools") or []),
+        len(_normalized_tools(options.get("tools") or options.get("_inherited_tools"))),
     )
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
+
+    release_session = await _acquire_raw_session_gate(upstream_session_id)
+
     def open_stream() -> RawChatResponse:
-        client = httpx.Client(timeout=timeout, http2=False)
+        client: Optional[httpx.Client] = None
         response: Optional[httpx.Response] = None
         try:
+            client = httpx.Client(timeout=timeout, http2=False)
             request = client.build_request(
-                "POST", base_url + RAW_CHAT_ENDPOINT, headers=headers, json=body
+                "POST",
+                base_url
+                + str(os.environ.get("TRAE_RAW_CHAT_ENDPOINT") or RAW_CHAT_ENDPOINT),
+                headers=headers,
+                json=body,
             )
             response = client.send(request, stream=True)
             if response.status_code != 200:
@@ -948,14 +1389,55 @@ async def send_raw_chat_request(
                     f"Trae raw chat request failed with {response.status_code}"
                     + (f": {detail}" if detail else "")
                 )
-            return RawChatResponse(response=response, client=client, auth_token=token)
-        except Exception:
-            if response is not None:
-                response.close()
-            client.close()
+            return RawChatResponse(
+                response=response,
+                client=client,
+                auth_token=token,
+                release_session=release_session,
+            )
+        except BaseException:
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                try:
+                    if client is not None:
+                        client.close()
+                finally:
+                    release_session()
             raise
 
     # Opening a sync httpx stream can spend several seconds waiting for Trae's
     # response headers.  Do that work off the uvicorn event loop so the public
     # SSE connection can emit its lifecycle/keepalive frames immediately.
-    return await asyncio.to_thread(open_stream)
+    try:
+        open_task = asyncio.create_task(asyncio.to_thread(open_stream))
+    except BaseException:
+        release_session()
+        raise
+
+    try:
+        return await asyncio.shield(open_task)
+    except asyncio.CancelledError:
+        # ``to_thread`` cannot cancel a synchronous httpx send already in
+        # progress. Close the response as soon as it materializes so the
+        # model-bound gate is still released without allowing an overlapping
+        # request on the same raw conversation.
+        def close_cancelled_open(task: asyncio.Task[RawChatResponse]) -> None:
+            try:
+                wrapped = task.result()
+            except BaseException:
+                release_session()
+                return
+            try:
+                wrapped.close()
+            except Exception as exc:
+                logger.warning("raw cancelled response cleanup failed: %s", exc)
+
+        open_task.add_done_callback(close_cancelled_open)
+        raise
+    except BaseException:
+        # ``open_stream`` releases on every internal failure. This idempotent
+        # fallback also covers task/executor setup failures before it starts.
+        release_session()
+        raise

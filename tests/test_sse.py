@@ -129,6 +129,286 @@ def _parse_chunks(chunks):
 
 
 class TranslateCliStreamTests(unittest.TestCase):
+    def test_provider_qualified_deepseek_model_matches_requested_family(self):
+        sse._check_provider_model("DeepSeek-V4-Pro", "ali-deepseek-v4-pro")
+
+    def test_provider_family_normalizes_only_known_trae_decorations(self):
+        matching = [
+            ("DeepSeek-V4-Pro", "ali-deepseek-v4-pro-0813"),
+            ("DeepSeek-V4-Pro", "ali-deepseek-v4-pro-0813__dev"),
+            ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro__v2"),
+            ("DeepSeek-V4-Pro 正式版", "ali-deepseek-v4-pro-0813"),
+            ("DeepSeek-V4-Flash", "ali-deepseek-v4-flash"),
+            (
+                "DeepSeek-V4-Flash-Official",
+                "ali-deepseek-v4-flash-Official__v2",
+            ),
+            ("glm-5.3", "glm-5.3__dev"),
+            ("glm-5.3", "glm-5.3__v2"),
+        ]
+        for requested, actual in matching:
+            with self.subTest(requested=requested, actual=actual):
+                sse._check_provider_model(requested, actual)
+
+        with self.assertRaises(sse.ModelProviderMismatch):
+            sse._check_provider_model(
+                "DeepSeek-V4-Pro-Official", "kimi-k2.6__v2"
+            )
+
+    def test_native_pascal_and_camel_case_events_are_normalized(self):
+        class GuardedResponse:
+            def iter_lines(self):
+                yield "Event: modelConfig"
+                yield 'Data: {"modelName":"glm-5.3__v2"}'
+                yield "Event: output"
+                yield 'Data: {"response":"native complete"}'
+                yield "Event: tokenUsage"
+                yield (
+                    'Data: {"inputToken":5,"outputToken":2,'
+                    '"totalToken":7,"creditsFloat":0.2}'
+                )
+                yield "Event: Done"
+                yield 'Data: {"stopReason":"stop"}'
+                raise AssertionError("read past native Done event")
+
+        result = asyncio.run(
+            sse.collect_nonstream_ide(GuardedResponse(), "glm-5.3")
+        )
+        self.assertEqual(
+            result["choices"][0]["message"]["content"], "native complete"
+        )
+        self.assertEqual(result["provider_model_name"], "glm-5.3__v2")
+        self.assertEqual(
+            result["usage"],
+            {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "total_tokens": 7,
+                "credits_consumed": 0.2,
+            },
+        )
+
+    def test_data_event_type_camel_case_is_normalized(self):
+        response = _LineResponse(
+            [
+                'data: {"eventType":"requestWaitInQueue","position":1}',
+                'data: {"eventType":"output","response":"ready"}',
+                'data: {"eventType":"Done","finishReason":"stop"}',
+            ]
+        )
+        chunks = asyncio.run(
+            _collect(sse.translate_ide_stream(response, "m", True))
+        )
+        parsed, done = _parse_chunks(chunks)
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertIn("位置：1", content)
+        self.assertTrue(content.endswith("ready"))
+        self.assertTrue(done)
+
+    def test_ide_provider_mismatch_is_not_presented_as_requested_model(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"fallback"}',
+                'data: {"timing_cost":{"provider_model_name":"kimi-k2.6"}}',
+                "data: [DONE]",
+            ]
+        )
+
+        with self.assertRaises(sse.ModelProviderMismatch):
+            asyncio.run(_collect(sse.translate_ide_stream(response, "glm-5.3", True)))
+
+    def test_ide_provider_name_is_exposed_on_terminal_chunk(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"ok"}',
+                'data: {"timing_cost":{"provider_model_name":"glm-5.3__dev"}}',
+                "data: [DONE]",
+            ]
+        )
+        chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "glm-5.3", True)))
+        parsed, done = _parse_chunks(chunks)
+        terminal = [item for item in parsed if item.get("provider_model_name")]
+        self.assertEqual(terminal[-1]["provider_model_name"], "glm-5.3__dev")
+        self.assertTrue(done)
+
+    def test_timing_events_internal_model_id_is_ignored(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"ok"}',
+                'data: {"event":"timing_events","model_name":"eFs8axOnhnVU4aIQm9b4"}',
+                "data: [DONE]",
+            ]
+        )
+        chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "glm-5.3", True)))
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        self.assertFalse(any(item.get("provider_model_name") for item in parsed))
+
+    def test_nested_internal_model_id_is_ignored(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"ok"}',
+                'data: {"data":{"model_name":"eFs8axOnhnVU4aIQm9b4"}}',
+                "data: [DONE]",
+            ]
+        )
+        chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "glm-5.3", True)))
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        self.assertFalse(any(item.get("provider_model_name") for item in parsed))
+
+    def test_model_config_model_name_is_exposed(self):
+        response = _LineResponse(
+            [
+                'data: {"event":"model_config","model_name":"glm-5.3__dev"}',
+                'data: {"response":"ok"}',
+                "data: [DONE]",
+            ]
+        )
+        chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "glm-5.3", True)))
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        self.assertEqual(
+            [item["provider_model_name"] for item in parsed if item.get("provider_model_name")][-1],
+            "glm-5.3__dev",
+        )
+
+    def test_model_config_reply_to_message_id_is_captured_privately(self):
+        response = _LineResponse(
+            [
+                "event: model_config",
+                'data: {"model_name":"glm-5.3__dev","reply_to_message_id":"turn-1"}',
+                'data: {"response":"ok"}',
+                "data: [DONE]",
+            ]
+        )
+        metadata = {}
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_ide_stream(
+                    response,
+                    "glm-5.3",
+                    True,
+                    upstream_metadata=metadata,
+                )
+            )
+        )
+        self.assertEqual(metadata, {"usage_turn_id": "turn-1"})
+        self.assertNotIn("turn-1", "".join(chunks))
+
+    def test_stream_usage_turn_id_variants_are_captured_privately(self):
+        cases = [
+            (
+                "reply snake",
+                {"reply_to_message_id": "stream-reply-snake"},
+                "stream-reply-snake",
+            ),
+            (
+                "reply camel",
+                {"replyToMessageId": "stream-reply-camel"},
+                "stream-reply-camel",
+            ),
+            (
+                "user snake",
+                {"user_message_id": "stream-user-snake"},
+                "stream-user-snake",
+            ),
+            (
+                "user camel",
+                {"userMessageId": "stream-user-camel"},
+                "stream-user-camel",
+            ),
+            (
+                "nested snake",
+                {"model_config": {"reply_to_message_id": "stream-nested-snake"}},
+                "stream-nested-snake",
+            ),
+            (
+                "nested camel",
+                {"modelConfig": {"userMessageId": "stream-nested-camel"}},
+                "stream-nested-camel",
+            ),
+            (
+                "nested data",
+                {
+                    "data": {
+                        "modelConfig": {
+                            "replyToMessageId": "stream-nested-data"
+                        }
+                    }
+                },
+                "stream-nested-data",
+            ),
+        ]
+
+        for label, payload, turn_id in cases:
+            with self.subTest(label=label):
+                response = _LineResponse(
+                    [
+                        "event: model_config",
+                        "data: " + json.dumps(payload),
+                        'data: {"response":"ok"}',
+                        "data: [DONE]",
+                    ]
+                )
+                metadata = {}
+                chunks = asyncio.run(
+                    _collect(
+                        sse.translate_ide_stream(
+                            response,
+                            "m",
+                            True,
+                            upstream_metadata=metadata,
+                        )
+                    )
+                )
+                wire = "".join(chunks)
+
+                self.assertEqual(metadata, {"usage_turn_id": turn_id})
+                self.assertNotIn(turn_id, wire)
+                self.assertNotIn("reply_to_message_id", wire)
+                self.assertNotIn("replyToMessageId", wire)
+                self.assertNotIn("user_message_id", wire)
+                self.assertNotIn("userMessageId", wire)
+                parsed, done = _parse_chunks(chunks)
+                self.assertTrue(done)
+                self.assertTrue(
+                    any(
+                        choice.get("delta", {}).get("content") == "ok"
+                        for item in parsed
+                        for choice in item.get("choices", [])
+                    )
+                )
+
+    def test_done_message_id_is_not_used_as_usage_turn_id(self):
+        for key in ("message_id", "messageId"):
+            with self.subTest(key=key):
+                response = _LineResponse(
+                    [
+                        'data: {"response":"ok"}',
+                        "event: done",
+                        "data: " + json.dumps({key: "agent-message-1"}),
+                    ]
+                )
+                metadata = {}
+                chunks = asyncio.run(
+                    _collect(
+                        sse.translate_ide_stream(
+                            response,
+                            "m",
+                            True,
+                            upstream_metadata=metadata,
+                        )
+                    )
+                )
+
+                self.assertEqual(metadata, {})
+                self.assertNotIn("agent-message-1", "".join(chunks))
+
     def test_translate_cli_stream(self):
         chunks = asyncio.run(_collect(sse.translate_cli_stream(_cli_events(), "m", True)))
         parsed, done = _parse_chunks(chunks)
@@ -338,6 +618,7 @@ class TranslateCliStreamTests(unittest.TestCase):
                     {"response": "once", "finish_reason": "stop"}
                 )
                 yield "data: " + json.dumps({"response": "once and continued"})
+                yield "data: [DONE]"
 
         chunks = asyncio.run(
             _collect(sse.translate_ide_stream(GuardedResponse(), "m", True))
@@ -358,6 +639,45 @@ class TranslateCliStreamTests(unittest.TestCase):
         self.assertEqual(terminal, ["stop"])
         self.assertTrue(done)
         self.assertEqual(chunks.count("data: [DONE]\n\n"), 1)
+
+    def test_ide_eof_without_terminal_is_reported_as_incomplete(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"partial","stop_reason":"max_tokens"}',
+                'data: {"response":"partial and still growing"}',
+            ]
+        )
+        with self.assertRaises(sse.IncompleteUpstreamResponse):
+            asyncio.run(_collect(sse.translate_ide_stream(response, "m", True)))
+
+    def test_raw_v2_eof_is_a_valid_terminal_boundary(self):
+        response = _LineResponse(
+            [
+                'event: output',
+                'data: {"response":"complete at eof"}',
+                'event: token_usage',
+                'data: {"input_token":5,"output_token":2}',
+            ]
+        )
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_ide_stream(
+                    response,
+                    "m",
+                    True,
+                    fail_on_empty=True,
+                    require_terminal=False,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for item in parsed
+            for choice in item.get("choices", [])
+        )
+        self.assertEqual(content, "complete at eof")
+        self.assertTrue(done)
 
     def test_sync_ide_reader_does_not_block_event_loop(self):
         class SlowResponse:
@@ -420,6 +740,7 @@ class TranslateCliStreamTests(unittest.TestCase):
                 'data: {"event":"request_wait_in_queue","position":2}',
                 'data: {"event":"request_wait_in_queue","position":1}',
                 'data: {"finish_reason":"stop"}',
+                "data: [DONE]",
             ]
         )
         chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "m", True)))
@@ -454,6 +775,113 @@ class TranslateCliStreamTests(unittest.TestCase):
             raise AssertionError("empty probe did not raise")
 
         self.assertEqual(asyncio.run(run()), [])
+
+    def test_ide_empty_probe_with_usage_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                'event: token_usage',
+                'data: {"input_token":12,"output_token":1,"credits_float":0.25}',
+                'event: done',
+                'data: {"finish_reason":"stop"}',
+            ]
+        )
+
+        async def run():
+            async for _chunk in sse.translate_ide_stream(
+                response, "m", True, fail_on_empty=True
+            ):
+                pass
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(run())
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertEqual(
+            raised.exception.usage,
+            {
+                "prompt_tokens": 12,
+                "completion_tokens": 1,
+                "total_tokens": 13,
+                "credits_consumed": 0.25,
+            },
+        )
+
+    def test_ide_empty_probe_with_usage_turn_id_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                "event: model_config",
+                'data: {"replyToMessageId":"accepted-turn"}',
+                "event: done",
+                'data: {"finish_reason":"stop"}',
+            ]
+        )
+        metadata = {}
+
+        async def run():
+            async for _chunk in sse.translate_ide_stream(
+                response,
+                "m",
+                True,
+                fail_on_empty=True,
+                upstream_metadata=metadata,
+            ):
+                pass
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(run())
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertEqual(metadata["usage_turn_id"], "accepted-turn")
+
+    def test_ide_empty_probe_with_only_nested_usage_turn_id_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                "event: model_config",
+                'data: {"model_config":{"reply_to_message_id":"accepted-nested"}}',
+                "event: done",
+                "data: {}",
+            ]
+        )
+        metadata = {}
+
+        async def run():
+            chunks = []
+            try:
+                async for chunk in sse.translate_ide_stream(
+                    response,
+                    "m",
+                    True,
+                    fail_on_empty=True,
+                    upstream_metadata=metadata,
+                ):
+                    chunks.append(chunk)
+            except sse.EmptyUpstreamResponse as exc:
+                return chunks, exc
+            raise AssertionError("empty probe did not raise")
+
+        chunks, error = asyncio.run(run())
+        self.assertEqual(chunks, [])
+        self.assertFalse(error.retryable)
+        self.assertTrue(error.observed_model_event)
+        self.assertIsNone(error.usage)
+        self.assertEqual(metadata, {"usage_turn_id": "accepted-nested"})
+
+    def test_ide_incomplete_after_visible_output_is_not_retryable(self):
+        response = _LineResponse(['data: {"response":"partial"}'])
+
+        async def run():
+            async for _chunk in sse.translate_ide_stream(
+                response, "m", True, fail_on_empty=True
+            ):
+                pass
+
+        with self.assertRaises(sse.IncompleteUpstreamResponse) as raised:
+            asyncio.run(run())
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
 
     def test_ide_probe_starts_stream_as_soon_as_text_arrives(self):
         response = _LineResponse(
@@ -1082,6 +1510,167 @@ class CollectNonstreamCliTests(unittest.TestCase):
 
 
 class CollectNonstreamIdeTests(unittest.TestCase):
+    def test_usage_turn_id_variants_are_captured_privately(self):
+        cases = [
+            (
+                "reply snake",
+                {"reply_to_message_id": "nonstream-reply-snake"},
+                "nonstream-reply-snake",
+            ),
+            (
+                "reply camel",
+                {"replyToMessageId": "nonstream-reply-camel"},
+                "nonstream-reply-camel",
+            ),
+            (
+                "user snake",
+                {"user_message_id": "nonstream-user-snake"},
+                "nonstream-user-snake",
+            ),
+            (
+                "user camel",
+                {"userMessageId": "nonstream-user-camel"},
+                "nonstream-user-camel",
+            ),
+            (
+                "nested snake",
+                {
+                    "model_config": {
+                        "user_message_id": "nonstream-nested-snake"
+                    }
+                },
+                "nonstream-nested-snake",
+            ),
+            (
+                "nested camel",
+                {
+                    "modelConfig": {
+                        "replyToMessageId": "nonstream-nested-camel"
+                    }
+                },
+                "nonstream-nested-camel",
+            ),
+            (
+                "nested data",
+                {
+                    "data": {
+                        "model_config": {
+                            "userMessageId": "nonstream-nested-data"
+                        }
+                    }
+                },
+                "nonstream-nested-data",
+            ),
+        ]
+
+        for label, payload, turn_id in cases:
+            with self.subTest(label=label):
+                response = _LineResponse(
+                    [
+                        "event: model_config",
+                        "data: " + json.dumps(payload),
+                        'data: {"response":"ok"}',
+                        "data: [DONE]",
+                    ]
+                )
+                metadata = {}
+                result = asyncio.run(
+                    sse.collect_nonstream_ide(
+                        response,
+                        "m",
+                        upstream_metadata=metadata,
+                    )
+                )
+                public_json = json.dumps(result)
+
+                self.assertEqual(metadata, {"usage_turn_id": turn_id})
+                self.assertEqual(
+                    result["choices"][0]["message"]["content"], "ok"
+                )
+                self.assertNotIn(turn_id, public_json)
+                self.assertNotIn("reply_to_message_id", public_json)
+                self.assertNotIn("replyToMessageId", public_json)
+                self.assertNotIn("user_message_id", public_json)
+                self.assertNotIn("userMessageId", public_json)
+
+    def test_done_message_id_variants_are_not_used_as_usage_turn_id(self):
+        for key in ("message_id", "messageId"):
+            with self.subTest(key=key):
+                response = _LineResponse(
+                    [
+                        'data: {"response":"ok"}',
+                        "event: done",
+                        "data: " + json.dumps({key: "assistant-message"}),
+                    ]
+                )
+                metadata = {}
+                result = asyncio.run(
+                    sse.collect_nonstream_ide(
+                        response,
+                        "m",
+                        upstream_metadata=metadata,
+                    )
+                )
+
+                self.assertEqual(metadata, {})
+                self.assertNotIn("assistant-message", json.dumps(result))
+
+    def test_empty_response_with_only_nested_usage_turn_id_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                "event: model_config",
+                'data: {"modelConfig":{"replyToMessageId":"nonstream-accepted"}}',
+                "event: done",
+                "data: {}",
+            ]
+        )
+        metadata = {}
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(
+                sse.collect_nonstream_ide(
+                    response,
+                    "m",
+                    fail_on_empty=True,
+                    upstream_metadata=metadata,
+                )
+            )
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertIsNone(raised.exception.usage)
+        self.assertEqual(metadata, {"usage_turn_id": "nonstream-accepted"})
+
+    def test_eof_without_terminal_is_reported_as_incomplete(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"partial","stop_reason":"max_tokens"}',
+                'data: {"response":"partial and still growing"}',
+            ]
+        )
+        with self.assertRaises(sse.IncompleteUpstreamResponse):
+            asyncio.run(sse.collect_nonstream_ide(response, "m"))
+
+    def test_raw_v2_nonstream_accepts_eof_after_output(self):
+        response = _LineResponse(
+            [
+                'event: output',
+                'data: {"response":"complete at eof"}',
+                'event: token_usage',
+                'data: {"input_token":5,"output_token":2}',
+            ]
+        )
+        result = asyncio.run(
+            sse.collect_nonstream_ide(
+                response,
+                "m",
+                fail_on_empty=True,
+                require_terminal=False,
+            )
+        )
+        self.assertEqual(result["choices"][0]["message"]["content"], "complete at eof")
+        self.assertEqual(result["usage"]["total_tokens"], 7)
+
     def test_empty_probe_raises_before_placeholder_is_created(self):
         response = _LineResponse(
             ['data: {"finish_reason":"stop"}', "data: [DONE]"]
@@ -1213,6 +1802,27 @@ class CollectNonstreamIdeTests(unittest.TestCase):
 
 
 class WebEventTests(unittest.TestCase):
+    def test_web_hyphenated_keepalive_is_ignored(self):
+        async def events():
+            yield "keep-alive", {"message": "heartbeat"}
+            yield "planItem", {"id": "answer", "thought": "complete"}
+            yield "Done", {"stopReason": "stop"}
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(result["choices"][0]["message"]["content"], "complete")
+
+    def test_web_camel_case_events_stop_without_reading_replayed_data(self):
+        async def events():
+            yield "planItem", {"id": "answer", "thought": "complete"}
+            yield "tokenUsage", {"inputToken": 3, "outputToken": 1}
+            yield "Done", {"stopReason": "max_tokens"}
+            raise AssertionError("read past web Done event")
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(result["choices"][0]["message"]["content"], "complete")
+        self.assertEqual(result["choices"][0]["finish_reason"], "length")
+        self.assertEqual(result["usage"]["total_tokens"], 4)
+
     def test_interleaved_plan_updates_do_not_replay_later_items(self):
         async def events():
             yield "plan_item", {"id": "a", "thought": "A"}
@@ -1261,6 +1871,128 @@ class WebEventTests(unittest.TestCase):
         self.assertTrue(done)
         self.assertEqual(parsed[-1]["choices"][0]["finish_reason"], "length")
 
+
+
+    def test_web_message_event_content_is_translated(self):
+        async def events():
+            yield "message", {
+                "content": [{"type": "text", "text": "Hello "}],
+            }
+            yield "message", {
+                "content": [{"type": "text", "text": "Hello world"}],
+            }
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, done = _parse_chunks(chunks)
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertIn("Hello world", content)
+        self.assertTrue(done)
+
+    def test_web_empty_stream_yields_visible_placeholder(self):
+        async def events():
+            yield "heartbeat", {"ts": 1}
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, done = _parse_chunks(chunks)
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertIn("trae upstream returned an empty response", content)
+        self.assertTrue(done)
+
+    def test_web_empty_nonstream_uses_placeholder(self):
+        async def events():
+            yield "done", {}
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(
+            result["choices"][0]["message"]["content"],
+            "(trae upstream returned an empty response)",
+        )
+    def test_web_empty_stream_fail_on_empty_raises(self):
+        async def events():
+            yield "heartbeat", {"ts": 1}
+            yield "done", {}
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(_collect(sse.translate_web_events(events(), "m", fail_on_empty=True)))
+        self.assertTrue(raised.exception.retryable)
+        self.assertIsNone(raised.exception.usage)
+
+    def test_web_empty_stream_fail_on_empty_emits_no_data_frame(self):
+        async def events():
+            yield "done", {}
+
+        collected = []
+
+        async def run():
+            async for chunk in sse.translate_web_events(
+                events(), "m", fail_on_empty=True
+            ):
+                collected.append(chunk)
+
+        with self.assertRaises(sse.EmptyUpstreamResponse):
+            asyncio.run(run())
+        self.assertEqual(collected, [])
+
+    def test_web_nonempty_fail_on_empty_emits_role_then_content(self):
+        async def events():
+            yield "message", {"content": [{"type": "text", "text": "hi"}]}
+            yield "done", {}
+
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(events(), "m", fail_on_empty=True)
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        roles = [
+            choice["delta"].get("role")
+            for event in parsed
+            for choice in event.get("choices", [])
+            if choice.get("delta", {}).get("role")
+        ]
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertEqual(roles, ["assistant"])
+        self.assertIn("hi", content)
+        self.assertTrue(done)
+
+    def test_web_observed_usage_marks_empty_response_not_retryable(self):
+        async def events():
+            yield "token_usage", {"prompt_tokens": 3, "completion_tokens": 0}
+            yield "done", {}
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(
+                _collect(
+                    sse.translate_web_events(events(), "m", fail_on_empty=True)
+                )
+            )
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.usage.get("prompt_tokens"), 3)
+
+    def test_web_empty_nonstream_fail_on_empty_raises(self):
+        async def events():
+            yield "done", {}
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(
+                sse.collect_nonstream_web(events(), "m", fail_on_empty=True)
+            )
+        self.assertTrue(raised.exception.retryable)
+        self.assertIsNone(raised.exception.usage)
 
 if __name__ == "__main__":
     unittest.main()

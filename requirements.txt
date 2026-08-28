@@ -3,3 +3,6 @@ uvicorn>=0.30,<1
 httpx>=0.27,<1
 python-dotenv>=1.0,<2
 cryptography>=42,<50
+# Required by the Windows TraeWork native helper for AHA DEALER/ROUTER IPC.
+# Linux relay deployments may omit this dependency when UPSTREAM_MODE is raw/remote.
+pyzmq>=26,<28

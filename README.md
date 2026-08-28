@@ -11,8 +11,8 @@ Trae CN / Trae Solo CN 模型与工具调用反代。把 Trae 终端协议包装
 - OpenAI `tools` / `tool_choice` / `parallel_tool_calls` 兼容，流式输出标准 `delta.tool_calls`
 - Codex Responses API 兼容：支持文本流、`function_call`、`custom_tool_call`、namespace 工具及 `*_call_output` 续轮
 - 调用方工具桥接：请求中声明的 Windows 工作区、Shell、读写和编辑工具由 API 调用方执行，relay 只转发调用与结果
-- 五种上游模式：Trae raw chat、9router 风格 remote 会话、Trae CLI 子进程、旧版网页 remote、IDE chat 端点
-- `auto` 与 `raw` 都只直连 Trae 原生 `llm_utils_chat`，不会把请求留在 relay 缓存，也不会回退到 CLI/remote/web/IDE 模拟路径
+- 六种上游模式：Trae raw chat、9router 风格 remote 会话、Trae CLI 子进程、旧版网页 remote、IDE chat 端点、可选 TraeWork native bridge
+- `auto` 与 `raw` 都只直连 Trae raw v2 `llm_raw_chat`，不会把请求留在 relay 缓存，也不会回退到 CLI/remote/web/IDE 模拟路径
 - 多账号管理：网页 UI 添加/切换/删除账号，round-robin 轮询
 - 网页 OAuth 登录：在浏览器中直接授权，无需手动抓取 JWT
 - 多账号轮询：每次请求自动切换到下一个有效账号，突破单账号并发限制
@@ -88,10 +88,22 @@ docker compose up -d --build
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TRAE_AUTH_SOURCE` | `auto` | 认证来源 |
-| `UPSTREAM_MODE` | `raw` | 上游模式：`auto` 与 `raw` 均只直连 `llm_utils_chat`；其他兼容模式需显式选择 `remote`（或 `9router`）/ `cli` / `web` / `ide` |
+| `UPSTREAM_MODE` | `remote` | 上游模式：remote 默认先用 `solo_agent_remote`，创建失败或首个模型事件前空响应时最多回退一次 `solo_work_remote`；其他兼容模式可显式选择 `raw` / `cli` / `web` / `ide` |
 | `TRAE_CHECKIN_INTERVAL_SECONDS` | `60` | 多账号轮询时相邻实际签到请求的间隔 |
 | `TRAE_CHECKIN_9074_RETRY_SECONDS` | `60` | 上游返回业务码 9074 后提示的最短重试等待时间；relay 不会立即重复 claim |
-| `TRAE_RAW_BASE_URL` | `https://trae-api-cn.mchost.guru` | Trae 原生 `llm_utils_chat` 网关；账号站 `api.trae.com.cn` 不提供此模型端点 |
+| `TRAE_RAW_BASE_URL` | `https://trae-api-cn.mchost.guru` | Trae raw v2 `llm_raw_chat` 网关；账号站 `api.trae.com.cn` 不提供此模型端点 |
+| `TRAE_RAW_MAX_MESSAGES` | `80` | raw 请求保留的非系统历史消息上限；会保留最近连续历史及边界工具调用配对 |
+| `TRAE_RAW_MAX_HISTORY_CHARS` | `120000` | raw 历史文本字符上限，避免重复工具 schema 和过长历史造成额外消费 |
+| `TRAE_RAW_MAX_TOOL_SCHEMA_CHARS` | `48000` | raw 系统提示中的工具 schema 字符预算；超限时保留全部工具名并压缩为字段签名，减少输入积分消耗 |
+| `TRAE_REMOTE_ONLY_MODELS` | 空 | 仅将列出的显式模型强制送往 remote；逗号分隔，`*` 表示全部强制 remote |
+| `TRAE_REMOTE_MAX_MESSAGES` | `500` | remote 会话保留的非系统历史消息上限 |
+| `TRAE_REMOTE_MAX_HISTORY_CHARS` | `480000` | remote 历史文本字符上限（压缩阶段） |
+| `TRAE_REMOTE_QUERY_MAX_CHARS` | `480000` | remote 扁平化 query 的硬上限；上游超过约 500K 字符会静默结束事件流，超限时从最早的非系统消息开始裁剪 |
+| `TRAE_REMOTE_MAX_MODE` | `0` | remote 会话启用 1M Max 模式；对账号配置 `max_mode=true` 的模型注入 `strategy=max` 与 1M/936K/64K 参数，并使用独立的 max 会话 ID |
+| `TRAE_REMOTE_MAX_MODELS` | 空 | Max 模型白名单，逗号分隔；留空表示所有 `max_mode=true` 模型生效 |
+| `TRAE_REMOTE_MAX_MODE_TYPE` | `1` | 服务端 `get_model_selection_modes` 的模式枚举；`1` 已实测生效 |
+| `TRAE_REMOTE_AGENT_FIRST` | `1` | remote 是否默认锁定 Agent 执行器；关闭后普通请求直接使用 Work |
+| `TRAE_REMOTE_WORK_FALLBACK` | `1` | Agent 创建失败或可重试空响应时，是否同账号回退一次 Work |
 | `TRAE_CLIENT_WORKSPACE_PATH` | `C:\workspace` | 未传 `client_context` 时使用的调用方工作区 |
 | `TRAE_CLIENT_SYSTEM_TYPE` | `Windows` | 未传 `client_context` 时使用的调用方系统 |
 | `TRAE_CLI_DISALLOWED_TOOLS` | `Read,Bash,Edit,Replace,Write,Glob,Grep,Task` | CLI 模式额外禁用的 relay 本机工具；外部工具请求会与默认项合并 |
@@ -101,13 +113,16 @@ docker compose up -d --build
 | `TRAE_FETCH_MODEL_LIST` | `false` | `/v1/models` 是否从上游拉取真实模型列表 |
 | `SSE_HEARTBEAT_SECONDS` | `1` | Chat/Responses 上游空窗时发送标准 SSE 注释心跳；`0` 为关闭 |
 | `TRAE_USAGE_RECORDS_PATH` | `data/usage_records.json` | 消费记录独立持久化文件，不改写 `data/accounts.json` |
+| `TRAE_USAGE_SESSION_QUERY` | `true` | 有上游回合 ID 时异步查询精确积分；失败自动回退账号快照差值 |
+| `TRAE_USAGE_API_HOST` | `https://api5-normal.mchost.guru` | TraeWork 商业用量查询主机，不与 entitlement API 混用 |
+| `TRAE_USAGE_QUERY_TIMEOUT_SECONDS` | `15` | 回合积分查询超时时间；只影响后台 enrichment |
 | `TRAE_USAGE_CREDIT_SETTLE_SECONDS` | `1` | 请求完成后等待上游积分账单落库再计算单次积分差值 |
 | `RESPONSES_SESSION_TTL_SECONDS` | `3600` | `previous_response_id` 会话缓存有效期（秒） |
 | `RESPONSES_SESSION_MAX_ENTRIES` | `1024` | Responses 进程内会话缓存最大条数 |
 | `RELAY_API_KEYS` | 空 | API 密钥鉴权（逗号分隔多个）；公网部署必须设置并配合 TLS |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
-控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态和模型。积分优先使用上游显式 usage；没有显式值时，relay 在后台比较同一账号请求前后的累计积分，无法安全归属时显示 `--`，不会把未知值伪装成 0。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
+控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态和模型。积分优先级为：上游显式 usage、TraeWork 回合级 `credits_float`、同一账号请求前后的累计积分差值；无法安全归属时显示 `--`，不会把未知值伪装成 0。回合级查询使用上游 `reply_to_message_id/userMessageId`，不会把固定 raw 会话 UUID 当作计费键，也不会阻塞模型首帧。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
 
 ## 工具调用
 
@@ -179,7 +194,9 @@ docker compose up -d --build
 }
 ```
 
-`UPSTREAM_MODE=auto` 与 `UPSTREAM_MODE=raw` 的路由完全相同：Chat 与 Responses 请求都只发送到 Trae 原生 `llm_utils_chat`。`tools`、`tool_choice`、`parallel_tool_calls`、assistant 的 `tool_calls` 历史及 `role: "tool"` 结果均使用上游原生字段透传；relay 不再用 `Previous client...` 文本模拟工具历史，也不再回退到 CLI/remote/web/IDE。显式使用 `remote`、`web` 或 `ide` 模式发送工具协议请求会返回 `400`。
+`UPSTREAM_MODE=auto` 与 `UPSTREAM_MODE=raw` 的路由完全相同：Chat 与 Responses 请求都只发送到 `/api/ide/v2/llm_raw_chat`。raw HTTP body 固定为 `config_name`、`conversation_id`、`messages`、`model_name`、`session_id`、`stream` 六个字段；OpenAI `tools`、`tool_choice`、`parallel_tool_calls` 和工具历史不会作为顶层 raw 字段发送，而是由 relay 转成稳定的系统提示和不可执行历史，再把模型文本中的工具调用解析回 OpenAI 事件。
+
+每个账号与模型使用确定性的独立 raw 会话，并同时在 body 与 `Extra` 中绑定 `config_name` / `model_name`，避免缺失模型选择时回落到默认 provider。显式模型默认走 raw；只有 `TRAE_REMOTE_ONLY_MODELS` 中列出的模型才改走 remote，`*` 可作为诊断时的全量强制开关。
 
 ### 传输实现说明
 
@@ -187,7 +204,7 @@ docker compose up -d --build
 
 `ide` 模式保留 trae2api 的 `/api/ide/v1/chat` 请求结构：稳定的 `session_id` / `conversation_id`、`chat_history`、`last_llm_response_info`、设备指纹和 Cloud-IDE-JWT 请求头。两种模式共用现有账号切换、token 快照、SSE 心跳、消费记录和 Responses 会话缓存。
 
-raw 模式不会剥离顶层工具字段后重试。上游错误会原样转换成 API 错误，避免请求看似成功却没有真正发起工具轮次。`GET /v1/status` 的 `tool_execution` 固定为 `client`，并列出当前工具桥接能力。
+raw 模式不会向上游发送其不接受的 OpenAI 顶层工具字段，也不会在空响应后伪造占位正文。只有在首个模型事件出现前允许一次空响应重试；已有输出、provider、usage 或工具事件后不会重放请求，避免重复消费。`GET /v1/status` 的 `tool_execution` 固定为 `client`，并列出当前工具桥接能力。
 
 `UPSTREAM_MODE=cli` 仅作为显式兼容模式保留，会禁用默认工具并合并 `TRAE_CLI_DISALLOWED_TOOLS`；`auto` 不会进入该路径。
 
