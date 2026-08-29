@@ -1,11 +1,17 @@
 FROM python:3.11-slim
 
+ARG RELAY_BUILD_REVISION=local
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     HOME=/home/app \
     HOST=0.0.0.0 \
-    PORT=8000
+    PORT=8000 \
+    RELAY_BUILD_REVISION=${RELAY_BUILD_REVISION}
+
+LABEL org.opencontainers.image.title="trae-cn-relay" \
+      org.opencontainers.image.revision="${RELAY_BUILD_REVISION}"
 
 WORKDIR /app
 

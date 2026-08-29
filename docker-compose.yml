@@ -1,12 +1,15 @@
 services:
   trae-cn-relay:
-    build: .
+    build:
+      context: .
+      args:
+        RELAY_BUILD_REVISION: "${RELAY_BUILD_REVISION:-local}"
     image: trae-cn-relay:latest
     container_name: trae-cn-relay
     restart: unless-stopped
     env_file:
       - path: .env
-        required: false
+        required: true
     ports:
       - "${RELAY_PORT:-8000}:8000"
     volumes:

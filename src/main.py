@@ -4734,6 +4734,7 @@ async def status():
         "base_url": state.host,
         "web_base": WEB_BASE,
         "upstream_mode": UPSTREAM_MODE,
+        "build_revision": os.environ.get("RELAY_BUILD_REVISION", "local"),
         "traework_native": {
             "enabled": traework_native_bridge.NativeBridgeConfig.from_env().enabled,
             "platform_supported": traework_native_bridge.NativeBridgeConfig.from_env().enabled_for_platform,

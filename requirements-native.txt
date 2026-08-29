@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Windows TraeWork helper: AHA DEALER/ROUTER IPC.
+pyzmq>=26,<28

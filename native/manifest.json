@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "name": "traework-ai-agent",
+  "platform": "windows-x64",
+  "source_root": "resources/app",
+  "module_root": "modules/ai-agent",
+  "ipc": {
+    "service": "ai-agent",
+    "default_port": 40005,
+    "meta_path": "modules/ai-agent/meta.json"
+  },
+  "files": [
+    {
+      "path": "modules/ai-agent/ai_agent.dll",
+      "required": true
+    },
+    {
+      "path": "modules/ai-agent/sscronet.dll",
+      "required": true
+    },
+    {
+      "path": "modules/ai-agent/vm_sdk.dll",
+      "required": true
+    },
+    {
+      "path": "modules/ai-agent/api-ms-win-core-synch-l1-2-0.dll",
+      "required": true
+    },
+    {
+      "path": "modules/ai-agent/meta.json",
+      "required": true
+    },
+    {
+      "path": "modules/ai-agent/start.bat",
+      "required": true
+    },
+    {
+      "path": "modules/ai-agent/bin/agent-tool-host.exe",
+      "required": false
+    },
+    {
+      "path": "modules/ai-agent/bin/ctx-cli.exe",
+      "required": false
+    },
+    {
+      "path": "modules/ai-agent/x64/aiep_ipc.dll",
+      "required": false
+    },
+    {
+      "path": "modules/ai-agent/x64/aiep_vm.dll",
+      "required": false
+    },
+    {
+      "path": "modules/ai-agent/x64/run_helper.exe",
+      "required": false
+    },
+    {
+      "path": "sscronet.dll",
+      "required": false
+    },
+    {
+      "path": "aha_net.dll",
+      "required": false
+    }
+  ]
+}

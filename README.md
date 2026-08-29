@@ -43,6 +43,9 @@ pip install -r requirements.txt
 uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
+开发环境使用 `pip install -r requirements-dev.txt`，Windows TraeWork native
+helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只安装核心依赖。
+
 ## Docker 部署
 
 ```bash
@@ -51,6 +54,8 @@ docker compose up -d --build
 ```
 
 容器默认监听 `8000` 端口，可通过 `RELAY_PORT` 环境变量修改。
+发布构建可设置 `RELAY_BUILD_REVISION=$(git rev-parse --short HEAD)`；该值会写入
+镜像 label，并由 `/v1/status` 返回，便于确认运行容器与源码版本一致。
 
 ## 网页授权（推荐：web-login 模式）
 
@@ -111,6 +116,7 @@ docker compose up -d --build
 | `TRAE_WEB_BASE_URL` | `https://trae-api-cn.mchost.guru/api/remote/v1` | remote 上游端点；`remote` 模式按 9router 的 `chat_sessions` + `events` 协议转发 |
 | `TRAE_WEB_PARALLEL_LIMIT` | `2` | 每账号最大并行会话数 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
+| `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
 | `TRAE_FETCH_MODEL_LIST` | `false` | `/v1/models` 是否从上游拉取真实模型列表 |
 | `SSE_HEARTBEAT_SECONDS` | `1` | Chat/Responses 上游空窗时发送标准 SSE 注释心跳；`0` 为关闭 |
 | `TRAE_USAGE_RECORDS_PATH` | `data/usage_records.json` | 消费记录独立持久化文件，不改写 `data/accounts.json` |
@@ -244,6 +250,37 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 - 手动添加凭证
 - 登出
 - 获取模型列表：一键刷新 `/v1/models`（`TRAE_FETCH_MODEL_LIST=true` 时从上游拉取）
+
+## 项目结构与运维
+
+正式可部署源码只有以下边界：
+
+```text
+src/                    relay 服务与协议转换
+tests/                  离线协议、流式和路由回归测试
+native/                 TraeWork native 文件清单与说明，不包含 DLL
+tools/                  Windows native helper
+scripts/backup_runtime.sh  Docker 运行态一致性备份
+```
+
+探针、抓包、逆向材料、账号状态、旧发布包和备份不进入 Docker 构建上下文，
+也不应提交到仓库。`trae-cn-relay` 是唯一产品源码目录；研究目录只用于生成报告或补丁。
+
+发布前运行：
+
+```bash
+python -m pytest -q
+docker compose build
+```
+
+在 Docker 主机上备份当前运行容器、容器内源码、宿主配置和数据：
+
+```bash
+sudo bash scripts/backup_runtime.sh
+```
+
+脚本会短暂停止并自动重启容器，备份写入 `backups/<timestamp>-runtime/`，
+同时生成镜像归档和 SHA-256 校验清单。`.env` 与 `data` 含敏感状态，备份目录权限为 `0700`，文件为 `0600`。
 
 ## 开源协议
 
