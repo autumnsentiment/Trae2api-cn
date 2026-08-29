@@ -74,6 +74,73 @@ def raw_gate_users(session_id):
 
 
 class RawClientBuildTests(unittest.TestCase):
+    def test_runtime_prompt_requires_client_confirmation_for_file_changes(self):
+        prompt = raw_client.build_runtime_system_prompt(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "download_file",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            {"workspace_path": r"C:\workspace"},
+        )
+
+        self.assertIn("cannot write into the caller workspace", prompt)
+        self.assertIn("matching client tool result", prompt)
+
+    def test_compacted_catalog_prioritizes_namespaced_exec_and_download(self):
+        tools = []
+        for index in range(100):
+            tools.append(
+                {
+                    "name": f"bulk__tool_{index}",
+                    "description": "x" * 600,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {f"field_{index}": {"type": "string"}},
+                    },
+                }
+            )
+        tools.extend(
+            [
+                {
+                    "name": "functions__exec",
+                    "description": "Run a caller-side command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+                {
+                    "name": "browser__download_file",
+                    "description": "Download a caller-side file.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "path": {"type": "string"},
+                        },
+                        "required": ["url", "path"],
+                    },
+                },
+            ]
+        )
+
+        with patch.dict(os.environ, {"TRAE_RAW_MAX_TOOL_SCHEMA_CHARS": "4096"}):
+            payload, compacted, _ = raw_client._tool_definitions_prompt(tools)
+
+        parsed = json.loads(payload)
+        by_name = {item["name"]: item for item in parsed["signatures"]}
+        self.assertTrue(compacted)
+        self.assertEqual(by_name["functions__exec"]["required"], ["cmd"])
+        self.assertEqual(
+            by_name["browser__download_file"]["required"], ["url", "path"]
+        )
+
     def test_build_body_has_exact_new_protocol_keys(self):
         tools = [
             {

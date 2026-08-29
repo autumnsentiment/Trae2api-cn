@@ -104,6 +104,7 @@ docker compose up -d --build
 | `TRAE_REMOTE_MAX_MODE_TYPE` | `1` | 服务端 `get_model_selection_modes` 的模式枚举；`1` 已实测生效 |
 | `TRAE_REMOTE_AGENT_FIRST` | `1` | remote 是否默认锁定 Agent 执行器；关闭后普通请求直接使用 Work |
 | `TRAE_REMOTE_WORK_FALLBACK` | `1` | Agent 创建失败或可重试空响应时，是否同账号回退一次 Work |
+| `TRAE_REMOTE_CALLER_TOOLS_USE_WORK` | `1` | 带调用端工具的 remote 请求固定使用 Work，避免 Agent 内部远端工具把“已下载/已写入”误报为调用端本地文件操作；普通无工具请求仍默认 Agent |
 | `TRAE_CLIENT_WORKSPACE_PATH` | `C:\workspace` | 未传 `client_context` 时使用的调用方工作区 |
 | `TRAE_CLIENT_SYSTEM_TYPE` | `Windows` | 未传 `client_context` 时使用的调用方系统 |
 | `TRAE_CLI_DISALLOWED_TOOLS` | `Read,Bash,Edit,Replace,Write,Glob,Grep,Task` | CLI 模式额外禁用的 relay 本机工具；外部工具请求会与默认项合并 |

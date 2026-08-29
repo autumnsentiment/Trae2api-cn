@@ -475,6 +475,113 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(bounded[-1]["content"], "continue")
         self.assertLessEqual(len(main_module.trae_client.flatten_query(bounded)), 12_000)
 
+    def test_short_continuation_retains_active_client_tool_task(self):
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Download https://example.com/archive.zip to "
+                    "C:/workspace/output/archive.zip and verify the file."
+                ),
+            },
+            {"role": "assistant", "content": "I will continue."},
+            {"role": "user", "content": "继续"},
+        ]
+        options = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "download_file",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ]
+        }
+
+        anchor = main_module._remote_client_tool_task_anchor(messages, options)
+
+        self.assertIsNotNone(anchor)
+        self.assertEqual(anchor["role"], "system")
+        self.assertIn("https://example.com/archive.zip", anchor["content"])
+        self.assertIn("C:/workspace/output/archive.zip", anchor["content"])
+        self.assertIn("emit the matching client tool call", anchor["content"])
+
+    def test_task_anchor_survives_remote_query_trimming(self):
+        anchor = {
+            "role": "system",
+            "content": (
+                "Active caller task retained during history compaction.\n"
+                "Download https://example.com/archive.zip to "
+                "C:/workspace/output/archive.zip."
+            ),
+        }
+        messages = [
+            {"role": "system", "content": "client tool runtime"},
+            anchor,
+            {"role": "user", "content": "old " + "x" * 40_000},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "继续"},
+        ]
+
+        bounded, removed = main_module._bounded_remote_query(
+            messages, {"trae_remote_query_max_chars": 4_000}
+        )
+
+        self.assertGreater(removed, 0)
+        self.assertIn(anchor, bounded)
+        self.assertEqual(bounded[-1]["content"], "继续")
+
+    def test_remote_caller_tools_use_work_executor(self):
+        async def empty_events():
+            if False:
+                yield None
+
+        async def run():
+            captured = {}
+
+            async def fake_create(client, token, model, msgs, *, options=None):
+                captured.update(dict(options or {}))
+                return ("work-session", "work-message")
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "jwt-token", "provider_specific": {}},
+                ),
+                patch.object(main_module.trae_client, "acquire_web_slot", new=AsyncMock()),
+                patch.object(main_module.trae_client, "release_web_slot"),
+                patch.object(main_module.trae_remote_client, "create_session", new=fake_create),
+                patch.object(main_module.trae_remote_client, "stream_events", return_value=empty_events()),
+                patch.object(main_module.trae_remote_client, "stop_session", new=AsyncMock()),
+                patch.object(main_module, "collect_nonstream_web", new=AsyncMock(return_value={"choices": []})),
+                patch.object(main_module, "_track_usage_from_result", return_value=None),
+            ):
+                await main_module.run_remote_session(
+                    [{"role": "user", "content": "download the file"}],
+                    "glm-5.3",
+                    False,
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "jwt-token",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "download_file",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                    },
+                )
+            return captured
+
+        captured = asyncio.run(run())
+        self.assertEqual(captured["_remote_agent_type"], "solo_work_remote")
+        self.assertEqual(captured["_session_variant"], "caller-tools-work")
+
     def test_remote_slot_is_released_once_when_nonstream_translation_fails(self):
         async def empty_events():
             if False:

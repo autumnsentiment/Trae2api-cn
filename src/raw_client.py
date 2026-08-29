@@ -690,21 +690,44 @@ def _tool_definitions_prompt(tool_defs: list[dict[str, Any]]) -> tuple[str, bool
         return full, False, 0
 
     names = [str(tool.get("name") or "") for tool in tool_defs]
-    priority_names = {
+    discovery_names = {
         "tool_search",
         "search_tools",
         "list_tools",
         "plugin_search",
-        "shell",
-        "shell_exec",
-        "exec_command",
         "environment",
         "get_environment",
     }
+    execution_names = {
+        "shell",
+        "shell_exec",
+        "exec",
+        "exec_command",
+        "download",
+        "download_file",
+        "write",
+        "write_file",
+        "file_write",
+        "edit",
+        "edit_file",
+        "apply_patch",
+    }
+
+    def priority(signature: Mapping[str, Any]) -> int:
+        name = str(signature.get("name") or "").lower()
+        # Responses namespace tools are flattened as ``namespace__tool``.
+        # Rank both the complete name and its basename so functions__exec and
+        # browser__download_file retain argument fields under schema pressure.
+        basename = name.rsplit("__", 1)[-1]
+        candidates = {name, basename}
+        if candidates & discovery_names:
+            return 0
+        if candidates & execution_names:
+            return 1
+        return 2
+
     signatures = [_compact_tool_signature(tool) for tool in tool_defs]
-    signatures.sort(
-        key=lambda item: (str(item.get("name") or "").lower() not in priority_names,)
-    )
+    signatures.sort(key=priority)
     payload: dict[str, Any] = {
         "available_tools": names,
         "signatures": [],
@@ -754,6 +777,7 @@ def build_runtime_system_prompt(
         json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str),
         "Discover the local environment through the available client tools when the request requires it.",
         "If a tool can answer the question, call it proactively and wait for the external client result.",
+        "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, or saved unless a matching client tool result in the conversation confirms success.",
         "Never repeat a completed tool call; do not describe that server's Linux filesystem as the caller workspace.",
         "To use one, emit exactly one JSON block as your entire response and include no other text:",
         '<opencode_tool_call>{"id":"call_unique","name":"tool_name","input":{}}</opencode_tool_call>',

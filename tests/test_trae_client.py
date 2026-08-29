@@ -504,6 +504,28 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
 
 
 class IdeRequestContextTests(unittest.TestCase):
+    def test_runtime_prompt_uses_inherited_response_tools(self):
+        messages = trae_client._messages_with_client_runtime(
+            [{"role": "user", "content": "继续"}],
+            {
+                "_inherited_tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "download_file",
+                            "description": "Download a client-side file.",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "_tool_protocol_requested": True,
+            },
+        )
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("download_file", messages[0]["content"])
+        self.assertNotIn("No client tools are available", messages[0]["content"])
+
     def test_ide_request_uses_bound_account_credential_snapshot(self):
         calls = []
 

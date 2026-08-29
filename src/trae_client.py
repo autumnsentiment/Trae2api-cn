@@ -786,8 +786,13 @@ def _messages_with_client_runtime(
         and "clientContext" not in options
     ):
         return messages
+    tool_catalog = (
+        options.get("tools")
+        if "tools" in options
+        else options.get("_inherited_tools")
+    )
     prompt = raw_client.build_runtime_system_prompt(
-        options.get("tools"),
+        tool_catalog,
         raw_client.build_client_context(options),
         options.get("tool_choice"),
         options.get("parallel_tool_calls"),

@@ -2837,6 +2837,61 @@ def _bounded_remote_query(
         removed += len(drop)
 
 
+_CONTINUATION_ONLY_RE = re.compile(
+    r"^(?:继续(?:执行|完成|处理|下载|安装|操作|进行|做)?|接着(?:做|执行|处理)?|"
+    r"往下继续|下一步|j继续|continue(?:\s+(?:it|this|working))?|go\s+on|"
+    r"proceed|keep\s+going|resume)[\s。.!！?？]*$",
+    re.IGNORECASE,
+)
+
+
+def _remote_client_tool_task_anchor(
+    messages: list[Mapping[str, Any]], options: Mapping[str, Any]
+) -> dict[str, str] | None:
+    """Keep the active client-tool task when the newest turn only says continue.
+
+    Very large Codex sessions can contain more than a thousand messages. The
+    remote query cap must discard old turns, but a short continuation such as
+    ``继续`` has no task semantics by itself. Preserve the nearest preceding
+    user request as a system constraint so URLs and destination paths survive
+    compaction and the model still emits a caller-owned tool call.
+    """
+    if not _tool_protocol_requested(options, list(messages)):
+        return None
+    user_messages: list[tuple[int, str]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "user") != "user":
+            continue
+        text = raw_client._content_to_text(message.get("content")).strip()
+        if text:
+            user_messages.append((index, text))
+    if len(user_messages) < 2:
+        return None
+    latest_index, latest_text = user_messages[-1]
+    if not _CONTINUATION_ONLY_RE.fullmatch(latest_text):
+        return None
+    for index, text in reversed(user_messages[:-1]):
+        if index >= latest_index or _CONTINUATION_ONLY_RE.fullmatch(text):
+            continue
+        max_chars = 16_000
+        if len(text) > max_chars:
+            text = text[:8_000] + "\n...[task middle omitted]...\n" + text[-8_000:]
+        return {
+            "role": "system",
+            "content": (
+                "Active caller task retained during history compaction. The "
+                "latest user message is only a continuation request. Continue "
+                "the task below. For any caller-side download or file change, "
+                "emit the matching client tool call and wait for its result; "
+                "do not claim success from a remote/internal tool.\n\n"
+                + text
+            ),
+        }
+    return None
+
+
 def _requires_remote_model(model: str) -> bool:
     """Return whether an explicit operator override forces remote routing."""
 
@@ -3099,6 +3154,22 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
     remote_options = dict(options)
+    caller_tools_use_work = (
+        os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "1").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if (
+        caller_tools_use_work
+        and _tool_protocol_requested(options, messages)
+        and not remote_options.get("_remote_agent_type")
+        and not remote_options.get("remote_agent_type")
+    ):
+        # Agent sessions own a remote workspace and may consume their internal
+        # shell/file tools, then report success without emitting a caller tool
+        # call. Work mode has no such ownership ambiguity: caller-advertised
+        # tools remain executable only by Codex/the API client.
+        remote_options["_remote_agent_type"] = "solo_work_remote"
+        remote_options["_session_variant"] = "caller-tools-work"
     # A session lease may carry provider metadata captured from the account
     # store before the JWT identity is normalized. Prefer that bound snapshot;
     # only consult the mutable account lookup as a fallback.
@@ -3186,6 +3257,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     # remote upstream sees the available tools even though its transport
     # only accepts text messages.
     prepared_messages = trae_client._messages_with_client_runtime(messages, options)
+    task_anchor = _remote_client_tool_task_anchor(messages, options)
+    if task_anchor is not None:
+        prepared_messages = [prepared_messages[0], task_anchor, *prepared_messages[1:]]
+        logger.info(
+            "remote retained active client-tool task id=%s anchor_chars=%d",
+            str(options.get("_relay_request_id") or ""),
+            len(task_anchor["content"]),
+        )
     compact_options = dict(options)
     # The agent-remote session advertises a 1M-token window, but the upstream
     # silently drops sessions whose flattened query exceeds ~500k chars.
