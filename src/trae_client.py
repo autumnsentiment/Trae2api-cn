@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import string
@@ -339,8 +340,29 @@ def build_headers(
 # derive the id from the immutable user id carried in the JWT instead.
 _CHECKIN_DEVICE_IDS: dict[str, str] = {}
 
-CHECKIN_OS_VERSION = os.environ.get("TRAE_CHECKIN_OS_VERSION", "Windows 10 Pro")
-CHECKIN_APP_VERSION = os.environ.get("TRAE_CHECKIN_APP_VERSION", "3.3.65")
+CHECKIN_DEVICE_BRAND = os.environ.get(
+    "TRAE_CHECKIN_DEVICE_BRAND", "ASUS TUF Gaming A15 FA507RM_FA507RM"
+).strip()
+CHECKIN_DEVICE_TYPE = os.environ.get("TRAE_CHECKIN_DEVICE_TYPE", "windows").strip()
+CHECKIN_OS_VERSION = os.environ.get("TRAE_CHECKIN_OS_VERSION", "Windows 10 Pro").strip()
+CHECKIN_APP_VERSION = os.environ.get("TRAE_CHECKIN_APP_VERSION", "3.3.65").strip()
+
+
+def _configured_checkin_device_id(identity: str, account_id: str = "") -> str:
+    """Return a TraeWork device id configured for this account, if any."""
+    raw_mapping = os.environ.get("TRAE_CHECKIN_DEVICE_IDS_JSON", "").strip()
+    if raw_mapping:
+        try:
+            mapping = json.loads(raw_mapping)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            mapping = None
+        if isinstance(mapping, dict):
+            for key in (identity, account_id):
+                value = mapping.get(str(key)) if key else None
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+
+    return os.environ.get("TRAE_CHECKIN_DEVICE_ID", "").strip()
 
 
 def _checkin_identity(token: str, account_id: str = "") -> str:
@@ -374,9 +396,12 @@ def checkin_device_id_for(token: str, account_id: str = "") -> str:
     stable ``data.id`` (or an explicit account id) survives token refreshes
     while keeping different accounts on different device ids.
     """
-    if not token:
-        return ""
     identity = _checkin_identity(token, account_id)
+    configured = _configured_checkin_device_id(identity, account_id)
+    if configured:
+        return configured
+    if not token and not account_id:
+        return ""
     if identity in _CHECKIN_DEVICE_IDS:
         return _CHECKIN_DEVICE_IDS[identity]
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -386,15 +411,19 @@ def checkin_device_id_for(token: str, account_id: str = "") -> str:
 
 def build_checkin_headers(token: str, account_id: str = "") -> dict[str, str]:
     """Build headers for the client daily-checkin API."""
-    return {
+    headers = {
         "Authorization": f"Cloud-IDE-JWT {token}",
         "Content-Type": "application/json",
         "x-device-id": checkin_device_id_for(token, account_id),
-        "x-device-brand": "ASUS TUF Gaming A15 FA507RM_FA507RM",
-        "x-device-type": "windows",
-        "x-os-version": CHECKIN_OS_VERSION,
-        "x-app-version": CHECKIN_APP_VERSION,
     }
+    if CHECKIN_DEVICE_BRAND and os.environ.get("TRAE_CHECKIN_NO_BRAND") != "1":
+        headers["x-device-brand"] = CHECKIN_DEVICE_BRAND
+    if CHECKIN_DEVICE_TYPE and os.environ.get("TRAE_CHECKIN_NO_TYPE") != "1":
+        headers["x-device-type"] = CHECKIN_DEVICE_TYPE
+    if os.environ.get("TRAE_CHECKIN_EXTRA_VERSION_HEADERS") == "1":
+        headers["x-os-version"] = CHECKIN_OS_VERSION
+        headers["x-app-version"] = CHECKIN_APP_VERSION
+    return headers
 
 async def fetch_checkin_credits_status(token: str = "", account_id: str = "") -> dict:
     """Query daily checkin credits status, returns the original JSON data."""
@@ -435,6 +464,21 @@ async def _post_checkin(
             data = resp.json()
         except Exception as e:
             raise RuntimeError(f"Trae checkin invalid json: {e}") from e
+        if not isinstance(data, dict):
+            raise RuntimeError("Trae checkin invalid json: top-level value is not an object")
+
+        if path.endswith("/status"):
+            if not isinstance(data.get("enable"), bool) or not isinstance(
+                data.get("checked_in"), bool
+            ):
+                raise RuntimeError(
+                    "Trae checkin invalid status: enable/checked_in must be boolean"
+                )
+            credits = data.get("credits")
+            if isinstance(credits, bool) or not isinstance(credits, (int, float)):
+                data.pop("credits", None)
+            elif not math.isfinite(credits) or credits <= 0:
+                data.pop("credits", None)
 
         # Upstream uses business codes in a 200 response. Do not turn 9095 into
         # ``checked_in=True``: its message is device-scoped (the same device

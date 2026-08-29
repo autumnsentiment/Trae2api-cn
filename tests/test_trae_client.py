@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
@@ -60,9 +61,42 @@ class CheckinDeviceTests(unittest.TestCase):
         headers = trae_client.build_checkin_headers(_fake_jwt("account-44", 100))
 
         self.assertEqual(headers["x-device-type"], "windows")
-        self.assertEqual(headers["x-os-version"], trae_client.CHECKIN_OS_VERSION)
-        self.assertEqual(headers["x-app-version"], trae_client.CHECKIN_APP_VERSION)
         self.assertRegex(headers["x-device-id"], r"^\d{16}$")
+        self.assertNotIn("x-os-version", headers)
+        self.assertNotIn("x-app-version", headers)
+
+    def test_global_traework_device_id_override_wins(self):
+        token = _fake_jwt("account-override", 100)
+
+        with patch.dict(os.environ, {"TRAE_CHECKIN_DEVICE_ID": "traework-machine-did"}):
+            self.assertEqual(
+                trae_client.checkin_device_id_for(token), "traework-machine-did"
+            )
+
+    def test_per_account_traework_device_id_override_wins(self):
+        first = _fake_jwt("account-first", 100)
+        second = _fake_jwt("account-second", 100)
+        mapping = json.dumps(
+            {
+                "account-first": "first-machine-did",
+                "legacy-second-row": "second-machine-did",
+            }
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_CHECKIN_DEVICE_ID": "fallback-machine-did",
+                "TRAE_CHECKIN_DEVICE_IDS_JSON": mapping,
+            },
+        ):
+            self.assertEqual(
+                trae_client.checkin_device_id_for(first), "first-machine-did"
+            )
+            self.assertEqual(
+                trae_client.checkin_device_id_for(second, "legacy-second-row"),
+                "second-machine-did",
+            )
 
     def test_device_already_checked_code_does_not_claim_account_checked(self):
         token = _fake_jwt("account-45", 100)
@@ -117,6 +151,63 @@ class CheckinDeviceTests(unittest.TestCase):
         upstream.assert_awaited_once_with(
             "/trae/api/v2/ug/checkin_credits/claim", "token-1", account_id="account-1"
         )
+
+    def test_status_rejects_non_boolean_protocol_fields(self):
+        class FakeResponse:
+            status_code = 200
+            text = '{"code":0,"enable":1,"checked_in":false}'
+
+            @staticmethod
+            def json():
+                return {"code": 0, "enable": 1, "checked_in": False}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, json, headers):
+                return FakeResponse()
+
+        with patch("src.trae_client.httpx.AsyncClient", return_value=FakeClient()):
+            with self.assertRaisesRegex(RuntimeError, "must be boolean"):
+                asyncio.run(
+                    trae_client._post_checkin(
+                        "/trae/api/v2/ug/checkin_credits/status",
+                        _fake_jwt("account-status", 100),
+                    )
+                )
+
+    def test_status_drops_non_positive_credits(self):
+        class FakeResponse:
+            status_code = 200
+            text = '{"code":0,"enable":true,"checked_in":false,"credits":0}'
+
+            @staticmethod
+            def json():
+                return {"code": 0, "enable": True, "checked_in": False, "credits": 0}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, json, headers):
+                return FakeResponse()
+
+        with patch("src.trae_client.httpx.AsyncClient", return_value=FakeClient()):
+            result = asyncio.run(
+                trae_client._post_checkin(
+                    "/trae/api/v2/ug/checkin_credits/status",
+                    _fake_jwt("account-status", 100),
+                )
+            )
+
+        self.assertNotIn("credits", result)
 
 
 class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
