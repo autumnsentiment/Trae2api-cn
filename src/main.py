@@ -40,6 +40,12 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import dotenv
+
+# Several transport modules cache environment-derived defaults at import time.
+# Load the project .env before importing them so local and Docker startup use
+# the same configuration order.
+dotenv.load_dotenv()
+
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -66,8 +72,6 @@ from .sse import (
     translate_ide_stream,
     translate_web_events,
 )
-
-dotenv.load_dotenv()
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("trae-cn-relay")
@@ -3384,20 +3388,31 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 stream_status = "completed"
                             yield chunk
                         stream_status = "completed"
-                    except EmptyUpstreamResponse as exc:
-                        if exc.usage is not None:
-                            _track_usage_from_result({"usage": exc.usage}, model)
+                    except (
+                        EmptyUpstreamResponse,
+                        trae_remote_client.RemoteFirstEventTimeout,
+                    ) as exc:
+                        exc_usage = getattr(exc, "usage", None)
+                        exc_retryable = bool(getattr(exc, "retryable", True))
+                        exc_observed_model_event = bool(
+                            getattr(exc, "observed_model_event", False)
+                        )
+                        if exc_usage is not None:
+                            _track_usage_from_result({"usage": exc_usage}, model)
+                        polling_retry_enabled = bool(
+                            auth.get_polling_status().get("enabled")
+                        )
                         if (
-                            not exc.retryable
+                            not exc_retryable
                             or work_fallback_used
-                            or not can_work_fallback
+                            or not (can_work_fallback or polling_retry_enabled)
                         ):
                             logger.warning(
                                 "remote empty response is not safe to retry "
                                 "id=%s model=%s observed_model_event=%s fallback_used=%s",
                                 request_id,
                                 model,
-                                exc.observed_model_event,
+                                exc_observed_model_event,
                                 work_fallback_used,
                             )
                             raise
@@ -3413,14 +3428,8 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         retry_client = None
                         retry_session_id = ""
                         retry_message_id = ""
+                        retry_account_id = account_id
                         try:
-                            await trae_client.acquire_web_slot(
-                                account_id,
-                                timeout=float(
-                                    os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")
-                                ),
-                            )
-                            slot_reacquired = True
                             retry_options = dict(remote_options)
                             retry_model = model
                             if can_work_fallback and not work_fallback_used:
@@ -3438,6 +3447,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 )
                                 if next_snapshot is not None:
                                     next_account_id, record = next_snapshot
+                                    retry_account_id = next_account_id
                                     retry_token = (
                                         str(record.get("token") or "") or retry_token
                                     )
@@ -3473,6 +3483,13 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                         retry_token,
                                         retry_provider,
                                     )
+                            await trae_client.acquire_web_slot(
+                                retry_account_id,
+                                timeout=float(
+                                    os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")
+                                ),
+                            )
+                            slot_reacquired = True
                             retry_client = httpx.AsyncClient(timeout=None)
                             logger.info(
                                 "remote empty retry start id=%s model=%s account=%s",
@@ -3528,7 +3545,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                         pass
                         finally:
                             if slot_reacquired:
-                                trae_client.release_web_slot(account_id)
+                                trae_client.release_web_slot(retry_account_id)
                             if retry_client is not None:
                                 await retry_client.aclose()
                 except asyncio.CancelledError:

@@ -541,6 +541,10 @@ _TEXT_TOOL_BLOCK_RE = re.compile(
     r"(?P<body>[\s\S]*?)</(?P=tag)>",
     flags=re.IGNORECASE,
 )
+_OPENCODE_TOOL_OPEN_RE = re.compile(r"<opencode_tool_call>", flags=re.IGNORECASE)
+_OPENCODE_BAD_CLOSE_RE = re.compile(
+    r"\s*</arg_value>\s*[\"'`]*\s*", flags=re.IGNORECASE
+)
 _NAMED_TOOL_BLOCK_RE = re.compile(
     r"<(?P<tag>tool_call|tool_cell)\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>"
     r"(?P<body>[\s\S]*?)</(?P=tag)>",
@@ -1418,6 +1422,41 @@ def _parse_text_tool_body(body: str, fallback_name: str = "", index: int = 0) ->
     return None
 
 
+def _recover_malformed_opencode_tool_blocks(
+    text: str,
+    occupied: list[tuple[int, int]],
+) -> list[tuple[dict, int, int]]:
+    """Recover a complete JSON call followed by Trae's wrong closing tag."""
+
+    recovered: list[tuple[dict, int, int]] = []
+    decoder = json.JSONDecoder()
+    for opening in _OPENCODE_TOOL_OPEN_RE.finditer(text):
+        if any(start <= opening.start() < end for start, end in occupied):
+            continue
+        body_start = opening.end()
+        body = text[body_start:]
+        leading = len(body) - len(body.lstrip())
+        try:
+            raw, consumed = decoder.raw_decode(body[leading:])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        json_end = body_start + leading + consumed
+        trailing = text[json_end:]
+        bad_close = _OPENCODE_BAD_CLOSE_RE.match(trailing)
+        if bad_close is not None:
+            block_end = json_end + bad_close.end()
+        elif not trailing.strip():
+            block_end = len(text)
+        else:
+            continue
+        call = normalize_tool_call(raw, index=len(recovered))
+        if call:
+            recovered.append((call, opening.start(), block_end))
+    return recovered
+
+
 def extract_text_tool_calls(content: Any) -> list[dict]:
     """Extract tool calls encoded in Trae's text/XML fallback formats."""
     text = _strip_internal_wait_residue(_content_to_text(content))
@@ -1452,6 +1491,11 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         if call:
             calls.append(call)
             occupied.append((match.start(), match.end()))
+
+    for call, start, end in _recover_malformed_opencode_tool_blocks(text, occupied):
+        call["_source_index"] = len(calls)
+        calls.append(call)
+        occupied.append((start, end))
 
     # A compact <tool_call> form can be split by malformed model output. Look
     # for a JSON object containing a name/arguments pair before the closing tag.
@@ -1561,6 +1605,9 @@ def strip_tool_call_blocks(content: Any) -> str:
     text = _TEXT_TOOL_BLOCK_RE.sub("", text)
     text = _NAMED_TOOL_BLOCK_RE.sub("", text)
     text = _KIMI_TOOL_PARAMETER_RE.sub("", text)
+    recovered = _recover_malformed_opencode_tool_blocks(text, [])
+    for _call, start, end in reversed(recovered):
+        text = text[:start] + text[end:]
     # Raw-chat history is serialized as a readable line so the upstream can
     # preserve the call/result relationship.  If the model echoes that line,
     # it is protocol residue, never assistant content.

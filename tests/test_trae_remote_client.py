@@ -3,8 +3,11 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from src import trae_remote_client
 from src import main as main_module
+from src.sse import EmptyUpstreamResponse
 
 
 class _Response:
@@ -38,6 +41,53 @@ class _StreamResponse:
             b"event: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
         ):
             yield chunk
+
+
+class _SilentStreamResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def aiter_bytes(self):
+        await asyncio.sleep(60)
+        if False:
+            yield b""
+
+
+class _EmptyStreamResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def aiter_bytes(self):
+        if False:
+            yield b""
+
+
+class _ReadTimeoutStreamResponse:
+    status_code = 200
+
+    def __init__(self, chunks=()):
+        self.chunks = chunks
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
+        raise httpx.ReadTimeout("silent upstream")
 
 
 class _Client:
@@ -374,6 +424,179 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(events[0], ("plan_item", {"id": "p1", "thought": "hello"}))
         self.assertEqual(events[1][0], "token_usage")
         self.assertEqual(events[2], ("done", {"finish_reason": "stop"}))
+
+    def test_stream_events_times_out_before_first_event(self):
+        async def run():
+            client = _Client()
+            client.stream = lambda *_args, **_kwargs: _SilentStreamResponse()
+            with patch.dict(
+                trae_remote_client.os.environ,
+                {"TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS": "0.01"},
+            ):
+                return [
+                    item
+                    async for item in trae_remote_client.stream_events(
+                        client, "jwt-token", "s1", "m1"
+                    )
+                ]
+
+        with self.assertRaises(trae_remote_client.RemoteFirstEventTimeout) as raised:
+            asyncio.run(run())
+        self.assertIsInstance(raised.exception, EmptyUpstreamResponse)
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(raised.exception.observed_model_event)
+
+    def test_stream_events_treats_eof_before_first_event_as_retryable(self):
+        async def run():
+            client = _Client()
+            client.stream = lambda *_args, **_kwargs: _EmptyStreamResponse()
+            return [
+                item
+                async for item in trae_remote_client.stream_events(
+                    client, "jwt-token", "s1", "m1"
+                )
+            ]
+
+        with self.assertRaises(trae_remote_client.RemoteFirstEventTimeout) as raised:
+            asyncio.run(run())
+        self.assertTrue(raised.exception.retryable)
+
+    def test_stream_events_treats_read_timeout_before_first_event_as_retryable(self):
+        async def run():
+            client = _Client()
+            client.stream = lambda *_args, **_kwargs: _ReadTimeoutStreamResponse()
+            return [
+                item
+                async for item in trae_remote_client.stream_events(
+                    client, "jwt-token", "s1", "m1"
+                )
+            ]
+
+        with self.assertRaises(trae_remote_client.RemoteFirstEventTimeout) as raised:
+            asyncio.run(run())
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(raised.exception.observed_model_event)
+
+    def test_stream_events_does_not_retry_read_timeout_after_first_event(self):
+        async def run():
+            client = _Client()
+            client.stream = lambda *_args, **_kwargs: _ReadTimeoutStreamResponse(
+                (b'event: plan_item\ndata: {"thought":"started"}\n\n',)
+            )
+            return [
+                item
+                async for item in trae_remote_client.stream_events(
+                    client, "jwt-token", "s1", "m1"
+                )
+            ]
+
+        with self.assertRaises(trae_remote_client.RemoteStreamReadTimeout) as raised:
+            asyncio.run(run())
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+
+    def test_stream_work_first_event_timeout_rotates_account(self):
+        async def run():
+            create_calls = []
+            release_calls = []
+            translate_calls = 0
+
+            async def fake_create(client, token, model, msgs, *, options=None):
+                create_calls.append((token, dict(options or {})))
+                index = len(create_calls)
+                return (f"session-{index}", f"message-{index}")
+
+            async def fake_events(*_args, **_kwargs):
+                if False:
+                    yield None
+
+            async def fake_translate(*_args, **_kwargs):
+                nonlocal translate_calls
+                translate_calls += 1
+                if translate_calls == 1:
+                    raise trae_remote_client.RemoteFirstEventTimeout("silent")
+                yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "token-a", "provider_specific": {}},
+                ),
+                patch.object(
+                    main_module.auth,
+                    "get_polling_status",
+                    return_value={"enabled": True},
+                ),
+                patch.object(
+                    main_module,
+                    "_next_retry_account_snapshot",
+                    return_value=(
+                        "account-b",
+                        {"token": "token-b", "provider_specific": {"webId": "b"}},
+                    ),
+                ),
+                patch.object(
+                    main_module.trae_client,
+                    "acquire_web_slot",
+                    new=AsyncMock(),
+                ) as acquire,
+                patch.object(
+                    main_module.trae_client,
+                    "release_web_slot",
+                    side_effect=release_calls.append,
+                ),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "create_session",
+                    new=fake_create,
+                ),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "stream_events",
+                    side_effect=lambda *_args, **_kwargs: fake_events(),
+                ),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "stop_session",
+                    new=AsyncMock(),
+                ),
+                patch.object(main_module, "translate_web_events", new=fake_translate),
+                patch.object(main_module, "_track_usage_from_chunk"),
+            ):
+                response = await main_module.run_remote_session(
+                    [{"role": "user", "content": "download the file"}],
+                    "glm-5.3",
+                    True,
+                    {
+                        "_account_id": "account-a",
+                        "_auth_token": "token-a",
+                        "_remote_agent_type": "solo_work_remote",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "download_file",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                    },
+                )
+                chunks = [chunk async for chunk in response.body_iterator]
+            return chunks, create_calls, acquire, release_calls
+
+        chunks, create_calls, acquire, release_calls = asyncio.run(run())
+        self.assertIn("data: [DONE]", "".join(chunks))
+        self.assertEqual([item[0] for item in create_calls], ["token-a", "token-b"])
+        self.assertEqual(create_calls[1][1]["_account_id"], "account-b")
+        self.assertEqual(create_calls[1][1]["provider_specific"], {"webId": "b"})
+        self.assertEqual(
+            [call.args[0] for call in acquire.await_args_list],
+            ["account-a", "account-b"],
+        )
+        self.assertEqual(release_calls, ["account-a", "account-b"])
 
     def test_remote_session_compacts_oversized_history_before_create(self):
         messages = []

@@ -77,6 +77,33 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["arguments"], '{"command":"Get-ChildItem"}')
         self.assertEqual(cli_client.strip_tool_call_blocks(content), "")
 
+    def test_recovers_opencode_call_with_arg_value_closer(self):
+        content = (
+            'analysis before call\n'
+            '<opencode_tool_call>{"id":"call_download","name":"exec_command",'
+            '"input":{"cmd":"curl.exe -L https://example.com/a.zip",'
+            '"workdir":"C:\\\\workspace"}}</arg_value>'
+        )
+
+        calls = cli_client.extract_text_tool_calls(content)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["id"], "call_download")
+        self.assertEqual(calls[0]["function"]["name"], "exec_command")
+        self.assertIn("curl.exe", calls[0]["function"]["arguments"])
+        self.assertEqual(
+            cli_client.strip_tool_call_blocks(content).strip(),
+            "analysis before call",
+        )
+
+    def test_does_not_recover_opencode_json_followed_by_prose(self):
+        content = (
+            '<opencode_tool_call>{"id":"call_1","name":"exec_command",'
+            '"input":{"cmd":"Get-Date"}} this is only an example'
+        )
+
+        self.assertEqual(cli_client.extract_text_tool_calls(content), [])
+
     def test_extract_trae_native_function_call_argument_delta(self):
         head = cli_client.extract_tool_calls(
             {

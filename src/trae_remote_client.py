@@ -7,6 +7,7 @@ session and parses SSE; tools remain owned by the API caller.
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import hashlib
 import json
@@ -18,6 +19,7 @@ from typing import Any, AsyncIterator, Mapping, Optional
 import httpx
 
 from . import auth, trae_client
+from .sse import EmptyUpstreamResponse
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,28 @@ DEFAULT_MAX_CONTEXT_TOKENS = 1_000_000
 DEFAULT_MAX_PROMPT_TOKENS = 936_000
 DEFAULT_MAX_OUTPUT_TOKENS = 64_000
 DEFAULT_MAX_MODE_TYPE = 1
+
+
+class RemoteFirstEventTimeout(EmptyUpstreamResponse):
+    """A created remote session ended or timed out before its first event."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message,
+            retryable=True,
+            observed_model_event=False,
+        )
+
+
+class RemoteStreamReadTimeout(EmptyUpstreamResponse):
+    """The remote event stream timed out after upstream activity began."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message,
+            retryable=False,
+            observed_model_event=True,
+        )
 
 
 def base_url(options: Optional[Mapping[str, Any]] = None) -> str:
@@ -495,7 +519,7 @@ async def create_session(
     return session_id, message_id
 
 
-async def stream_events(
+async def _stream_events_unbounded(
     client: httpx.AsyncClient,
     token: str,
     session_id: str,
@@ -551,6 +575,68 @@ async def stream_events(
                 data = {"_raw": payload}
             if isinstance(data, dict):
                 yield "message", data
+
+
+async def stream_events(
+    client: httpx.AsyncClient,
+    token: str,
+    session_id: str,
+    message_id: str,
+    *,
+    options: Optional[Mapping[str, Any]] = None,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """Stream events while bounding a session that is silent after creation."""
+
+    source = _stream_events_unbounded(
+        client,
+        token,
+        session_id,
+        message_id,
+        options=options,
+    )
+    raw_timeout = os.environ.get(
+        "TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS",
+        os.environ.get("TRAE_WEB_FIRST_EVENT_TIMEOUT", "120"),
+    )
+    try:
+        first_event_timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        first_event_timeout = 120.0
+    try:
+        if first_event_timeout > 0:
+            try:
+                first = await asyncio.wait_for(
+                    source.__anext__(), timeout=first_event_timeout
+                )
+            except StopAsyncIteration as exc:
+                raise RemoteFirstEventTimeout(
+                    "Trae remote session ended before its first event"
+                ) from exc
+            except (asyncio.TimeoutError, httpx.ReadTimeout) as exc:
+                raise RemoteFirstEventTimeout(
+                    "Trae remote session emitted no event before the first-event timeout"
+                ) from exc
+        else:
+            try:
+                first = await source.__anext__()
+            except StopAsyncIteration as exc:
+                raise RemoteFirstEventTimeout(
+                    "Trae remote session ended before its first event"
+                ) from exc
+            except httpx.ReadTimeout as exc:
+                raise RemoteFirstEventTimeout(
+                    "Trae remote session timed out before its first event"
+                ) from exc
+        yield first
+        try:
+            async for event in source:
+                yield event
+        except httpx.ReadTimeout as exc:
+            raise RemoteStreamReadTimeout(
+                "Trae remote event stream timed out after upstream activity began"
+            ) from exc
+    finally:
+        await source.aclose()
 
 
 async def stop_session(
