@@ -414,6 +414,134 @@ class CheckinResultTests(unittest.TestCase):
         self.assertTrue(bodies[2]["success"])
         self.assertEqual(claim.await_count, 2)
 
+    def test_9074_backoff_escalates_after_repeated_failures(self):
+        def scenario():
+            record = {"token": "test-token", "user_id": "user-1"}
+            with (
+                patch("src.main.auth.get_account_record", return_value=record),
+                patch("src.main.CHECKIN_RETRY_AFTER", 60),
+                patch("src.main.CHECKIN_9074_MAX_BACKOFF", 3600),
+            ):
+                first = main_module._checkin_next_backoff("account-1")
+                second = main_module._checkin_next_backoff("account-1")
+            return first, second
+
+        # With no persisted streak both settle on the base window.
+        first, second = scenario()
+        self.assertEqual(first, 60)
+        self.assertEqual(second, 60)
+
+        def with_streak(count):
+            record = {
+                "token": "test-token",
+                "user_id": "user-1",
+                "checkin": {"retry_9074_count": count},
+            }
+            with (
+                patch("src.main.auth.get_account_record", return_value=record),
+                patch("src.main.CHECKIN_RETRY_AFTER", 60),
+                patch("src.main.CHECKIN_9074_MAX_BACKOFF", 3600),
+            ):
+                return main_module._checkin_next_backoff("account-1")
+
+        self.assertEqual(with_streak(0), 60)
+        self.assertEqual(with_streak(1), 120)
+        self.assertEqual(with_streak(2), 240)
+        self.assertEqual(with_streak(6), 3600)  # capped at max backoff
+
+    def test_9074_cooldown_honors_persisted_wall_clock_deadline(self):
+        now = 1_000_000.0
+        record = {
+            "token": "test-token",
+            "checkin": {
+                "retry_backoff": 300,
+                "retry_updated_at": now,
+            },
+        }
+        with (
+            patch("src.main.auth.get_account_record", return_value=record),
+            patch("src.main.time.monotonic", return_value=now),
+            patch("src.main.time.time", return_value=now + 120),
+        ):
+            remaining = main_module._checkin_cooldown_remaining("account-1")
+        self.assertGreater(remaining, 0)
+        self.assertLessEqual(remaining, 180)
+
+        with (
+            patch("src.main.auth.get_account_record", return_value=record),
+            patch("src.main.time.monotonic", return_value=now),
+            patch("src.main.time.time", return_value=now + 400),
+        ):
+            remaining = main_module._checkin_cooldown_remaining("account-1")
+        self.assertEqual(remaining, 0)
+
+    def test_start_cooldown_persists_escalating_backoff(self):
+        state = {
+            "record": {
+                "token": "test-token",
+                "user_id": "user-1",
+                "checkin": {},
+            }
+        }
+
+        def fake_merge(account_id, data):
+            state["record"]["checkin"].update(data)
+            return dict(state["record"]["checkin"])
+
+        with (
+            patch(
+                "src.main.auth.get_account_record",
+                side_effect=lambda _: dict(state["record"]),
+            ),
+            patch("src.main.auth.merge_account_retry", side_effect=fake_merge),
+            patch("src.main.CHECKIN_RETRY_AFTER", 60),
+            patch("src.main.CHECKIN_9074_MAX_BACKOFF", 3600),
+            patch("src.main.time.monotonic", return_value=100.0),
+            patch("src.main.time.time", return_value=1_000_000.0),
+        ):
+            first = main_module._checkin_start_cooldown("account-1")
+            second = main_module._checkin_start_cooldown("account-1")
+
+        self.assertEqual(first, 60)
+        self.assertEqual(second, 120)
+        self.assertEqual(state["record"]["checkin"].get("retry_9074_count"), 2)
+        self.assertEqual(state["record"]["checkin"].get("retry_backoff"), 120)
+
+    def test_auto_retry_loop_retries_only_persisted_backoff_accounts(self):
+        record = {
+            "token": "test-token",
+            "user_id": "user-1",
+            "checkin": {"retry_backoff": 60, "retry_9074_count": 1},
+        }
+        raw_accounts = [("account-1", record), ("plain-account", {"token": "tok"})]
+        claimed = []
+
+        async def fake_claim(account_id):
+            claimed.append(account_id)
+            return {
+                "success": True,
+                "skipped": False,
+                "claim_sent": True,
+                "checked_in": True,
+            }
+
+        async def cycle():
+            with (
+                patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
+                patch(
+                    "src.main._claim_checkin_account",
+                    side_effect=fake_claim,
+                ),
+                patch("src.main._checkin_cooldown_remaining", return_value=0),
+                patch("src.main._checkin_cache_is_today", return_value=False),
+                patch("src.main._checkin_clear_retry_state"),
+            ):
+                await main_module._checkin_auto_retry_cycle()
+
+        asyncio.run(cycle())
+        self.assertIn("account-1", claimed)
+        self.assertNotIn("plain-account", claimed)
+
     def test_single_and_claim_all_share_account_lock(self):
         record = {"token": "test-token", "user_id": "user-1"}
         raw_accounts = [("account-1", record)]

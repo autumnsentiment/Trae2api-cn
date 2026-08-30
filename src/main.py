@@ -86,6 +86,12 @@ CHECKIN_INTERVAL = float(os.environ.get("TRAE_CHECKIN_INTERVAL_SECONDS", "60") o
 CHECKIN_RETRY_AFTER = float(
     os.environ.get("TRAE_CHECKIN_9074_RETRY_SECONDS", "60") or "60"
 )
+CHECKIN_9074_MAX_BACKOFF = float(
+    os.environ.get("TRAE_CHECKIN_9074_MAX_BACKOFF_SECONDS", "3600") or "3600"
+)
+CHECKIN_AUTO_RETRY_INTERVAL = float(
+    os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
+)
 WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
 CHAT_OPTION_FIELDS = (
     "tools",
@@ -4637,17 +4643,65 @@ async def _terminal_session_reaper_loop():
             logger.warning("terminal session reaper error: %s", e)
 
 
+async def _checkin_auto_retry_cycle() -> None:
+    """Retry accounts whose persisted 9074 backoff has expired."""
+    try:
+        for account_id, record in auth.get_accounts_raw():
+            checkin = record.get("checkin") or {}
+            if float(checkin.get("retry_backoff") or 0) <= 0:
+                continue
+            if checkin.get("checked_in") is True and _checkin_cache_is_today(record):
+                _checkin_clear_retry_state(account_id)
+                continue
+            cooldown = _checkin_cooldown_remaining(account_id)
+            if cooldown:
+                continue
+            try:
+                result = await _claim_checkin_account(account_id)
+            except Exception as exc:
+                logger.warning(
+                    "checkin auto retry account=%s error: %s",
+                    account_id,
+                    exc,
+                )
+                continue
+            if result.get("success"):
+                logger.info(
+                    "checkin auto retry ok account=%s skipped=%s",
+                    account_id,
+                    result.get("skipped"),
+                )
+            else:
+                logger.info(
+                    "checkin auto retry pending account=%s retry_after=%s",
+                    account_id,
+                    result.get("retry_after_seconds"),
+                )
+    except Exception as exc:
+        logger.warning("checkin auto retry cycle error: %s", exc)
+
+
+async def _checkin_auto_retry_loop():
+    """Periodically retry accounts stuck in an upstream 9074 window."""
+    interval = max(15.0, float(CHECKIN_AUTO_RETRY_INTERVAL))
+    while True:
+        await asyncio.sleep(interval)
+        await _checkin_auto_retry_cycle()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_app()
     web_reaper = asyncio.create_task(_web_reaper_loop())
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
+    checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
     try:
         yield
     finally:
-        for reaper in (web_reaper, terminal_reaper):
+        for reaper in (web_reaper, terminal_reaper, checkin_retry):
             reaper.cancel()
         await asyncio.gather(web_reaper, terminal_reaper, return_exceptions=True)
+        await asyncio.gather(checkin_retry, return_exceptions=True)
         await _cancel_usage_tasks()
 
 
@@ -5309,14 +5363,70 @@ def _checkin_cooldown_remaining(account_id: str) -> int:
     remaining = until - time.monotonic()
     if remaining <= 0:
         _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+        # Fall back to persisted wall-clock retry deadline so a container
+        # restart does not immediately re-hammer a still-limited upstream.
+        rec = auth.get_account_record(account_id)
+        checkin = rec.get("checkin") or {}
+        backoff = float(checkin.get("retry_backoff") or 0)
+        updated = float(checkin.get("retry_updated_at") or 0)
+        if backoff > 0 and updated > 0:
+            persisted_remaining = (updated + backoff) - time.time()
+            if persisted_remaining > 0:
+                remaining = persisted_remaining
+    if remaining <= 0:
         return 0
     return max(1, int(remaining + 0.999))
 
 
-def _checkin_start_cooldown(account_id: str) -> int:
+def _checkin_retry_state(account_id: str) -> tuple[float, int]:
+    """Return persisted (retry_after_backoff, consecutive_9074_count)."""
+    rec = auth.get_account_record(account_id)
+    checkin = rec.get("checkin") or {}
+    backoff = float(checkin.get("retry_backoff") or 0)
+    count = int(checkin.get("retry_9074_count") or 0)
+    return backoff, count
+
+
+def _checkin_persist_retry_state(
+    account_id: str, backoff: float, count: int
+) -> None:
+    auth.merge_account_retry(
+        account_id,
+        {
+            "retry_backoff": backoff,
+            "retry_9074_count": count,
+            "retry_updated_at": time.time(),
+        },
+    )
+
+
+def _checkin_clear_retry_state(account_id: str) -> None:
+    auth.merge_account_retry(
+        account_id,
+        {
+            "retry_backoff": 0,
+            "retry_9074_count": 0,
+        },
+    )
+
+
+def _checkin_next_backoff(account_id: str) -> float:
+    """Exponential backoff for one account's 9074 streak."""
+    _, count = _checkin_retry_state(account_id)
+    base = max(1.0, float(CHECKIN_RETRY_AFTER))
+    backoff = base * (2 ** min(count, 10))
+    max_backoff = max(base, float(CHECKIN_9074_MAX_BACKOFF))
+    return max(base, min(backoff, max_backoff))
+
+
+def _checkin_start_cooldown(account_id: str, retry_after: float | None = None) -> int:
     """Start one account's local cooldown after an upstream 9074 response."""
-    retry_after = max(1, int(CHECKIN_RETRY_AFTER))
+    if retry_after is None:
+        retry_after = _checkin_next_backoff(account_id)
+    retry_after = max(1, int(retry_after))
     _CHECKIN_COOLDOWN_UNTIL[account_id] = time.monotonic() + retry_after
+    _, count = _checkin_retry_state(account_id)
+    _checkin_persist_retry_state(account_id, float(retry_after), count + 1)
     return retry_after
 
 
@@ -5374,13 +5484,13 @@ async def _claim_checkin_throttled(account_id: str, token: str) -> tuple[dict | 
             _CHECKIN_NEXT_CLAIM_AT = time.monotonic() + max(0.0, CHECKIN_INTERVAL)
 
         if data.get("code") == 9074:
-            retry_after = max(1, int(CHECKIN_RETRY_AFTER))
+            retry_after = _checkin_start_cooldown(account_id)
             until = time.monotonic() + retry_after
-            _CHECKIN_COOLDOWN_UNTIL[account_id] = until
             _CHECKIN_NEXT_CLAIM_AT = max(_CHECKIN_NEXT_CLAIM_AT, until)
             return data, retry_after
         if _checkin_claim_ok(data):
             _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+            _checkin_clear_retry_state(account_id)
         return data, 0
 
 
@@ -5406,6 +5516,7 @@ async def _claim_checkin_account(account_id: str) -> dict:
             accepted_recently or _checkin_cache_is_today(record)
         ):
             _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+            _checkin_clear_retry_state(account_id)
             return {
                 **before,
                 "success": True,
@@ -5461,6 +5572,8 @@ async def _claim_checkin_account(account_id: str) -> dict:
         _CHECKIN_ACCEPTED_UNTIL[account_id] = time.monotonic() + max(
             10.0, float(CHECKIN_RETRY_AFTER)
         )
+        _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+        _checkin_clear_retry_state(account_id)
         latest = {**before, "checked_in": True, "verification_pending": True}
         _checkin_mark_accepted(account_id, latest, pending=True)
 

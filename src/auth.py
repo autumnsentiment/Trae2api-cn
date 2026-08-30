@@ -912,6 +912,23 @@ def merge_account_credits(account_id: str, data: dict) -> dict:
         return dict(checkin)
 
 
+def merge_account_retry(account_id: str, data: dict) -> dict:
+    """Persist 9074 retry bookkeeping without touching checkin timestamps.
+
+    The daily-checkin date decides whether an account is "checked in today",
+    so retry state must never bump checkin_status_updated_at/checkin_updated_at.
+    """
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get('checkin') or {})
+        checkin.update(dict(data or {}))
+        rec['checkin'] = checkin
+        _save_accounts()
+        return dict(checkin)
+
+
 def get_account_record(account_id: str) -> dict:
     with _STORE_LOCK:
         rec = _accounts.get(account_id)
