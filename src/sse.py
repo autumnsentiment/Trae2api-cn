@@ -1354,11 +1354,15 @@ async def translate_web_events(
             continue
         if event == "plan_item":
             emitted_tool = False
+            plan_calls = _calls_from_payload(data)
+            plan_thought = _web_plan_text(data)
+            if plan_thought:
+                plan_calls.extend(_extract_tool_calls({"response": plan_thought}))
             plan_chunks = list(_emit_tool_deltas(
                 prefix_id,
                 model,
                 tool_calls,
-                _calls_from_payload(data),
+                plan_calls,
                 allowed_tools,
                 tool_choice,
                 parallel_tool_calls,
@@ -1935,9 +1939,13 @@ async def collect_nonstream_web(
             usage = _map_usage(data.get("usage") or data)
             continue
         if event == "plan_item":
+            calls = list(_calls_from_payload(data))
+            plan_thought = _web_plan_text(data)
+            if plan_thought:
+                calls.extend(_extract_tool_calls({"response": plan_thought}))
             calls = _filter_for_accumulator(
                 tool_calls,
-                _calls_from_payload(data),
+                calls,
                 allowed_tools,
                 tool_choice,
                 parallel_tool_calls,

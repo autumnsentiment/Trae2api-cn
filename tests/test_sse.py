@@ -1858,6 +1858,79 @@ class WebEventTests(unittest.TestCase):
         self.assertEqual(choice["message"]["content"], "done")
         self.assertNotIn("tool_calls", choice["message"])
 
+    def test_plan_thought_tool_block_is_translated_to_client_call(self):
+        block = (
+            '<opencode_tool_call>{"id":"call_dl_1","name":"download",'
+            '"input":{"url":"https://example.com/file.zip","dest":"file.zip"}}'
+            "</opencode_tool_call>"
+        )
+
+        async def events():
+            yield "plan_item", {
+                "id": "plan-1",
+                "thought": "Downloading the file.\n" + block,
+            }
+            yield "done", {"status": "succeeded"}
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "download",
+                    "description": "Download a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "dest": {"type": "string"},
+                        },
+                        "required": ["url", "dest"],
+                    },
+                },
+            }
+        ]
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    events(),
+                    "m",
+                    True,
+                    allowed_tools=tools,
+                    tool_choice="auto",
+                    parallel_tool_calls=True,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        tool_deltas = [
+            call
+            for event in parsed
+            for choice in event.get("choices", [])
+            for call in choice.get("delta", {}).get("tool_calls", [])
+        ]
+        self.assertTrue(done)
+        self.assertEqual(tool_deltas[0]["id"], "call_dl_1")
+        self.assertEqual(tool_deltas[0]["function"]["name"], "download")
+        arguments = "".join(
+            call.get("function", {}).get("arguments", "")
+            for call in tool_deltas
+        )
+        self.assertEqual(json.loads(arguments)["dest"], "file.zip")
+        self.assertEqual(parsed[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                events(),
+                "m",
+                allowed_tools=tools,
+                tool_choice="auto",
+                parallel_tool_calls=True,
+            )
+        )
+        call = result["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "download")
+        self.assertIn("file.zip", call["function"]["arguments"])
+
     def test_done_max_tokens_maps_to_openai_length(self):
         async def events():
             yield "plan_item", {"id": "answer-1", "thought": "partial"}
