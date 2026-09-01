@@ -27,7 +27,7 @@ from typing import Any, AsyncIterator, Mapping, Optional
 import httpx
 
 from . import auth, raw_client
-from .cli_client import sanitize_assistant_history_messages
+from .cli_client import renderer_block_text, sanitize_assistant_history_messages
 from .model_limits import clamp_max_completion_tokens
 
 logger = logging.getLogger(__name__)
@@ -260,7 +260,12 @@ def _content_to_text(content: Any) -> str:
         parts = []
         for c in content:
             if isinstance(c, dict):
-                parts.append(c.get("text") or c.get("content") or "")
+                text = c.get("text") or c.get("content")
+                if text in (None, ""):
+                    # Trae's renderer stores text/tool_result payloads under
+                    # ``value`` instead of ``text``/``content``.
+                    text = renderer_block_text(c)
+                parts.append(text or "")
             elif isinstance(c, str):
                 parts.append(c)
         return "\n".join(parts)
@@ -755,12 +760,17 @@ def flatten_query(messages: list[dict]) -> str:
         elif role == "assistant":
             assistant_parts = [content] if content else []
             tool_history = raw_client._serialize_tool_calls(m.get("tool_calls"))
+            if not tool_history:
+                # Renderer histories carry calls as tool_use content blocks.
+                tool_history = raw_client._serialize_tool_calls(
+                    raw_client._renderer_tool_use_blocks(content_value)
+                )
             if tool_history:
                 assistant_parts.append(tool_history)
             if assistant_parts:
                 parts.append("[Assistant]\n" + "\n\n".join(assistant_parts))
         elif role == "tool":
-            tool_id = m.get("tool_call_id") or "unknown"
+            tool_id = m.get("tool_call_id") or m.get("toolCallId") or "unknown"
             tool_name = m.get("name") or "tool"
             parts.append(f"[Client Tool Result: {tool_id} {tool_name}]\n{content}")
         else:
@@ -786,6 +796,25 @@ def build_web_content(messages: list[dict]) -> list[dict]:
                     content = candidate
                     break
         tool_calls = m.get("tool_calls")
+        if role == "assistant" and not tool_calls:
+            # Renderer histories carry calls as tool_use content blocks.
+            renderer_calls = raw_client._renderer_tool_use_blocks(content)
+            if renderer_calls:
+                tool_calls = [
+                    {
+                        "id": call.get("id"),
+                        "function": {
+                            "name": call.get("name"),
+                            "arguments": json.dumps(
+                                call.get("input") or {},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            ),
+                        },
+                    }
+                    for call in renderer_calls
+                ]
 
         if role == "system":
             items.append({"type": "text", "data": {"content": f"[System]\n{_content_to_text(content)}"}})
@@ -802,7 +831,7 @@ def build_web_content(messages: list[dict]) -> list[dict]:
                 )
                 items.append({"type": "text", "data": {"content": tc_text}})
         elif role == "tool":
-            tc_id = m.get("tool_call_id", "")
+            tc_id = m.get("tool_call_id") or m.get("toolCallId") or ""
             tool_name = m.get("name") or "tool"
             items.append(
                 {

@@ -593,6 +593,51 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
         self.assertNotIn("None", structured)
         self.assertIn("call_1 read_file", structured)
 
+    def test_renderer_tool_use_and_tool_result_survive_remote_flattening(self):
+        """Trae's renderer keeps tool history in content blocks, not arrays."""
+
+        messages = [
+            {"role": "user", "content": "Download release.zip"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_abc",
+                        "name": "download",
+                        "parameters": {
+                            "url": "https://example.com/release.zip",
+                            "dest": "release.zip",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "toolCallId": "call_abc",
+                "name": "download",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_abc",
+                        "value": [{"type": "text", "value": "Downloaded 4096 bytes"}],
+                        "isError": False,
+                    }
+                ],
+            },
+        ]
+
+        flattened = trae_client.flatten_query(messages)
+        structured = json.dumps(
+            trae_client.build_web_content(messages), ensure_ascii=False
+        )
+
+        for blob in (flattened, structured):
+            self.assertIn("call_abc", blob)
+            self.assertIn("download", blob)
+            self.assertIn("Downloaded 4096 bytes", blob)
+            self.assertNotIn("None", blob)
+
 
 class IdeRequestContextTests(unittest.TestCase):
     def test_runtime_prompt_uses_inherited_response_tools(self):
