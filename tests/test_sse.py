@@ -1946,6 +1946,86 @@ class WebEventTests(unittest.TestCase):
 
 
 
+    def test_context_window_exceeded_maps_to_openai_length(self):
+        """A truncated turn must not be reported to the client as ``stop``."""
+
+        for reason in (
+            "model_context_window_exceeded",
+            "context_window_exceeded",
+            "context_length_exceeded",
+        ):
+            with self.subTest(reason=reason):
+
+                async def events(reason=reason):
+                    yield "plan_item", {"id": "answer-1", "thought": "partial"}
+                    yield "done", {"stop_reason": reason}
+
+                result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+                self.assertEqual(result["choices"][0]["finish_reason"], "length")
+
+    def test_plan_item_content_is_not_dropped(self):
+        """plan_item carries the reply in ``content`` next to ``thought``."""
+
+        async def both():
+            yield "plan_item", {
+                "id": "p1",
+                "thought": "thinking",
+                "content": "the actual reply",
+            }
+            yield "done", {}
+
+        async def content_only():
+            yield "plan_item", {"id": "p1", "content": "the actual reply"}
+            yield "done", {}
+
+        result = asyncio.run(sse.collect_nonstream_web(both(), "m"))
+        content = result["choices"][0]["message"]["content"]
+        self.assertIn("thinking", content)
+        self.assertIn("the actual reply", content)
+
+        result = asyncio.run(sse.collect_nonstream_web(content_only(), "m"))
+        self.assertEqual(
+            result["choices"][0]["message"]["content"], "the actual reply"
+        )
+
+    def test_plan_item_content_streams_without_duplication(self):
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "step 1"}
+            yield "plan_item", {"id": "p1", "thought": "step 1 step 2"}
+            yield "plan_item", {
+                "id": "p1",
+                "thought": "step 1 step 2",
+                "content": "final answer",
+            }
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, done = _parse_chunks(chunks)
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertTrue(done)
+        self.assertEqual(content, "step 1 step 2\n\nfinal answer")
+
+    def test_raw_cache_read_tokens_are_reported(self):
+        usage = sse._map_usage(
+            {
+                "input_tokens": 29558,
+                "output_tokens": 11,
+                "cache_read_tokens": 28544,
+                "cache_write_tokens": 0,
+            }
+        )
+
+        self.assertEqual(usage["prompt_tokens"], 29558)
+        self.assertEqual(usage["completion_tokens"], 11)
+        self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 28544)
+
+        plain = sse._map_usage({"input_token": 5, "output_token": 2})
+        self.assertNotIn("prompt_tokens_details", plain)
+
     def test_web_message_event_content_is_translated(self):
         async def events():
             yield "message", {

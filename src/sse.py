@@ -436,6 +436,17 @@ def _map_usage(usage: Any) -> Optional[dict]:
     )
     if credits is not None:
         mapped["credits_consumed"] = credits
+    # Trae's raw stream reports prompt-cache hits (report 9.1:
+    # cache_read_tokens / cache_write_tokens). Surface the read count in the
+    # OpenAI-standard slot so a caller can see its cache savings.
+    cached = optional_number(
+        "cache_read_tokens",
+        "cacheReadTokens",
+        "cached_tokens",
+        "cachedTokens",
+    )
+    if cached is not None:
+        mapped["prompt_tokens_details"] = {"cached_tokens": int(cached)}
     return mapped
 
 
@@ -483,6 +494,12 @@ def _finish_reason(value: Any, has_tool_calls: bool) -> str:
         "max_output_tokens",
         "max_token",
         "token_limit",
+        # Trae reports an over-budget prompt/context as its own reason
+        # (report: finish_reason=model_context_window_exceeded). Mapping it to
+        # ``stop`` would tell the client a truncated answer is complete.
+        "model_context_window_exceeded",
+        "context_window_exceeded",
+        "context_length_exceeded",
     }:
         return "length"
     if reason in {"content_filter", "content-filter", "safety"}:
@@ -1257,7 +1274,26 @@ async def translate_ide_stream(
 
 
 def _web_plan_text(data: dict) -> str:
-    return data.get("thought") or data.get("reasoning_content") or ""
+    """Return the visible text of a remote ``plan_item`` event.
+
+    The remote SSE carries the reasoning trace in ``thought`` /
+    ``reasoning_content`` and the actual reply in ``content`` (report: plan_item
+    data = {id, thought, content}).  Both are cumulative snapshots, so append
+    the reply after the trace instead of dropping it; a plan item that only
+    carries ``content`` otherwise reads as an empty upstream response.
+    """
+
+    thought = data.get("thought") or data.get("reasoning_content") or ""
+    if not isinstance(thought, str):
+        thought = ""
+    content = _web_message_text({"content": data.get("content")})
+    if not content:
+        return thought
+    if not thought:
+        return content
+    if content in thought:
+        return thought
+    return f"{thought}\n\n{content}"
 
 
 def _web_finish_summary(data: dict) -> str:

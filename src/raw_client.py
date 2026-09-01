@@ -163,6 +163,15 @@ _KNOWN_MODELS = {
         "DeepSeek-V4-Flash-Official",
         "DeepSeek-V4-Flash \u6b63\u5f0f\u7248",
     ),
+    # The Pro counterpart was missing while Flash was pinned, so a raw request
+    # for the Pro official id fell back to the account default label.
+    "deepseek-v4-pro-official": RawModel(
+        "DeepSeek-V4-Pro-Official",
+        "DeepSeek-V4-Pro-Official",
+        "DeepSeek-V4-Pro \u6b63\u5f0f\u7248",
+    ),
+    "minimax-m3": RawModel("minimax-m3", "minimax-m3", "MiniMax M3"),
+    "qwen-3.7-plus": RawModel("qwen-3.7-plus", "qwen-3.7-plus", "Qwen 3.7 Plus"),
 }
 
 

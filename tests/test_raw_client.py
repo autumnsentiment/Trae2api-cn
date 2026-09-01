@@ -291,7 +291,44 @@ class RawClientBuildTests(unittest.TestCase):
             "Unexpected tool role message",
         )
 
+    def test_official_and_third_party_models_resolve_to_pinned_raw_ids(self):
+        """Cover the bundled TraeWork mapping table (config/raw/display)."""
+
+        expected = {
+            "auto": ("glm-5.2", "glm-5.2", "GLM-5.2"),
+            "glm-5.2": ("glm-5.2", "glm-5.2", "GLM-5.2"),
+            "glm-5.3": ("glm-5.3", "glm-5.3", "GLM-5.3"),
+            "coding": ("glm-5.1", "glm-5__v2", "GLM-5.1"),
+            "deepseek-v4-pro": (
+                "DeepSeek-V4-Pro",
+                "DeepSeek-V4-Pro__v2",
+                "DeepSeek-V4-Pro",
+            ),
+            "DeepSeek-V4-Pro-Official": (
+                "DeepSeek-V4-Pro-Official",
+                "DeepSeek-V4-Pro-Official",
+                "DeepSeek-V4-Pro \u6b63\u5f0f\u7248",
+            ),
+            "DeepSeek-V4-Flash-Official": (
+                "DeepSeek-V4-Flash-Official",
+                "DeepSeek-V4-Flash-Official",
+                "DeepSeek-V4-Flash \u6b63\u5f0f\u7248",
+            ),
+            "kimi-k2.6": ("kimi-k2.6", "kimi-k2.6__v2", "Kimi-K2.6"),
+            "minimax-m3": ("minimax-m3", "minimax-m3", "MiniMax M3"),
+            "qwen-3.7-plus": ("qwen-3.7-plus", "qwen-3.7-plus", "Qwen 3.7 Plus"),
+        }
+
+        for name, (config, raw, display) in expected.items():
+            with self.subTest(model=name):
+                resolved = raw_client.resolve_raw_model(name, {})
+                self.assertEqual(resolved.config_name, config)
+                self.assertEqual(resolved.raw_model_name, raw)
+                self.assertEqual(resolved.display_name, display)
+
     def test_build_body_preserves_renderer_tool_use_and_tool_result(self):
+        """Trae's renderer carries tool history as content blocks, not arrays."""
+
         """Trae's renderer carries tool history as content blocks, not arrays."""
 
         messages = [
