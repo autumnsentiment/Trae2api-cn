@@ -236,6 +236,35 @@ def build_cli_args(prompt: str, model: str, force_disable_tools: bool = False) -
     return args
 
 
+def renderer_block_text(block: Mapping[str, Any]) -> str:
+    """Extract text from a Trae renderer content block.
+
+    The desktop renderer serializes parts as ``{type:"text", value:...}`` and
+    tool results as ``{type:"tool_result", value:[{type:"text", value:...}]}``
+    (reverse-engineered NPi/$Pi converters).  Those blocks carry ``value``
+    rather than ``text``/``content``, so they otherwise read as empty.
+    """
+
+    value = block.get("value")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, Mapping):
+                nested = item.get("text") or item.get("content") or item.get("value")
+                if isinstance(nested, str):
+                    parts.append(nested)
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+# Backwards-compatible private alias used inside this module.
+_renderer_block_text = renderer_block_text
+
+
 def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -243,7 +272,13 @@ def _content_to_text(content: Any) -> str:
         parts: list[str] = []
         for block in content:
             if isinstance(block, dict):
-                parts.append(block.get("text") or block.get("content") or "")
+                text = block.get("text") or block.get("content")
+                if text in (None, ""):
+                    # Trae's renderer model carries tool results as
+                    # {type:"tool_result", value:[{type:"text", value:...}]}
+                    # and plain text as {type:"text", value:...}.
+                    text = _renderer_block_text(block)
+                parts.append(text or "")
             elif isinstance(block, str):
                 parts.append(block)
         return "\n".join(parts)
@@ -1079,9 +1114,17 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
     if function is None:
         function = raw
     inherited_synthetic_id = raw.get("_synthetic_id") is True
-    raw_id = _string_or_empty(raw.get("id")) or _string_or_empty(raw.get("tool_call_id"))
+    # Trae's renderer emits ``toolCallId`` on tool_use parts. Losing it forces
+    # a synthetic id, which breaks the client's tool_call_id/tool pairing.
+    raw_id = (
+        _string_or_empty(raw.get("id"))
+        or _string_or_empty(raw.get("tool_call_id"))
+        or _string_or_empty(raw.get("toolCallId"))
+    )
     if not raw_id and isinstance(function, dict):
-        raw_id = _string_or_empty(function.get("id"))
+        raw_id = _string_or_empty(function.get("id")) or _string_or_empty(
+            function.get("toolCallId")
+        )
     name = (
         _string_or_empty(function.get("name"))
         or _string_or_empty(raw.get("name"))
@@ -1114,6 +1157,7 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
             if key not in {
                 "id", "type", "name", "tool_name", "server_name", "index",
                 "function", "function_call", "functionCall",
+                "tool_call_id", "toolCallId",
             }
         }
     arguments_text = _stringify_tool_arguments(arguments)
@@ -1188,6 +1232,10 @@ def _tool_content_text(value: Any) -> str:
                     parts.append(str(text))
                 elif item.get("content") not in (None, ""):
                     parts.append(str(item["content"]))
+                else:
+                    nested = _renderer_block_text(item)
+                    if nested:
+                        parts.append(nested)
             elif item not in (None, ""):
                 parts.append(str(item))
         return "\n".join(parts).strip()
@@ -1220,6 +1268,19 @@ def tool_result_is_failed(message: Mapping[str, Any]) -> bool:
         return True
 
     content = message.get("content")
+    # Trae's renderer marks failures on the tool_result block itself
+    # ({type:"tool_result", isError:true}), not on the enclosing message.
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            for key in ("is_error", "isError"):
+                flag = block.get(key)
+                if flag is True or (
+                    isinstance(flag, str)
+                    and flag.strip().lower() in {"true", "1", "yes"}
+                ):
+                    return True
     text = _tool_content_text(content)
     parsed: Any = None
     if text:

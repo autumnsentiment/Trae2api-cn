@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -310,6 +311,94 @@ class ExtractionTests(unittest.TestCase):
             cli_client.tool_call_signature(messages[0]["tool_calls"][1]),
             cli_client.completed_tool_signatures(repaired),
         )
+
+
+class RendererMessageModelTests(unittest.TestCase):
+    """Cover Trae's renderer tool_use/tool_result content-block shapes."""
+
+    def test_tool_use_block_keeps_renderer_call_id(self):
+        block = {
+            "type": "tool_use",
+            "toolCallId": "call_abc",
+            "name": "download",
+            "parameters": {"url": "https://example.com/a.zip", "dest": "a.zip"},
+        }
+
+        call = cli_client.normalize_tool_call(block)
+
+        self.assertEqual(call["id"], "call_abc")
+        self.assertFalse(call["_synthetic_id"])
+        self.assertEqual(call["function"]["name"], "download")
+        self.assertEqual(
+            json.loads(call["function"]["arguments"])["dest"], "a.zip"
+        )
+
+    def test_tool_use_block_extracted_from_message_content(self):
+        calls = cli_client.extract_tool_calls(
+            {
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "toolCallId": "call_xyz",
+                            "name": "read_file",
+                            "parameters": {"path": "README.md"},
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual([call["id"] for call in calls], ["call_xyz"])
+
+    def test_renderer_tool_result_value_blocks_are_readable(self):
+        content = [
+            {
+                "type": "tool_result",
+                "toolCallId": "call_abc",
+                "value": [{"type": "text", "value": "Downloaded 4096 bytes"}],
+                "isError": False,
+            }
+        ]
+
+        self.assertEqual(
+            cli_client._content_to_text(content), "Downloaded 4096 bytes"
+        )
+
+    def test_renderer_text_block_value_is_readable(self):
+        self.assertEqual(
+            cli_client._content_to_text([{"type": "text", "value": "hello"}]),
+            "hello",
+        )
+
+    def test_renderer_tool_result_is_error_marks_failure(self):
+        failed = {
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "toolCallId": "call_abc",
+                    "value": [{"type": "text", "value": "denied"}],
+                    "isError": True,
+                }
+            ],
+        }
+        succeeded = {
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "toolCallId": "call_abc",
+                    "value": [{"type": "text", "value": "ok"}],
+                    "isError": False,
+                }
+            ],
+        }
+
+        self.assertTrue(cli_client.tool_result_is_failed(failed))
+        self.assertFalse(cli_client.tool_result_is_failed(succeeded))
 
 
 class PromptAndArgsTests(unittest.TestCase):

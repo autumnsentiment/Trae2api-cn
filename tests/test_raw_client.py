@@ -291,6 +291,63 @@ class RawClientBuildTests(unittest.TestCase):
             "Unexpected tool role message",
         )
 
+    def test_build_body_preserves_renderer_tool_use_and_tool_result(self):
+        """Trae's renderer carries tool history as content blocks, not arrays."""
+
+        messages = [
+            {"role": "user", "content": "download it"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_abc",
+                        "name": "download",
+                        "parameters": {
+                            "url": "https://example.com/a.zip",
+                            "dest": "a.zip",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "toolCallId": "call_abc",
+                "name": "download",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_abc",
+                        "value": [{"type": "text", "value": "Downloaded 4096 bytes"}],
+                        "isError": False,
+                    }
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ]
+
+        body = raw_client.build_raw_chat_body(messages, "auto")
+
+        assistant_message = next(
+            message for message in body["messages"] if message["role"] == "assistant"
+        )
+        assistant_text = assistant_message["content"][0]["text"]
+        self.assertIn("Client tool calls already issued", assistant_text)
+        self.assertIn("call_abc", assistant_text)
+        self.assertIn("download", assistant_text)
+        self.assertIn("a.zip", assistant_text)
+
+        tool_texts = [
+            block["text"]
+            for message in body["messages"]
+            if message["role"] == "user"
+            for block in message.get("content", [])
+            if "Client tool result" in block.get("text", "")
+        ]
+        self.assertTrue(tool_texts, "Expected a renderer tool result in the history")
+        self.assertIn("call_abc", tool_texts[0])
+        self.assertIn("Downloaded 4096 bytes", tool_texts[0])
+
     def test_build_body_does_not_synthesize_missing_native_tool_result(self):
         body = raw_client.build_raw_chat_body(
             [

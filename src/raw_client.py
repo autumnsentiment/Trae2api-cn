@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping, Optional
 import httpx
 
 from . import auth
-from .cli_client import strip_tool_call_blocks
+from .cli_client import renderer_block_text, strip_tool_call_blocks
 
 
 logger = logging.getLogger(__name__)
@@ -591,6 +591,13 @@ def _content_to_text(content: Any) -> str:
             text = block.get("text") or block.get("content")
             if isinstance(text, str):
                 parts.append(text)
+            elif block.get("value") is not None:
+                # Trae's renderer carries text/tool_result payloads in
+                # ``value`` ({type:"text", value:...} and
+                # {type:"tool_result", value:[{type:"text", value:...}]}).
+                nested = renderer_block_text(block)
+                if nested:
+                    parts.append(nested)
             elif block.get("type") in ("image", "image_url", "file"):
                 parts.append(f"[Unsupported {block.get('type')} input omitted]")
         return "\n".join(part for part in parts if part)
@@ -940,6 +947,41 @@ def _serialize_tool_calls(tool_calls: Any) -> str:
     )
 
 
+def _renderer_tool_use_blocks(content: Any) -> list[dict[str, Any]]:
+    """Collect Trae renderer ``tool_use`` content blocks as call records.
+
+    The desktop renderer stores assistant calls as
+    ``{type:"tool_use", toolCallId, name, parameters}`` blocks. Without this
+    the assistant turn carries no text and gets dropped, orphaning the tool
+    result that follows.
+    """
+
+    if not isinstance(content, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        if str(block.get("type") or "").strip().lower() != "tool_use":
+            continue
+        name = block.get("name")
+        if not name:
+            continue
+        calls.append(
+            {
+                "id": block.get("toolCallId")
+                or block.get("tool_call_id")
+                or block.get("id")
+                or "unknown",
+                "name": str(name),
+                "input": block.get("parameters")
+                if block.get("parameters") is not None
+                else block.get("input", {}),
+            }
+        )
+    return calls
+
+
 def _serialize_tool_call_context(tool_calls: Any) -> str:
     """Render assistant tool history as inert conversation context.
 
@@ -1165,6 +1207,12 @@ def build_raw_messages(
             call_context = _serialize_tool_call_context(tool_calls)
             if not call_context and isinstance(message.get("function_call"), Mapping):
                 call_context = _serialize_tool_call_context([message["function_call"]])
+            if not call_context:
+                # Trae's renderer keeps assistant calls as tool_use content
+                # blocks instead of an OpenAI ``tool_calls`` array.
+                call_context = _serialize_tool_call_context(
+                    _renderer_tool_use_blocks(content)
+                )
             if call_context:
                 text = "\n\n".join(part for part in (text, call_context) if part)
         native_message: dict[str, Any] = {"role": role}
