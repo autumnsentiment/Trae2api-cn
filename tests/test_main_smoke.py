@@ -709,6 +709,37 @@ class CheckinResultTests(unittest.TestCase):
         self.assertIn("account-1", claimed)
         self.assertNotIn("plain-account", claimed)
 
+    def test_auto_retry_still_sees_account_after_backoff_is_cleared(self):
+        """Clearing the backoff must not hide a still-unclaimed 9074 account."""
+
+        rotated = {
+            "token": "test-token",
+            # Backoff was reset, but the account has not claimed yet and its
+            # device id was already rotated once.
+            "checkin": {"retry_backoff": 0, "device_generation": 1},
+        }
+        raw_accounts = [("rotated-account", rotated), ("plain-account", {"token": "t"})]
+        claimed = []
+
+        async def fake_claim(account_id):
+            claimed.append(account_id)
+            return {"success": True, "skipped": False, "checked_in": True}
+
+        async def cycle():
+            with (
+                patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
+                patch("src.main._claim_checkin_account", side_effect=fake_claim),
+                patch("src.main._checkin_cooldown_remaining", return_value=0),
+                patch("src.main._checkin_cache_is_today", return_value=False),
+                patch("src.main._checkin_clear_retry_state"),
+            ):
+                await main_module._checkin_auto_retry_cycle()
+
+        asyncio.run(cycle())
+        self.assertIn("rotated-account", claimed)
+        # Still not a general poller.
+        self.assertNotIn("plain-account", claimed)
+
     def test_single_and_claim_all_share_account_lock(self):
         record = {"token": "test-token", "user_id": "user-1"}
         raw_accounts = [("account-1", record)]

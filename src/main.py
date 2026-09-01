@@ -4658,10 +4658,22 @@ async def _checkin_auto_retry_cycle() -> None:
     try:
         for account_id, record in auth.get_accounts_raw():
             checkin = record.get("checkin") or {}
-            if float(checkin.get("retry_backoff") or 0) <= 0:
-                continue
             if checkin.get("checked_in") is True and _checkin_cache_is_today(record):
-                _checkin_clear_retry_state(account_id)
+                if float(checkin.get("retry_backoff") or 0) > 0:
+                    _checkin_clear_retry_state(account_id)
+                continue
+            if not (record.get("token") or ""):
+                continue
+            # Only accounts that actually hit 9074 belong here; this loop must
+            # not turn into a general claim poller. ``device_generation``
+            # survives a retry-state reset, so an account stays visible after
+            # its backoff is cleared but before it has claimed.
+            pending_9074 = (
+                float(checkin.get("retry_backoff") or 0) > 0
+                or int(checkin.get("retry_9074_count") or 0) > 0
+                or int(checkin.get("device_generation") or 0) > 0
+            )
+            if not pending_9074:
                 continue
             cooldown = _checkin_cooldown_remaining(account_id)
             if cooldown:
