@@ -5505,6 +5505,17 @@ def _checkin_cooldown_payload(snapshot: dict, retry_after: int) -> dict:
     }
 
 
+def _checkin_device_rotation_enabled() -> bool:
+    """Whether a 9074 claim may rotate to a fresh device id.
+
+    Set ``TRAE_CHECKIN_NO_DEVICE_ROTATION=1`` to keep one fixed id per account.
+    """
+
+    return str(
+        os.environ.get("TRAE_CHECKIN_NO_DEVICE_ROTATION", "")
+    ).strip().lower() not in {"1", "true", "yes", "on"}
+
+
 async def _claim_checkin_throttled(account_id: str, token: str) -> tuple[dict | None, int]:
     """Send at most one claim after account cooldown and global spacing checks."""
     remaining = _checkin_cooldown_remaining(account_id)
@@ -5524,6 +5535,23 @@ async def _claim_checkin_throttled(account_id: str, token: str) -> tuple[dict | 
         finally:
             _CHECKIN_NEXT_CLAIM_AT = time.monotonic() + max(0.0, CHECKIN_INTERVAL)
 
+        if data.get("code") == 9074:
+            # 9074 is scoped to the device id, not the account: the same token
+            # claims successfully on a freshly derived id. Rotate once and retry
+            # before falling back to a timed cooldown.
+            if _checkin_device_rotation_enabled() and trae_client.rotate_checkin_device_id(
+                token, account_id
+            ):
+                logger.info(
+                    "checkin 9074 account=%s: rotated device id, retrying once",
+                    account_id,
+                )
+                try:
+                    data = await trae_client.claim_checkin_credits(token, account_id)
+                finally:
+                    _CHECKIN_NEXT_CLAIM_AT = time.monotonic() + max(
+                        0.0, CHECKIN_INTERVAL
+                    )
         if data.get("code") == 9074:
             retry_after = _checkin_start_cooldown(account_id)
             until = time.monotonic() + retry_after

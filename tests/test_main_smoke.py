@@ -7,7 +7,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 FAKE_CMD = str(Path(__file__).resolve().parent / "fake" / "fake_cli.cmd")
 WORKDIR = tempfile.mkdtemp(prefix="trae-relay-test-")
@@ -195,6 +195,9 @@ class CheckinResultTests(unittest.TestCase):
                 new=AsyncMock(side_effect=RuntimeError("skip work credits")),
             ),
             patch("src.main.auth.set_account_checkin"),
+            # A persistent 9074 must still surface; rotation is covered
+            # separately.
+            patch("src.main._checkin_device_rotation_enabled", return_value=False),
         ):
             response = asyncio.run(main_module.api_checkin_account("account-1"))
 
@@ -443,6 +446,9 @@ class CheckinResultTests(unittest.TestCase):
                 patch("src.main.CHECKIN_RETRY_AFTER", 60),
                 patch("src.main._CHECKIN_VERIFY_DELAYS", ()),
                 patch("src.main.time.monotonic", side_effect=lambda: clock[0]),
+                # Device rotation is covered separately; keep this focused on
+                # the cooldown gate.
+                patch("src.main._checkin_device_rotation_enabled", return_value=False),
             ):
                 first = await main_module.api_checkin_account("account-1")
                 second = await main_module.api_checkin_account("account-1")
@@ -458,6 +464,66 @@ class CheckinResultTests(unittest.TestCase):
         self.assertTrue(bodies[1]["skipped"])
         self.assertTrue(bodies[2]["success"])
         self.assertEqual(claim.await_count, 2)
+
+    def test_9074_rotates_device_id_and_retries_once(self):
+        """9074 is device-scoped: a fresh id lets the same account claim."""
+
+        claim = AsyncMock(
+            side_effect=[
+                {"code": 9074, "message": "too frequent"},
+                {"code": 0, "message": "success"},
+            ]
+        )
+        rotate = MagicMock(return_value="9999888877776666")
+        with (
+            patch(
+                "src.main.auth.get_account_record",
+                return_value={"token": "test-token"},
+            ),
+            patch("src.main.trae_client.claim_checkin_credits", new=claim),
+            patch("src.main.trae_client.rotate_checkin_device_id", new=rotate),
+            patch(
+                "src.main.trae_client.fetch_checkin_credits_status",
+                new=AsyncMock(return_value={"checked_in": False, "credits": 200}),
+            ),
+            patch(
+                "src.main._fetch_full_credits",
+                new=AsyncMock(return_value={"account_credits": {"remaining": 10}}),
+            ),
+            patch("src.main.auth.set_account_checkin"),
+            patch("src.main.CHECKIN_INTERVAL", 0),
+            patch.dict(main_module._CHECKIN_COOLDOWN_UNTIL, {}, clear=True),
+        ):
+            data, retry_after = asyncio.run(
+                main_module._claim_checkin_throttled("account-1", "test-token")
+            )
+
+        self.assertEqual(rotate.call_count, 1)
+        self.assertEqual(claim.await_count, 2)
+        self.assertEqual(data.get("code"), 0)
+        self.assertEqual(retry_after, 0)
+
+    def test_persistent_9074_still_falls_back_to_cooldown(self):
+        claim = AsyncMock(return_value={"code": 9074, "message": "too frequent"})
+        rotate = MagicMock(return_value="9999888877776666")
+        with (
+            patch(
+                "src.main.auth.get_account_record",
+                return_value={"token": "test-token"},
+            ),
+            patch("src.main.trae_client.claim_checkin_credits", new=claim),
+            patch("src.main.trae_client.rotate_checkin_device_id", new=rotate),
+            patch("src.main.CHECKIN_INTERVAL", 0),
+            patch("src.main.CHECKIN_RETRY_AFTER", 60),
+            patch.dict(main_module._CHECKIN_COOLDOWN_UNTIL, {}, clear=True),
+        ):
+            data, retry_after = asyncio.run(
+                main_module._claim_checkin_throttled("account-1", "test-token")
+            )
+
+        self.assertEqual(claim.await_count, 2)
+        self.assertEqual(data.get("code"), 9074)
+        self.assertGreater(retry_after, 0)
 
     def test_9074_backoff_escalates_after_repeated_failures(self):
         def scenario():

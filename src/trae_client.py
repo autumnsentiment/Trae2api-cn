@@ -393,13 +393,61 @@ def _checkin_identity(token: str, account_id: str = "") -> str:
     return token
 
 
+# Device-id generation per account identity. Advancing it moves an account off
+# a device id the upstream has rate limited (business code 9074).
+_CHECKIN_DEVICE_GENERATIONS: dict[str, int] = {}
+
+
+def checkin_device_generation(identity: str) -> int:
+    """Return the current device-id generation for an account identity."""
+
+    if not identity:
+        return 0
+    if identity in _CHECKIN_DEVICE_GENERATIONS:
+        return _CHECKIN_DEVICE_GENERATIONS[identity]
+    stored = 0
+    try:
+        record = auth.get_account_record(identity) or {}
+        checkin = record.get("checkin") or {}
+        stored = int(checkin.get("device_generation") or 0)
+    except Exception:
+        stored = 0
+    if stored < 0:
+        stored = 0
+    _CHECKIN_DEVICE_GENERATIONS[identity] = stored
+    return stored
+
+
+def rotate_checkin_device_id(token: str = "", account_id: str = "") -> str:
+    """Advance to the next device id after an upstream 9074 on the current one.
+
+    Probing showed 9074 is device-scoped: the same account claims successfully
+    on a freshly derived id. Returns the new id, or "" when an explicit id is
+    configured (rotating past an operator-pinned device id is not our call).
+    """
+
+    identity = _checkin_identity(token, account_id)
+    if not identity:
+        return ""
+    if _configured_checkin_device_id(identity, account_id):
+        return ""
+    generation = checkin_device_generation(identity) + 1
+    _CHECKIN_DEVICE_GENERATIONS[identity] = generation
+    try:
+        auth.merge_account_retry(identity, {"device_generation": generation})
+    except Exception:
+        logger.warning("checkin device rotation was not persisted")
+    return checkin_device_id_for(token, account_id)
+
+
 def checkin_device_id_for(token: str, account_id: str = "") -> str:
     """Return a stable, account-bound 16-digit device id.
 
-    The daily-checkin endpoint binds a device to an account and rejects a
-    changing/random fingerprint with business code 9074. Using the JWT's
-    stable ``data.id`` (or an explicit account id) survives token refreshes
-    while keeping different accounts on different device ids.
+    Business code 9074 ("too many users, retry later") is scoped to the device
+    id, not the account: probing showed a claim that returns 9074 on one id
+    succeeds immediately on a freshly derived id for the same account. The id
+    therefore stays stable across token refreshes, but a caller that keeps
+    hitting 9074 can advance ``generation`` to move off an exhausted id.
     """
     identity = _checkin_identity(token, account_id)
     configured = _configured_checkin_device_id(identity, account_id)
@@ -407,11 +455,14 @@ def checkin_device_id_for(token: str, account_id: str = "") -> str:
         return configured
     if not token and not account_id:
         return ""
-    if identity in _CHECKIN_DEVICE_IDS:
-        return _CHECKIN_DEVICE_IDS[identity]
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    generation = checkin_device_generation(identity)
+    cache_key = f"{identity}#{generation}"
+    if cache_key in _CHECKIN_DEVICE_IDS:
+        return _CHECKIN_DEVICE_IDS[cache_key]
+    material = identity if generation <= 0 else f"{identity}#gen{generation}"
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     did = str(int(digest, 16) % 10**16).zfill(16)
-    _CHECKIN_DEVICE_IDS[identity] = did
+    _CHECKIN_DEVICE_IDS[cache_key] = did
     return did
 
 def build_checkin_headers(token: str, account_id: str = "") -> dict[str, str]:
