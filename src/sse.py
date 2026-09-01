@@ -1300,6 +1300,22 @@ _NARRATION_SENTENCE_RE = re.compile(
 )
 
 
+# A cumulative snapshot can be cut mid-narration ("The", "The user wa"). Those
+# prefixes do not match the sentence pattern yet, so streaming them out would
+# leave a dangling fragment that no later frame can retract.
+_NARRATION_PREFIX_RE = re.compile(
+    r"""^[ \t]*(?:
+        t(?:h(?:e(?:\s+u(?:s(?:e(?:r(?:'?s?)?)?)?)?)?)?)?
+      | l(?:e(?:t(?:'?s?|\s+m(?:e)?)?)?)?
+      | i(?:\s+(?:n(?:e(?:e(?:d)?)?)?|s(?:h(?:o(?:u(?:l(?:d)?)?)?)?)?|w(?:i(?:l(?:l)?)?)?|m(?:u(?:s(?:t)?)?)?))?
+      | s(?:i(?:m(?:p(?:l(?:e)?)?)?)?)?
+      | n(?:o(?:\s+t(?:o(?:o(?:l(?:s)?)?)?)?)?)?
+      | t(?:h(?:i(?:s)?)?)?
+    )[ \t]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
 def _concise_reasoning_enabled() -> bool:
     return str(os.environ.get("TRAE_VERBOSE_REASONING", "")).strip().lower() not in {
         "1",
@@ -1325,6 +1341,9 @@ def strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> st
 
     if not text or not _concise_reasoning_enabled():
         return text
+    if hold_incomplete and _NARRATION_PREFIX_RE.match(text):
+        # Still inside a possible narration opener; wait for the full sentence.
+        return ""
     remainder = text
     removed = False
     for _ in range(6):
@@ -1339,7 +1358,10 @@ def strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> st
         removed = True
     if not removed:
         return text
-    return remainder.lstrip("\n") if remainder.strip() else text
+    if not remainder.strip():
+        return text
+    # The answer follows the dropped sentence, often after a space or newline.
+    return remainder.lstrip(" \t\n")
 
 
 def _web_plan_text(data: dict, *, hold_incomplete: bool = False) -> str:

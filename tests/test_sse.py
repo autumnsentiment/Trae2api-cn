@@ -2057,6 +2057,38 @@ class WebEventTests(unittest.TestCase):
             result["choices"][0]["message"]["content"], "The user wants X."
         )
 
+    def test_split_narration_prefix_never_leaks_a_dangling_fragment(self):
+        """Cumulative snapshots arrive mid-sentence ("The", "The user")."""
+
+        snapshots = [
+            "The",
+            "The user",
+            "The user wants the arrival time.",
+            "The user wants the arrival time. Leg 1: 340 km = 4h.",
+            "The user wants the arrival time. Leg 1: 340 km = 4h.\n20:45",
+        ]
+
+        async def events():
+            for snapshot in snapshots:
+                yield "plan_item", {"id": "p1", "thought": snapshot}
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, _ = _parse_chunks(chunks)
+        streamed = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertEqual(streamed, "Leg 1: 340 km = 4h.\n20:45")
+        self.assertFalse(streamed.startswith("The"))
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(
+            result["choices"][0]["message"]["content"],
+            "Leg 1: 340 km = 4h.\n20:45",
+        )
+
     def test_plain_answer_is_never_altered_by_the_filter(self):
         for answer in ("20:45", "340/85 = 4 hours.\n20:45", "Use s[::-1] to reverse."):
             with self.subTest(answer=answer):
