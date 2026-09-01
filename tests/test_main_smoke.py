@@ -77,6 +77,45 @@ class CheckinResultTests(unittest.TestCase):
         self.assertIn("9074", second_body["error"])
         self.assertEqual(status.await_count, 1)
 
+    def test_checked_in_status_retires_stale_9074_backoff(self):
+        """A leftover backoff would block tomorrow's first claim."""
+
+        record = {
+            "token": "test-token",
+            "checkin": {
+                "checked_in": False,
+                "retry_backoff": 3600.0,
+                "retry_9074_count": 22,
+            },
+        }
+        cleared = []
+        with (
+            patch("src.main.auth.get_account_record", return_value=record),
+            patch("src.main.auth.merge_account_checkin", return_value={}),
+            patch(
+                "src.main.trae_client.fetch_checkin_credits_status",
+                new=AsyncMock(return_value={"code": 0, "enable": True, "checked_in": True}),
+            ),
+            patch(
+                "src.main._checkin_clear_retry_state",
+                side_effect=lambda aid: cleared.append(aid),
+            ),
+            patch.dict(
+                main_module._CHECKIN_COOLDOWN_UNTIL,
+                {"account-1": time.monotonic() + 3600},
+                clear=True,
+            ),
+        ):
+            row = asyncio.run(
+                main_module._fetch_checkin_status_snapshot(
+                    "account-1", record, use_cached_on_cooldown=True
+                )
+            )
+
+        self.assertIs(row["checked_in"], True)
+        self.assertEqual(cleared, ["account-1"])
+        self.assertNotIn("account-1", main_module._CHECKIN_COOLDOWN_UNTIL)
+
     def test_claim_cooldown_does_not_block_status_read(self):
         """A claim-side 9074 must not freeze status on a stale checked_in."""
 

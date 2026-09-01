@@ -5293,6 +5293,12 @@ async def _fetch_checkin_status_snapshot(
     if status.get("checked_in") is True:
         _CHECKIN_ACCEPTED_UNTIL.pop(account_id, None)
         status = {**status, "verification_pending": False}
+        # The account is done for today, so a leftover 9074 backoff would only
+        # block tomorrow's first claim. Retire it together with the cooldown.
+        _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+        _CHECKIN_STATUS_COOLDOWN_UNTIL.pop(account_id, None)
+        if _checkin_retry_state(account_id)[0]:
+            _checkin_clear_retry_state(account_id)
     elif respect_pending and accepted_until > now:
         status = {
             **status,
