@@ -1274,7 +1274,75 @@ async def translate_ide_stream(
     yield "data: [DONE]\n\n"
 
 
-def _web_plan_text(data: dict) -> str:
+# Meta-narration the remote agent prepends to ``thought`` before the real
+# answer. The upstream ships reasoning and reply in one field, so a prompt
+# directive alone cannot keep this out of the visible answer.
+_NARRATION_SENTENCE_RE = re.compile(
+    r"""^[ \t]*(?:
+        (?:the\s+)?user(?:'s)?\s+(?:wants?|asks?|is\s+asking|input|query|question|
+            has\s+sent|request(?:s|ed)?|needs?)\b
+      | (?:so\s+|ok(?:ay)?[,.]?\s+|now[,.]?\s+)?let(?:'s|\s+me)\b
+      | i\s+(?:need\s+to|should|will|'ll|must|can)\b
+      | (?:this|that)\s+(?:is|does\s?n?o?t?|require)\b.{0,60}?
+            (?:question|request|tool|skill|exploration|change)
+      | (?:no|nothing)\s+(?:tools?|skill|codebase|file)\b
+      | simple\s+(?:factual|conceptual|knowledge)\s+question\b
+      | (?:this\s+is\s+a\s+)?(?:straightforward|simple|direct)\s+
+            (?:question|request|task)\b
+      | (?:the\s+)?(?:simplest|easiest|best|standard)\s+way\s+(?:is|would\s+be)\b
+      | (?:i'?ll\s+|i\s+will\s+)?answer\s+(?:in|with|concisely|directly|briefly)\b
+      | (?:here'?s|here\s+is)\s+(?:the|a)\s+(?:answer|solution|approach)\b
+    # A narration sentence can run straight into the answer without a space
+    # ("...two sentences.TCP is slower"), so do not require whitespace after
+    # the terminator.
+    )[^\n]*?(?:[.!?]|\n|$)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _concise_reasoning_enabled() -> bool:
+    return str(os.environ.get("TRAE_VERBOSE_REASONING", "")).strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> str:
+    """Drop leading meta-narration sentences from a cumulative answer snapshot.
+
+    Only a prefix is removed, so the result stays stable as the snapshot grows
+    (important for incremental streaming deltas).
+
+    With ``hold_incomplete`` the function returns ``""`` while the snapshot is
+    still nothing but narration.  A streaming caller must hold that text back:
+    once a delta is on the wire it cannot be retracted, and the answer that
+    follows would otherwise arrive behind the narration it was meant to replace.
+    Without the flag an all-narration snapshot is returned unchanged, which is
+    what a non-streaming caller wants as a last resort so the turn is not empty.
+    """
+
+    if not text or not _concise_reasoning_enabled():
+        return text
+    remainder = text
+    removed = False
+    for _ in range(6):
+        match = _NARRATION_SENTENCE_RE.match(remainder)
+        if not match or match.end() == 0:
+            break
+        candidate = remainder[match.end():]
+        if not candidate.strip():
+            # Nothing but narration so far.
+            return "" if hold_incomplete else text
+        remainder = candidate
+        removed = True
+    if not removed:
+        return text
+    return remainder.lstrip("\n") if remainder.strip() else text
+
+
+def _web_plan_text(data: dict, *, hold_incomplete: bool = False) -> str:
     """Return the visible text of a remote ``plan_item`` event.
 
     The remote SSE carries the reasoning trace in ``thought`` /
@@ -1287,6 +1355,7 @@ def _web_plan_text(data: dict) -> str:
     thought = data.get("thought") or data.get("reasoning_content") or ""
     if not isinstance(thought, str):
         thought = ""
+    thought = strip_reasoning_narration(thought, hold_incomplete=hold_incomplete)
     content = _web_message_text({"content": data.get("content")})
     if not content:
         return thought
@@ -1356,6 +1425,7 @@ async def translate_web_events(
     prefix_id = make_id()
     order: list[str] = []
     thoughts: dict[str, str] = {}
+    held_thoughts: dict[str, str] = {}
     streamed_text = ""
     message_text = ProtocolTextAccumulator()
     usage = None
@@ -1416,8 +1486,11 @@ async def translate_web_events(
             pid = str(data.get("id") or "")
             if pid:
                 thought = _hold_incomplete_tool_block(
-                    _visible_text(_web_plan_text(data))
+                    _visible_text(_web_plan_text(data, hold_incomplete=True))
                 )
+                held = _hold_incomplete_tool_block(_visible_text(_web_plan_text(data)))
+                if len(held) >= len(held_thoughts.get(pid, "")):
+                    held_thoughts[pid] = held
                 if pid not in thoughts:
                     order.append(pid)
                 previous = thoughts.get(pid, "")
@@ -1496,6 +1569,17 @@ async def translate_web_events(
                     started = True
                     yield openai_chunk(prefix_id, model, {"role": "assistant"})
                 yield openai_chunk(prefix_id, model, {"content": "\n\n" + final_summary})
+
+    if not streamed_text and not tool_calls.has_calls:
+        # Every plan item was narration that the filter held back. Flush it
+        # rather than letting the turn look like an empty upstream response.
+        held = "".join(held_thoughts.get(item, "") for item in order)
+        if held.strip():
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            streamed_text += held
+            yield openai_chunk(prefix_id, model, {"content": held})
 
     if fail_on_empty and not streamed_text and not tool_calls.has_calls:
         observed_model_event = bool(usage is not None or provider_model_name)
@@ -1949,6 +2033,7 @@ async def collect_nonstream_web(
     prefix_id = make_id()
     order: list[str] = []
     thoughts: dict[str, str] = {}
+    held_thoughts: dict[str, str] = {}
     message_text = ProtocolTextAccumulator()
     usage = None
     error_event = None
@@ -1994,8 +2079,13 @@ async def collect_nonstream_web(
             pid = str(data.get("id") or "")
             if pid:
                 thought = _hold_incomplete_tool_block(
-                    _visible_text(_web_plan_text(data))
+                    _visible_text(_web_plan_text(data, hold_incomplete=True))
                 )
+                # Remember the unfiltered text so a turn that never gets past
+                # narration still has something to return.
+                held = _hold_incomplete_tool_block(_visible_text(_web_plan_text(data)))
+                if len(held) >= len(held_thoughts.get(pid, "")):
+                    held_thoughts[pid] = held
                 if pid not in thoughts:
                     order.append(pid)
                 if len(thought) >= len(thoughts.get(pid, "")):
@@ -2025,6 +2115,10 @@ async def collect_nonstream_web(
         raise RuntimeError(f"trae {error_event.get('code','')}: {error_event.get('message','')}")
     _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
     content = "".join(thoughts.get(item, "") for item in order)
+    if not content.strip():
+        # Every plan item was pure narration. Returning it is better than
+        # reporting an empty upstream response.
+        content = "".join(held_thoughts.get(item, "") for item in order)
     message_content = message_text.visible.strip()
     if message_content:
         if not content:

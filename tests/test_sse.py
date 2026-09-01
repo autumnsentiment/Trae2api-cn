@@ -2009,6 +2009,64 @@ class WebEventTests(unittest.TestCase):
         self.assertTrue(done)
         self.assertEqual(content, "step 1 step 2\n\nfinal answer")
 
+    def test_reasoning_narration_is_dropped_from_visible_answer(self):
+        """The remote agent ships reasoning and reply in one ``thought`` field."""
+
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "The user wants a reversal."}
+            yield "plan_item", {
+                "id": "p1",
+                "thought": "The user wants a reversal.\nUse s[::-1].",
+            }
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, done = _parse_chunks(chunks)
+        streamed = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertTrue(done)
+        self.assertEqual(streamed, "Use s[::-1].")
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(
+            result["choices"][0]["message"]["content"], "Use s[::-1]."
+        )
+
+    def test_narration_only_turn_is_returned_not_reported_empty(self):
+        """Holding back every sentence would look like an empty upstream."""
+
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "The user wants X."}
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, _ = _parse_chunks(chunks)
+        streamed = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertEqual(streamed, "The user wants X.")
+        self.assertNotIn("empty response", streamed)
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(
+            result["choices"][0]["message"]["content"], "The user wants X."
+        )
+
+    def test_plain_answer_is_never_altered_by_the_filter(self):
+        for answer in ("20:45", "340/85 = 4 hours.\n20:45", "Use s[::-1] to reverse."):
+            with self.subTest(answer=answer):
+                self.assertEqual(sse.strip_reasoning_narration(answer), answer)
+
+    def test_verbose_reasoning_opt_out_keeps_narration(self):
+        narrated = "The user wants a reversal.\nUse s[::-1]."
+        with patch.dict(os.environ, {"TRAE_VERBOSE_REASONING": "1"}, clear=False):
+            self.assertEqual(sse.strip_reasoning_narration(narrated), narrated)
+
     def test_raw_cache_read_tokens_are_reported(self):
         usage = sse._map_usage(
             {
