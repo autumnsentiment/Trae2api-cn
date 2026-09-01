@@ -788,10 +788,14 @@ def response_style_instruction() -> str:
     if not _concise_reasoning_enabled():
         return ""
     return (
-        "Answer directly: state the result and the key facts or steps that "
-        "support it. Do not narrate your deliberation, restate the request, "
-        "describe what you are about to do, or explain your reasoning "
-        "process; give the conclusion and any code or commands it needs."
+        "Response format: your visible reply must contain only the final "
+        "answer. Start with the result itself. Never begin with a restatement "
+        "of the request or a description of your plan. Do not write sentences "
+        "about the user, the question, or yourself, such as \"The user wants\", "
+        "\"The user is asking\", \"Let me\", \"I need to\", \"This doesn't "
+        "require\", or \"No tools needed\". Keep the reasoning steps that the "
+        "answer genuinely needs (calculations, key facts, code) and drop "
+        "everything else. Emit each code block exactly once."
     )
 
 

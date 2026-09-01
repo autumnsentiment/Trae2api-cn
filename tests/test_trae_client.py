@@ -7,7 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from src import trae_client
+from src import raw_client, trae_client
 
 
 def _fake_jwt(user_id: str, issued_at: int) -> str:
@@ -600,15 +600,18 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
             [{"role": "user", "content": "why is TCP slower than UDP?"}], {}
         )
         self.assertEqual(plain[0]["role"], "system")
-        self.assertIn("Answer directly", plain[0]["content"])
-        self.assertIn("Answer directly", trae_client.flatten_query(plain))
+        directive = raw_client.response_style_instruction()
+        self.assertTrue(directive)
+        self.assertIn(directive, plain[0]["content"])
+        self.assertIn("only the final answer", plain[0]["content"])
+        self.assertIn("only the final answer", trae_client.flatten_query(plain))
 
         with_tools = trae_client._messages_with_client_runtime(
             [{"role": "user", "content": "read the readme"}],
             {"tools": TOOLS},
         )
         self.assertEqual(with_tools[0]["role"], "system")
-        self.assertIn("Answer directly", with_tools[0]["content"])
+        self.assertIn(directive, with_tools[0]["content"])
         # The tool runtime description must survive alongside the directive.
         self.assertIn("read_file", with_tools[0]["content"])
 
