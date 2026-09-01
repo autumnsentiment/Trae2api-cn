@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +76,50 @@ class CheckinResultTests(unittest.TestCase):
         self.assertTrue(second_body["stale"])
         self.assertIn("9074", second_body["error"])
         self.assertEqual(status.await_count, 1)
+
+    def test_claim_cooldown_does_not_block_status_read(self):
+        """A claim-side 9074 must not freeze status on a stale checked_in."""
+
+        status = AsyncMock(
+            return_value={
+                "code": 0,
+                "enable": True,
+                "checked_in": False,
+                "credits": 200,
+            }
+        )
+        record = {
+            "token": "test-token",
+            "checkin": {"checked_in": False, "credits": 200},
+        }
+        with (
+            patch("src.main.auth.get_account_record", return_value=record),
+            patch("src.main.auth.merge_account_checkin", return_value={}),
+            patch("src.main.trae_client.fetch_checkin_credits_status", new=status),
+            patch("src.main.CHECKIN_RETRY_AFTER", 60),
+            patch.dict(
+                main_module._CHECKIN_COOLDOWN_UNTIL,
+                {"account-1": time.monotonic() + 600},
+                clear=True,
+            ),
+            patch.dict(
+                main_module._CHECKIN_STATUS_COOLDOWN_UNTIL, {}, clear=True
+            ),
+        ):
+            row = asyncio.run(
+                main_module._fetch_checkin_status_snapshot(
+                    "account-1", record, use_cached_on_cooldown=True
+                )
+            )
+
+        # The status endpoint was still queried and its live value returned.
+        self.assertEqual(status.await_count, 1)
+        self.assertIs(row["checked_in"], False)
+        self.assertEqual(row["credits"], 200)
+        self.assertNotIn("stale", row)
+        # The pending claim window stays visible to the caller.
+        self.assertTrue(row["claim_rate_limited"])
+        self.assertGreater(row["retry_after_seconds"], 0)
 
     def test_checkin_cache_uses_china_business_day_and_status_timestamp(self):
         china = timezone(timedelta(hours=8))

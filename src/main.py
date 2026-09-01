@@ -184,6 +184,11 @@ _CHECKIN_CLAIM_GATE: asyncio.Lock | None = None
 _CHECKIN_CLAIM_GATE_LOOP: asyncio.AbstractEventLoop | None = None
 _CHECKIN_NEXT_CLAIM_AT = 0.0
 _CHECKIN_COOLDOWN_UNTIL: dict[str, float] = {}
+# The claim endpoint and the status endpoint are throttled independently: 9074
+# ("too many users, retry later") on claim does not stop status from answering
+# code=0. Track the status-side window separately so a claim cooldown cannot
+# freeze the dashboard on a stale checked_in value.
+_CHECKIN_STATUS_COOLDOWN_UNTIL: dict[str, float] = {}
 _CHECKIN_ACCEPTED_UNTIL: dict[str, float] = {}
 _CHECKIN_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 # Kept as a compatibility knob for older integrations; claim no longer runs
@@ -5236,19 +5241,27 @@ async def _fetch_checkin_status_snapshot(
         raise KeyError("account not found or token missing")
 
     cached_row = _cached_checkin_account_snapshot(account_id, record)
+    # The 9074 cooldown belongs to the *claim* endpoint only. Probing showed the
+    # status endpoint keeps answering code=0 during that window, so skipping it
+    # here only pinned the dashboard to a stale checked_in=false.
+    cooldown_remaining = (
+        _checkin_cooldown_remaining(account_id) if use_cached_on_cooldown else 0
+    )
     if use_cached_on_cooldown:
-        retry_after = _checkin_cooldown_remaining(account_id)
-        if retry_after:
+        status_cooldown = _checkin_status_cooldown_remaining(account_id)
+        if status_cooldown:
+            # The status endpoint itself answered 9074 recently; probing again
+            # only extends that window.
             return {
                 **cached_row,
                 "success": False,
                 "stale": True,
                 "rate_limited": True,
                 "retryable": True,
-                "retry_after_seconds": retry_after,
+                "retry_after_seconds": status_cooldown,
                 "error": (
                     "Trae checkin status skipped [9074]: local cooldown active; "
-                    f"retry after at least {retry_after}s"
+                    f"retry after at least {status_cooldown}s"
                 ),
             }
 
@@ -5261,6 +5274,7 @@ async def _fetch_checkin_status_snapshot(
             )
     if _checkin_response_is_rate_limited(status):
         retry_after = _checkin_start_cooldown(account_id)
+        _CHECKIN_STATUS_COOLDOWN_UNTIL[account_id] = time.monotonic() + retry_after
         return {
             **cached_row,
             "success": False,
@@ -5289,7 +5303,7 @@ async def _fetch_checkin_status_snapshot(
         _CHECKIN_ACCEPTED_UNTIL.pop(account_id, None)
 
     merged = auth.merge_account_checkin(account_id, status)
-    return {
+    row = {
         **cached_row,
         "checked_in": status.get("checked_in"),
         "credits": status.get("credits"),
@@ -5305,6 +5319,17 @@ async def _fetch_checkin_status_snapshot(
             ),
         ),
     }
+    if cooldown_remaining and status.get("checked_in") is not True:
+        # Report the live status and keep the claim window visible so the UI
+        # does not invite a claim the upstream will reject with 9074.
+        row.update(
+            {
+                "claim_rate_limited": True,
+                "retryable": True,
+                "retry_after_seconds": cooldown_remaining,
+            }
+        )
+    return row
 
 
 async def _fetch_checkin_account_snapshot(
@@ -5356,6 +5381,22 @@ def _checkin_claim_gate() -> asyncio.Lock:
         _CHECKIN_CLAIM_GATE = asyncio.Lock()
         _CHECKIN_CLAIM_GATE_LOOP = current_loop
     return _CHECKIN_CLAIM_GATE
+
+
+def _checkin_status_cooldown_remaining(account_id: str) -> int:
+    """Return the remaining window after the *status* endpoint returned 9074.
+
+    This is deliberately in-memory only: a claim-side 9074 is common and
+    persisted, while a status-side 9074 is rare and must not survive a restart
+    as a permanent read block.
+    """
+
+    until = _CHECKIN_STATUS_COOLDOWN_UNTIL.get(account_id, 0.0)
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        _CHECKIN_STATUS_COOLDOWN_UNTIL.pop(account_id, None)
+        return 0
+    return max(1, int(remaining))
 
 
 def _checkin_cooldown_remaining(account_id: str) -> int:

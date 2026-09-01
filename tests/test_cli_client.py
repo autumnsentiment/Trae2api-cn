@@ -371,6 +371,31 @@ class RendererMessageModelTests(unittest.TestCase):
             "hello",
         )
 
+    def test_invoke_tool_blocks_are_parsed_and_stripped(self):
+        """The ``invoke`` marker is part of Trae's text tool-block set."""
+
+        cases = {
+            '<invoke name="download">{"url":"u","dest":"d"}</invoke>': {
+                "url": "u",
+                "dest": "d",
+            },
+            '<invoke>{"name":"download","input":{"url":"u"}}</invoke>': {"url": "u"},
+            '<invoke name="download"><url>u</url><dest>d</dest></invoke>': {
+                "url": "u",
+                "dest": "d",
+            },
+        }
+        for text, want_args in cases.items():
+            with self.subTest(block=text[:32]):
+                calls = cli_client.extract_text_tool_calls(text)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["function"]["name"], "download")
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]), want_args
+                )
+                # The serialized block must never reach the user as text.
+                self.assertEqual(cli_client.strip_tool_call_blocks(text), "")
+
     def test_renderer_tool_result_is_error_marks_failure(self):
         failed = {
             "role": "tool",

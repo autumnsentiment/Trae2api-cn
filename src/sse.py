@@ -876,6 +876,7 @@ def _hold_incomplete_tool_block(
         ("<tool_use>", "</tool_use>"),
         ("<tool_call", "</tool_call>"),
         ("<tool_cell", "</tool_cell>"),
+        ("<invoke", "</invoke>"),
         ("<bash>", "</bash>"),
         ("<read>", "</read>"),
         ("<write>", "</write>"),

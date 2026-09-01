@@ -572,7 +572,7 @@ def strip_think_tags(text: str) -> str:
 
 
 _TEXT_TOOL_BLOCK_RE = re.compile(
-    r"<(?P<tag>opencode_tool_call|tool_use|tool_call|tool_cell|bash|read|write|edit|glob|grep|task)>"
+    r"<(?P<tag>opencode_tool_call|tool_use|tool_call|tool_cell|invoke|bash|read|write|edit|glob|grep|task)>"
     r"(?P<body>[\s\S]*?)</(?P=tag)>",
     flags=re.IGNORECASE,
 )
@@ -581,7 +581,7 @@ _OPENCODE_BAD_CLOSE_RE = re.compile(
     r"\s*</arg_value>\s*[\"'`]*\s*", flags=re.IGNORECASE
 )
 _NAMED_TOOL_BLOCK_RE = re.compile(
-    r"<(?P<tag>tool_call|tool_cell)\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>"
+    r"<(?P<tag>tool_call|tool_cell|invoke)\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>"
     r"(?P<body>[\s\S]*?)</(?P=tag)>",
     flags=re.IGNORECASE,
 )
@@ -885,7 +885,7 @@ _CLIENT_HISTORY_PARTIAL_PREFIX_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _HISTORY_PROTOCOL_TAG_RE = re.compile(
-    r"<\s*(?:opencode_tool_call|tool_use|tool_call|tool_cell|bash|read|write|edit|glob|grep|task)\b",
+    r"<\s*(?:opencode_tool_call|tool_use|tool_call|tool_cell|invoke|bash|read|write|edit|glob|grep|task)\b",
     flags=re.IGNORECASE,
 )
 
