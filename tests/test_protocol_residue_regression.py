@@ -371,8 +371,11 @@ class ProtocolResidueRegressionTests(unittest.TestCase):
         self.assertEqual(web_items[1]["data"]["content"], residue)
 
         converted = trae_client.convert_openai_messages(messages)
-        self.assertEqual(converted[0]["content"], "answer\n")
-        self.assertEqual(converted[1]["content"], residue)
+        # A relay-owned system directive may precede the history; assert on the
+        # forwarded conversation turns rather than absolute positions.
+        forwarded = [m for m in converted if m.get("role") != "system"]
+        self.assertEqual(forwarded[0]["content"], "answer\n")
+        self.assertEqual(forwarded[1]["content"], residue)
 
         native_payload = traework_native_bridge.build_native_payload(
             messages, "glm-5.3"

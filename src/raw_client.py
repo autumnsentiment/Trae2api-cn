@@ -767,6 +767,34 @@ def _tool_definitions_prompt(tool_defs: list[dict[str, Any]]) -> tuple[str, bool
     return encoded, True, int(payload["omitted_signatures"])
 
 
+def _concise_reasoning_enabled() -> bool:
+    """Whether to ask the model for conclusions instead of a narrated chain.
+
+    Set ``TRAE_VERBOSE_REASONING=1`` to keep the upstream's full deliberation in
+    the visible answer.
+    """
+
+    return str(os.environ.get("TRAE_VERBOSE_REASONING", "")).strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def response_style_instruction() -> str:
+    """Return the concise-answer directive, or "" when verbose mode is on."""
+
+    if not _concise_reasoning_enabled():
+        return ""
+    return (
+        "Answer directly: state the result and the key facts or steps that "
+        "support it. Do not narrate your deliberation, restate the request, "
+        "describe what you are about to do, or explain your reasoning "
+        "process; give the conclusion and any code or commands it needs."
+    )
+
+
 def build_runtime_system_prompt(
     tools: Any,
     client_context: Mapping[str, Any],
@@ -839,6 +867,12 @@ def build_runtime_system_prompt(
             lines.append(f"Tool choice requires the client tool named {selected['name']}.")
     if parallel_tool_calls is False:
         lines.append("Request at most one tool per turn.")
+    # The remote agent returns its reasoning trace and its reply in one
+    # ``thought`` field, so a narrated chain reaches the caller as the answer.
+    # Ask for the conclusion instead of the deliberation.
+    style = response_style_instruction()
+    if style:
+        lines.append(style)
     return "\n".join(lines)
 
 

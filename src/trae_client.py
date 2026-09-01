@@ -858,7 +858,13 @@ def _messages_with_client_runtime(
         and "client_context" not in options
         and "clientContext" not in options
     ):
-        return messages
+        # No tool runtime to describe, but the response-style constraint still
+        # applies: the remote agent otherwise returns its full reasoning trace
+        # as the visible answer.
+        style = raw_client.response_style_instruction()
+        if not style:
+            return messages
+        return [{"role": "system", "content": style}, *messages]
     tool_catalog = (
         options.get("tools")
         if "tools" in options

@@ -593,6 +593,33 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
         self.assertNotIn("None", structured)
         self.assertIn("call_1 read_file", structured)
 
+    def test_response_style_directive_reaches_plain_and_tool_requests(self):
+        """The remote agent returns reasoning as the answer without this."""
+
+        plain = trae_client._messages_with_client_runtime(
+            [{"role": "user", "content": "why is TCP slower than UDP?"}], {}
+        )
+        self.assertEqual(plain[0]["role"], "system")
+        self.assertIn("Answer directly", plain[0]["content"])
+        self.assertIn("Answer directly", trae_client.flatten_query(plain))
+
+        with_tools = trae_client._messages_with_client_runtime(
+            [{"role": "user", "content": "read the readme"}],
+            {"tools": TOOLS},
+        )
+        self.assertEqual(with_tools[0]["role"], "system")
+        self.assertIn("Answer directly", with_tools[0]["content"])
+        # The tool runtime description must survive alongside the directive.
+        self.assertIn("read_file", with_tools[0]["content"])
+
+    def test_verbose_reasoning_opt_out_removes_directive(self):
+        with patch.dict(os.environ, {"TRAE_VERBOSE_REASONING": "1"}, clear=False):
+            messages = trae_client._messages_with_client_runtime(
+                [{"role": "user", "content": "hello"}], {}
+            )
+
+        self.assertEqual([m["role"] for m in messages], ["user"])
+
     def test_renderer_tool_use_and_tool_result_survive_remote_flattening(self):
         """Trae's renderer keeps tool history in content blocks, not arrays."""
 
