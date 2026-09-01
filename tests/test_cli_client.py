@@ -371,6 +371,37 @@ class RendererMessageModelTests(unittest.TestCase):
             "hello",
         )
 
+    def test_repeated_placeholder_id_keeps_distinct_parallel_calls(self):
+        """Models sometimes echo the prompt's placeholder id for every call."""
+
+        text = (
+            '<opencode_tool_call>{"id":"call_unique","name":"download",'
+            '"input":{"url":"https://example.com/a.zip","dest":"a.zip"}}'
+            "</opencode_tool_call>"
+            '<opencode_tool_call>{"id":"call_unique","name":"download",'
+            '"input":{"url":"https://example.com/b.zip","dest":"b.zip"}}'
+            "</opencode_tool_call>"
+        )
+
+        calls = cli_client.extract_text_tool_calls(text)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len({call["id"] for call in calls}), 2)
+        targets = sorted(
+            json.loads(call["function"]["arguments"])["dest"] for call in calls
+        )
+        self.assertEqual(targets, ["a.zip", "b.zip"])
+
+    def test_identical_repeated_tool_call_still_collapses(self):
+        text = (
+            '<opencode_tool_call>{"id":"c1","name":"download",'
+            '"input":{"url":"u"}}</opencode_tool_call>'
+            '<opencode_tool_call>{"id":"c1","name":"download",'
+            '"input":{"url":"u"}}</opencode_tool_call>'
+        )
+
+        self.assertEqual(len(cli_client.extract_text_tool_calls(text)), 1)
+
     def test_invoke_tool_blocks_are_parsed_and_stripped(self):
         """The ``invoke`` marker is part of Trae's text tool-block set."""
 

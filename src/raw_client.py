@@ -796,7 +796,8 @@ def build_runtime_system_prompt(
         "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, or saved unless a matching client tool result in the conversation confirms success.",
         "Never repeat a completed tool call; do not describe that server's Linux filesystem as the caller workspace.",
         "To use one, emit exactly one JSON block as your entire response and include no other text:",
-        '<opencode_tool_call>{"id":"call_unique","name":"tool_name","input":{}}</opencode_tool_call>',
+        '<opencode_tool_call>{"id":"<unique-id>","name":"tool_name","input":{}}</opencode_tool_call>',
+        'Replace "<unique-id>" with a new identifier for every call; never reuse an id across calls.',
         "Fill input according to the selected tool schema and wait for the client result before continuing.",
     ]
     if tool_defs and not native_tools:
@@ -821,7 +822,7 @@ def build_runtime_system_prompt(
             [
                 schema_label,
                 tool_payload,
-                "To call a tool, emit exactly one block per call in this format and no final answer in the same turn: <opencode_tool_call>{\"id\":\"call_unique\",\"name\":\"tool_name\",\"input\":{}}</opencode_tool_call>. Fill input according to the selected tool schema.",
+                "To call a tool, emit exactly one block per call in this format and no final answer in the same turn: <opencode_tool_call>{\"id\":\"<unique-id>\",\"name\":\"tool_name\",\"input\":{}}</opencode_tool_call>. Replace \"<unique-id>\" with a distinct identifier per call and fill input according to the selected tool schema.",
             "After the client returns a tool result, continue from that result until the user's request is complete.",
             ]
         )

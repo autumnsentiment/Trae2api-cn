@@ -1573,6 +1573,14 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         # envelope.  The latter is only a compatibility fallback.
         call_id = call["id"]
         previous = deduped.get(call_id)
+        if previous is not None and not _same_tool_call(previous, call):
+            # Some models echo the prompt's placeholder id verbatim, so two
+            # genuinely different calls can share one id.  Re-key the later
+            # call instead of dropping it.
+            call = dict(call)
+            call["id"] = _rekeyed_tool_call_id(call, deduped)
+            deduped[call["id"]] = call
+            continue
         if previous is not None and previous.get("_history_marker") and not call.get(
             "_history_marker"
         ):
@@ -1580,6 +1588,33 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         else:
             deduped.setdefault(call_id, call)
     return list(deduped.values())
+
+
+def _same_tool_call(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Return whether two normalized calls request the same name/arguments."""
+
+    lf = left.get("function") if isinstance(left.get("function"), Mapping) else {}
+    rf = right.get("function") if isinstance(right.get("function"), Mapping) else {}
+    return (
+        _string_or_empty(lf.get("name")) == _string_or_empty(rf.get("name"))
+        and _string_or_empty(lf.get("arguments")) == _string_or_empty(rf.get("arguments"))
+    )
+
+
+def _rekeyed_tool_call_id(call: Mapping[str, Any], taken: Mapping[str, Any]) -> str:
+    """Return a free id for a call whose id collides with a different call."""
+
+    base = _string_or_empty(call.get("id")) or "call"
+    for suffix in range(2, 100):
+        candidate = f"{base}_{suffix}"
+        if candidate not in taken:
+            return candidate
+    function = call.get("function") if isinstance(call.get("function"), Mapping) else {}
+    return _stable_tool_id(
+        _string_or_empty(function.get("name")),
+        _string_or_empty(function.get("arguments")),
+        len(taken),
+    )
 
 
 def _iter_native_tool_calls(result: dict) -> list[dict]:
