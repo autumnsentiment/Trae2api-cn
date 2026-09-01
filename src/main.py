@@ -89,6 +89,11 @@ CHECKIN_RETRY_AFTER = float(
 CHECKIN_9074_MAX_BACKOFF = float(
     os.environ.get("TRAE_CHECKIN_9074_MAX_BACKOFF_SECONDS", "3600") or "3600"
 )
+# Cap the doubling so a long 9074 streak settles at minutes, not the ceiling.
+CHECKIN_9074_BACKOFF_EXPONENT_CAP = max(
+    0,
+    int(os.environ.get("TRAE_CHECKIN_9074_BACKOFF_EXPONENT_CAP", "3") or "3"),
+)
 CHECKIN_AUTO_RETRY_INTERVAL = float(
     os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
 )
@@ -5461,7 +5466,11 @@ def _checkin_next_backoff(account_id: str) -> float:
     """Exponential backoff for one account's 9074 streak."""
     _, count = _checkin_retry_state(account_id)
     base = max(1.0, float(CHECKIN_RETRY_AFTER))
-    backoff = base * (2 ** min(count, 10))
+    # 9074 is an upstream capacity signal ("too many users"), not a penalty for
+    # this account, and each retry now also rotates the device id. Escalate
+    # gently so a still-unclaimed account keeps getting attempts within the
+    # day instead of parking on the hour-long ceiling.
+    backoff = base * (2 ** min(count, CHECKIN_9074_BACKOFF_EXPONENT_CAP))
     max_backoff = max(base, float(CHECKIN_9074_MAX_BACKOFF))
     return max(base, min(backoff, max_backoff))
 

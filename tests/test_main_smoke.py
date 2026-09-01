@@ -597,7 +597,24 @@ class CheckinResultTests(unittest.TestCase):
         self.assertEqual(with_streak(0), 60)
         self.assertEqual(with_streak(1), 120)
         self.assertEqual(with_streak(2), 240)
-        self.assertEqual(with_streak(6), 3600)  # capped at max backoff
+        # Doubling stops at the exponent cap so a long streak keeps retrying
+        # within the day instead of parking on the hour-long ceiling.
+        self.assertEqual(with_streak(3), 480)
+        self.assertEqual(with_streak(6), 480)
+        self.assertEqual(with_streak(24), 480)
+
+        # A larger max window is still respected when the cap allows it.
+        record = {
+            "token": "test-token",
+            "checkin": {"retry_9074_count": 24},
+        }
+        with (
+            patch("src.main.auth.get_account_record", return_value=record),
+            patch("src.main.CHECKIN_RETRY_AFTER", 60),
+            patch("src.main.CHECKIN_9074_MAX_BACKOFF", 120),
+            patch("src.main.CHECKIN_9074_BACKOFF_EXPONENT_CAP", 10),
+        ):
+            self.assertEqual(main_module._checkin_next_backoff("account-1"), 120)
 
     def test_9074_cooldown_honors_persisted_wall_clock_deadline(self):
         now = 1_000_000.0
