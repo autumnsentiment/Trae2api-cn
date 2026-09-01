@@ -1841,6 +1841,55 @@ class WebEventTests(unittest.TestCase):
         self.assertEqual(content.count("B"), 1)
         self.assertTrue(done)
 
+    def test_summary_only_turn_keeps_its_text(self):
+        """Filtering must not empty a turn whose only content is the summary."""
+
+        async def events():
+            yield "plan_item", {
+                "id": "f1",
+                "tool_call_info": {
+                    "name": "finish",
+                    "params": {"summary": "The user wants a count. No tools needed."},
+                },
+            }
+            yield "done", {}
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        content = result["choices"][0]["message"]["content"]
+        self.assertIn("No tools needed", content)
+        self.assertNotIn("empty response", content)
+
+    def test_narrated_finish_summary_is_filtered_like_a_plan_thought(self):
+        """A narrated summary must not land after the answer already streamed."""
+
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "1, 2, 3"}
+            yield "plan_item", {
+                "id": "f1",
+                "tool_call_info": {
+                    "name": "finish",
+                    "params": {
+                        "summary": "The user wants me to count 1 to 3. No tools needed."
+                    },
+                },
+            }
+            yield "done", {}
+
+        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+        parsed, _ = _parse_chunks(chunks)
+        streamed = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertEqual(streamed, "1, 2, 3")
+        self.assertNotIn("The user wants", streamed)
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertNotIn(
+            "The user wants", result["choices"][0]["message"]["content"]
+        )
+
     def test_finish_plan_item_is_summary_not_tool_call(self):
         async def events():
             yield "plan_item", {

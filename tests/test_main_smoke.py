@@ -2917,6 +2917,133 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][2], True)
 
+    def test_model_test_endpoint_reports_text_and_tool_probes(self):
+        text_reply = JSONResponse(
+            {
+                "choices": [
+                    {"message": {"content": "pong"}, "finish_reason": "stop"}
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "total_tokens": 11,
+                },
+                "provider_model_name": "glm-5.3__max",
+            }
+        )
+        with patch("src.main._dispatch_chat", new=AsyncMock(return_value=text_reply)):
+            body = self.client.post(
+                "/api/model-test",
+                json={"model": "glm-5.3", "mode": "text"},
+                headers=AUTH_HEADERS,
+            ).json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["reply"], "pong")
+        self.assertEqual(body["provider_model_name"], "glm-5.3__max")
+        self.assertIsNone(body["error"])
+
+        tool_reply = JSONResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "relay_probe",
+                                        "arguments": '{"token":"pong"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {},
+            }
+        )
+        with patch("src.main._dispatch_chat", new=AsyncMock(return_value=tool_reply)):
+            body = self.client.post(
+                "/api/model-test",
+                json={"model": "glm-5.3", "mode": "tool"},
+                headers=AUTH_HEADERS,
+            ).json()
+        self.assertTrue(body["success"])
+        self.assertEqual(
+            [call["name"] for call in body["tool_calls"]], ["relay_probe"]
+        )
+
+    def test_model_test_endpoint_surfaces_failures(self):
+        empty = JSONResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "(trae upstream returned an empty response)"
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+        )
+        with patch("src.main._dispatch_chat", new=AsyncMock(return_value=empty)):
+            body = self.client.post(
+                "/api/model-test", json={"model": "m"}, headers=AUTH_HEADERS
+            ).json()
+        self.assertFalse(body["success"])
+        self.assertIn("empty response", body["error"])
+
+        upstream_502 = JSONResponse(
+            {"error": {"message": "All upstream paths failed: raw", "type": "api_error"}},
+            status_code=502,
+        )
+        with patch("src.main._dispatch_chat", new=AsyncMock(return_value=upstream_502)):
+            body = self.client.post(
+                "/api/model-test", json={"model": "m"}, headers=AUTH_HEADERS
+            ).json()
+        self.assertFalse(body["success"])
+        self.assertIn("All upstream paths failed", body["error"])
+
+        with patch(
+            "src.main._dispatch_chat", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            body = self.client.post(
+                "/api/model-test", json={"model": "m"}, headers=AUTH_HEADERS
+            ).json()
+        self.assertFalse(body["success"])
+        self.assertIn("boom", body["error"])
+
+        self.assertEqual(
+            self.client.post(
+                "/api/model-test", json={}, headers=AUTH_HEADERS
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/model-test",
+                json={"model": "m", "mode": "bogus"},
+                headers=AUTH_HEADERS,
+            ).status_code,
+            400,
+        )
+
+    def test_dashboard_exposes_model_connectivity_panel(self):
+        html = main_module._web_login_html()
+        for token in (
+            "conn-run-btn",
+            "runConnTest",
+            "/api/model-test",
+            "conn-tbody",
+            "conn-mode-tool",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, html)
+
     def test_stream_start_event_is_a_standard_assistant_chunk(self):
         raw = main_module._stream_start_event("glm-5.3")
         payload = json.loads(raw[len("data: "):].strip())
@@ -2924,9 +3051,11 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(payload["model"], "glm-5.3")
         self.assertEqual(len(payload["choices"]), 1)
         choice = payload["choices"][0]
-        self.assertEqual(choice["delta"]["role"], "assistant")
         self.assertEqual(choice["delta"]["content"], "")
         self.assertIsNone(choice["finish_reason"])
+        # The assistant role belongs to the translator's opening frame; sending
+        # it here too would emit it twice in one stream.
+        self.assertNotIn("role", choice["delta"])
 
     def test_get_v1_models(self):
         response = self.client.get("/v1", headers=AUTH_HEADERS)

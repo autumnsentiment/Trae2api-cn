@@ -276,6 +276,9 @@ PUBLIC_PATHS = {
     "/api/checkin/work-credits",
     "/api/usage/last",
     "/api/usage/records",
+    # Dashboard-only diagnostic, grouped with the other local console
+    # endpoints. It sends a fixed one-line probe and returns no credential.
+    "/api/model-test",
 }
 PUBLIC_PATH_PREFIXES = ("/api/checkin", "/api/accounts")
 WEB_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "web_login.py"
@@ -1014,6 +1017,45 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
 <pre id="models-out" style="margin-top:12px;padding:12px;background:#252836;border-radius:6px;font-size:12px;max-height:220px;overflow:auto;white-space:pre-wrap;color:#c8cbd6;display:none"></pre>
 <div id="models-msg" class="msg"></div>
 </div>
+<div class="panel-card" id="conn-panel">
+  <div class="section-head">
+    <div class="section-title">模型连通性测试</div>
+    <span id="conn-summary" class="section-meta">未运行</span>
+  </div>
+  <div class="form-group">
+    <label for="conn-models">测试模型（逗号或换行分隔，留空使用下方常用模型）</label>
+    <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"
+      style="width:100%;box-sizing:border-box;padding:8px;background:#252836;border:1px solid #363a4a;border-radius:6px;color:#e6e8ef;font-size:12px;font-family:inherit"></textarea>
+  </div>
+  <div class="form-group">
+    <label>测试内容</label>
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+        <input type="checkbox" id="conn-mode-text" checked> 文本回复
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+        <input type="checkbox" id="conn-mode-tool"> 工具调用
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+        超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"
+          style="width:72px;padding:4px 6px;background:#252836;border:1px solid #363a4a;border-radius:4px;color:#e6e8ef">
+      </label>
+    </div>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-secondary" id="conn-run-btn" onclick="runConnTest()">开始测试</button>
+    <button class="btn btn-secondary" onclick="fillConnPreset()">填入常用模型</button>
+  </div>
+  <table id="conn-table" style="width:100%;margin-top:12px;border-collapse:collapse;font-size:12px;display:none">
+    <thead><tr style="text-align:left;color:#9aa0b0">
+      <th style="padding:6px 4px">模型</th><th style="padding:6px 4px">类型</th>
+      <th style="padding:6px 4px">结果</th><th style="padding:6px 4px">耗时</th>
+      <th style="padding:6px 4px">详情</th>
+    </tr></thead>
+    <tbody id="conn-tbody"></tbody>
+  </table>
+  <div id="conn-msg" class="msg"></div>
+</div>
 </div>
 <script>
 const state = {{ traceId: null, win: null }};
@@ -1311,6 +1353,96 @@ function checkinFailureText(account){{
   var message=(account&&account.error)||((account&&account.data&&account.data.message)||'未知错误');
   return (account&&account.label||account&&account.id||'账号')+'：'+(code?'业务码 '+code+'，':'')+message;
 }}
+const CONN_PRESET = ['glm-5.3','glm-5.2','DeepSeek-V4-Pro-Official','DeepSeek-V4-Flash-Official'];
+function fillConnPreset(){{
+  document.getElementById('conn-models').value = CONN_PRESET.join(', ');
+}}
+function connModelList(){{
+  var raw = document.getElementById('conn-models').value || '';
+  var items = raw.split(/[\n,]+/).map(function(s){{ return s.trim(); }}).filter(Boolean);
+  return items.length ? items : CONN_PRESET.slice();
+}}
+function connModes(){{
+  var modes = [];
+  if(document.getElementById('conn-mode-text').checked) modes.push('text');
+  if(document.getElementById('conn-mode-tool').checked) modes.push('tool');
+  return modes;
+}}
+function connRow(model, mode){{
+  var tr = document.createElement('tr');
+  tr.style.borderTop = '1px solid #2c303d';
+  var label = mode === 'tool' ? '工具调用' : '文本回复';
+  tr.innerHTML = '<td style="padding:6px 4px">' + model + '</td>'
+    + '<td style="padding:6px 4px">' + label + '</td>'
+    + '<td style="padding:6px 4px" class="conn-status">排队中</td>'
+    + '<td style="padding:6px 4px" class="conn-time">-</td>'
+    + '<td style="padding:6px 4px;color:#9aa0b0" class="conn-detail">-</td>';
+  return tr;
+}}
+async function runConnTest(){{
+  var btn = document.getElementById('conn-run-btn');
+  var table = document.getElementById('conn-table');
+  var tbody = document.getElementById('conn-tbody');
+  var summary = document.getElementById('conn-summary');
+  var models = connModelList();
+  var modes = connModes();
+  if(!modes.length){{ showMsg('conn-msg','请至少选择一种测试内容',false); return; }}
+  var timeout = parseInt(document.getElementById('conn-timeout').value,10) || 120;
+  btn.disabled = true;
+  table.style.display = 'table';
+  tbody.innerHTML = '';
+  showMsg('conn-msg','');
+  var jobs = [];
+  models.forEach(function(model){{
+    modes.forEach(function(mode){{
+      var tr = connRow(model, mode);
+      tbody.appendChild(tr);
+      jobs.push({{model: model, mode: mode, row: tr}});
+    }});
+  }});
+  var passed = 0, done = 0;
+  summary.textContent = '0/' + jobs.length + ' 完成';
+  for(var i = 0; i < jobs.length; i++){{
+    var job = jobs[i];
+    var statusCell = job.row.querySelector('.conn-status');
+    var timeCell = job.row.querySelector('.conn-time');
+    var detailCell = job.row.querySelector('.conn-detail');
+    statusCell.textContent = '测试中...';
+    statusCell.style.color = '#9aa0b0';
+    try{{
+      var d = await postJSON('/api/model-test',
+        {{model: job.model, mode: job.mode, timeout: timeout}}, (timeout + 20) * 1000);
+      timeCell.textContent = (d.elapsed_ms !== undefined ? d.elapsed_ms + ' ms' : '-');
+      if(d.success){{
+        passed++;
+        statusCell.textContent = '通过';
+        statusCell.style.color = '#4ade80';
+        if(job.mode === 'tool'){{
+          var names = (d.tool_calls || []).map(function(c){{ return c.name; }}).join(', ');
+          detailCell.textContent = 'tool=' + (names || '-')
+            + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
+        }} else {{
+          detailCell.textContent = JSON.stringify(d.reply || '')
+            + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
+        }}
+      }} else {{
+        statusCell.textContent = '失败';
+        statusCell.style.color = '#f87171';
+        detailCell.textContent = String(d.error || 'unknown');
+      }}
+    }}catch(e){{
+      statusCell.textContent = '失败';
+      statusCell.style.color = '#f87171';
+      timeCell.textContent = '-';
+      detailCell.textContent = String(e);
+    }}
+    done++;
+    summary.textContent = done + '/' + jobs.length + ' 完成，通过 ' + passed;
+  }}
+  btn.disabled = false;
+  var allOk = passed === jobs.length;
+  showMsg('conn-msg', '测试结束：' + passed + '/' + jobs.length + ' 通过', allOk);
+}}
 async function refreshModels(){{
   var el=document.getElementById('models-out');
   var msg=document.getElementById('models-msg');
@@ -1543,6 +1675,10 @@ def _stream_start_event(model: str) -> str:
     as an empty response and close/retry before the upstream request finishes.
     An empty OpenAI delta keeps those clients attached without exposing text or
     inventing a completion.
+
+    The delta is deliberately empty: emitting ``role`` here would duplicate the
+    translator's own opening frame, and the OpenAI stream contract carries the
+    assistant role exactly once.
     """
     return (
         "data: "
@@ -1555,7 +1691,7 @@ def _stream_start_event(model: str) -> str:
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
+                        "delta": {"content": ""},
                         "finish_reason": None,
                     }
                 ],
@@ -4876,6 +5012,169 @@ async def chat_completions(req: Request):
 @app.post("/v1/responses")
 async def responses(req: Request):
     return await handle_responses(req)
+
+
+@app.post("/api/model-test")
+async def api_model_test(req: Request):
+    """Probe one model end to end through the real dispatch path.
+
+    Runs the same routing a client request would, so the result reflects actual
+    connectivity rather than a config lookup. ``mode`` selects a plain text
+    probe or a tool-call probe.
+    """
+
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return JSONResponse(
+            {"success": False, "error": "model is required"}, status_code=400
+        )
+    mode = str(body.get("mode") or "text").strip().lower()
+    if mode not in {"text", "tool"}:
+        return JSONResponse(
+            {"success": False, "error": "mode must be text or tool"}, status_code=400
+        )
+    try:
+        timeout = float(body.get("timeout") or 120)
+    except (TypeError, ValueError):
+        timeout = 120.0
+    timeout = max(10.0, min(timeout, 600.0))
+
+    probe_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "relay_probe",
+                "description": "Echo a probe token back to the relay",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"token": {"type": "string"}},
+                    "required": ["token"],
+                },
+            },
+        }
+    ]
+    if mode == "tool":
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Call relay_probe with token=\"pong\". Tool call only, "
+                    "no explanation."
+                ),
+            }
+        ]
+        options: dict[str, Any] = {
+            "tools": probe_tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+    else:
+        messages = [{"role": "user", "content": "Reply with exactly: pong"}]
+        options = {}
+    options["max_tokens"] = 64
+
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            _dispatch_chat(messages, model, False, options),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {
+                "success": False,
+                "model": model,
+                "mode": mode,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "error": f"timed out after {int(timeout)}s",
+            }
+        )
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "success": False,
+                "model": model,
+                "mode": mode,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "error": str(exc)[:400],
+            }
+        )
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    payload: dict[str, Any] = {}
+    http_status = 200
+    if isinstance(result, JSONResponse):
+        http_status = result.status_code
+        try:
+            payload = json.loads(bytes(result.body).decode("utf-8"))
+        except Exception:
+            payload = {}
+    elif isinstance(result, Mapping):
+        payload = dict(result)
+    if not isinstance(payload, dict):
+        payload = {}
+    upstream_error = payload.get("error")
+    if http_status >= 400 or isinstance(upstream_error, Mapping):
+        message = ""
+        if isinstance(upstream_error, Mapping):
+            message = str(upstream_error.get("message") or "")
+        return JSONResponse(
+            {
+                "success": False,
+                "model": model,
+                "mode": mode,
+                "elapsed_ms": elapsed_ms,
+                "error": (message or f"upstream returned HTTP {http_status}")[:400],
+            }
+        )
+    result = payload
+    choice = ((result or {}).get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = str(message.get("content") or "")
+    tool_calls = message.get("tool_calls") or []
+    usage = (result or {}).get("usage") or {}
+    empty_marker = "trae upstream returned an empty response" in content
+    if mode == "tool":
+        ok = bool(tool_calls)
+    else:
+        ok = bool(content.strip()) and not empty_marker
+    return JSONResponse(
+        {
+            "success": ok,
+            "model": model,
+            "mode": mode,
+            "elapsed_ms": elapsed_ms,
+            "finish_reason": choice.get("finish_reason"),
+            "provider_model_name": (result or {}).get("provider_model_name") or "",
+            "reply": content[:200],
+            "tool_calls": [
+                {
+                    "name": (call.get("function") or {}).get("name"),
+                    "arguments": ((call.get("function") or {}).get("arguments") or "")[
+                        :120
+                    ],
+                }
+                for call in tool_calls
+                if isinstance(call, dict)
+            ],
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            },
+            "error": None if ok else (
+                "upstream returned an empty response"
+                if empty_marker or not content.strip()
+                else "no tool call was returned"
+            ),
+        }
+    )
 
 
 @app.get("/v1")

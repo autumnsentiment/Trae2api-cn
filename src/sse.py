@@ -1574,7 +1574,12 @@ async def translate_web_events(
                 completed_tool_signatures,
             ):
                 yield chunk
-        final_summary = _visible_text(final_summary).strip()
+        # The finish summary is another reasoning surface, so apply the same
+        # narration filter used for plan thoughts. Without this a narrated
+        # summary arrives *after* the answer that already streamed.
+        final_summary = strip_reasoning_narration(
+            _visible_text(final_summary).strip(), hold_incomplete=True
+        ).strip()
     # Do not present a web agent's remote tool result as the external client's
     # tool result. The API client owns execution and the following turn.
     if not tool_calls.has_calls:
@@ -2158,7 +2163,17 @@ async def collect_nonstream_web(
             completed_tool_signatures,
         )
         tool_calls.add(summary_calls)
-        final_summary = _visible_text(final_summary).strip()
+        # ``hold_incomplete`` also applies here: an all-narration summary is
+        # dropped rather than appended after the answer. The plan thoughts above
+        # already guarantee the turn is not empty.
+        summary_text = _visible_text(final_summary).strip()
+        filtered_summary = strip_reasoning_narration(
+            summary_text, hold_incomplete=True
+        ).strip()
+        # Keep the raw summary only when it is the turn's sole content.
+        final_summary = filtered_summary or (
+            summary_text if not any(thoughts.values()) else ""
+        )
     if not tool_calls.has_calls:
         if not content:
             content = final_summary
