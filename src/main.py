@@ -319,6 +319,7 @@ PUBLIC_PATHS = {
     "/api/polling-mode",
     "/api/max-mode",
     "/api/max-mode/models",
+    "/api/auto-route",
     "/api/checkin/status",
     "/api/checkin/claim",
     "/api/checkin/accounts",
@@ -696,6 +697,7 @@ def _web_login_html() -> str:
     accounts = auth.list_accounts()
     polling = auth.get_polling_status()
     settings = auth.get_settings()
+    auto_route_on = _auto_route_enabled()
 
     # 根据当前状态显示不同文案
     status_html = f"""
@@ -708,7 +710,7 @@ def _web_login_html() -> str:
       <span class="label">源</span>
       <code>{html_mod.escape(state.source)}</code>
       <span class="label separator">上游</span>
-      <code>{html_mod.escape(_current_upstream_mode())}</code>
+      <code>{html_mod.escape(AUTO_ROUTE_MODE if auto_route_on else _current_upstream_mode())}</code>
     </div>
     <div class="status-row">
       <span class="label">轮询</span>
@@ -853,6 +855,8 @@ def _web_login_html() -> str:
     max_checked = 'checked' if max_settings.get('enabled') else ''
     max_models = html_mod.escape(max_settings.get('models') or '')
     max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
+    auto_route_checked = 'checked' if auto_route_on else ''
+    auto_route_state_text = '已开启' if auto_route_on else '已关闭'
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1207,6 +1211,17 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
 </div>
 <div id="settings-msg" class="msg"></div>
 </div>
+<div class="panel-card" id="auto-route-panel">
+  <div class="section-head">
+    <div class="section-title">自动路由</div>
+    <span id="auto-route-state" class="section-meta">{auto_route_state_text}</span>
+  </div>
+  <div class="check-row">
+    <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="saveAutoRoute()">
+    <label for="auto-route-toggle" style="cursor:pointer" title="开启后忽略上方预设端点的模式选择；端点失败时回落 Remote">启用自动路由（工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote）</label>
+  </div>
+  <div id="auto-route-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
 <div class="panel-card" id="max-mode-panel">
   <div class="section-head">
     <div class="section-title">1M 上下文（Max 模式）</div>
@@ -1287,6 +1302,7 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   <div class="form-group">
     <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
     <select id="conn-endpoint">
+      <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
       <option value="remote">Remote / chat_sessions</option>
       <option value="raw">IDE Raw / llm_raw_chat</option>
       <option value="ide">IDE Agent / llm_utils_chat</option>
@@ -1699,11 +1715,11 @@ async function runConnTest(){{
         statusCell.style.color = '#0d8a5f';
         if(job.mode === 'tool'){{
           var names = (d.tool_calls || []).map(function(c){{ return c.name; }}).join(', ');
-          detailCell.textContent = 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
+          detailCell.textContent = (d.auto_route ? 'auto -> ' : '') + 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
             + (d.fallback_used ? ' (fallback)' : '') + ' | tool=' + (names || '-')
             + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
         }} else {{
-          detailCell.textContent = 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
+          detailCell.textContent = (d.auto_route ? 'auto -> ' : '') + 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
             + (d.fallback_used ? ' (fallback)' : '') + ' | ' + JSON.stringify(d.reply || '')
             + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
         }}
@@ -1795,6 +1811,18 @@ async function saveSettings(){{
   var d=await postJSON('/api/settings',{{web_base_url:web,relay_port:port,upstream_mode:mode}});
   if(d.success){{ showMsg('settings-msg',d.note||'设置已保存',true); setTimeout(function(){{ location.reload(); }},800); }}
   else showMsg('settings-msg',d.error||'保存失败',false);
+}}
+async function saveAutoRoute(){{
+  var toggle=document.getElementById('auto-route-toggle');
+  var d=await postJSON('/api/auto-route',{{enabled:toggle.checked}});
+  if(d.success){{
+    toggle.checked=!!d.enabled;
+    document.getElementById('auto-route-state').textContent=d.enabled?'已开启':'已关闭';
+    showMsg('auto-route-msg',d.enabled?'自动路由已开启，下一个请求生效':'自动路由已关闭，使用预设端点',true,3000);
+  }} else {{
+    toggle.checked=!toggle.checked;
+    showMsg('auto-route-msg',d.error||'保存失败',false);
+  }}
 }}
 async function saveMaxMode(){{
   var enabled=document.getElementById('max-mode-toggle').checked;
@@ -2081,7 +2109,7 @@ async def _deferred_dispatch_stream(
     # response and close the HTTP stream before asking for the next frame. The
     # old ordering created the upstream task *after* that first yield, so the
     # request could be cancelled without ever reaching Trae.
-    options = dict(options or {})
+    options = _apply_auto_route(messages, options)
     requested_mode = str(
         options.get("_upstream_mode") or _current_upstream_mode()
     ).strip().lower()
@@ -5190,8 +5218,65 @@ def _raw_app_config_known_missing(model: Any, options: Mapping) -> bool:
     return True
 
 
+AUTO_ROUTE_MODE = "auto-route"
+# Endpoints chosen by auto routing. IDE Agent passes the full tool suite
+# (including parallel calls); Remote is the general chat path and the final
+# fallback for everything.
+AUTO_ROUTE_TOOL_ENDPOINT = "ide"
+AUTO_ROUTE_CHAT_ENDPOINT = "remote"
+
+
+def _auto_route_enabled() -> bool:
+    try:
+        return bool(auth.get_auto_route_settings().get("enabled"))
+    except Exception:
+        return False
+
+
+def _apply_auto_route(
+    messages: Optional[list[dict]], options: Optional[dict]
+) -> dict:
+    """Resolve the endpoint for one request when auto routing applies.
+
+    Auto routing runs when the caller asked for ``auto-route`` explicitly, or
+    when the console switch is on and the request carries no explicit
+    endpoint.  Tool requests (tool definitions or tool history) go to IDE
+    Agent, plain chat goes to Remote; the dispatcher's existing fallback then
+    lands on Remote if the chosen endpoint fails.
+    """
+
+    options = dict(options or {})
+    explicit = str(options.get("_upstream_mode") or "").strip().lower()
+    if explicit and explicit != AUTO_ROUTE_MODE:
+        return options
+    if options.get("_traework_custom_model"):
+        return options
+    if not explicit:
+        if not _auto_route_enabled():
+            return options
+        # Local CLI / native helper modes are host-specific; leave them alone.
+        if _current_upstream_mode() in (
+            "cli", "traework-native", "native", "traework"
+        ):
+            return options
+    uses_tools = _tool_protocol_requested(options, messages)
+    endpoint = AUTO_ROUTE_TOOL_ENDPOINT if uses_tools else AUTO_ROUTE_CHAT_ENDPOINT
+    options["_upstream_mode"] = endpoint
+    options["_auto_route"] = "tools" if uses_tools else "chat"
+    trace = options.get("_upstream_trace")
+    if isinstance(trace, dict):
+        trace.update(auto_route=True, auto_route_reason=options["_auto_route"])
+    logger.info(
+        "auto route id=%s model_request=%s endpoint=%s",
+        str(options.get("_relay_request_id") or ""),
+        options["_auto_route"],
+        endpoint,
+    )
+    return options
+
+
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
-    options = options or {}
+    options = _apply_auto_route(messages, options)
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
     trace = options.get("_upstream_trace")
     if isinstance(trace, dict):
@@ -5958,6 +6043,7 @@ async def status():
         "base_url": state.host,
         "web_base": auth.get_settings().get("web_base_url") or WEB_BASE,
         "upstream_mode": _current_upstream_mode(),
+        "auto_route": _auto_route_enabled(),
         "build_revision": os.environ.get("RELAY_BUILD_REVISION", "local"),
         "traework_native": {
             "enabled": traework_native_bridge.NativeBridgeConfig.from_env().enabled,
@@ -6105,7 +6191,7 @@ async def api_model_test(req: Request):
         timeout = 120.0
     timeout = max(10.0, min(timeout, 600.0))
     endpoint = str(body.get("endpoint") or _current_upstream_mode()).strip().lower()
-    if endpoint not in set(_VALID_UPSTREAM_MODES):
+    if endpoint not in set(_VALID_UPSTREAM_MODES) | {AUTO_ROUTE_MODE}:
         return JSONResponse(
             {"success": False, "error": f"unsupported endpoint: {endpoint}"},
             status_code=400,
@@ -7319,6 +7405,30 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+@app.get("/api/auto-route")
+async def api_get_auto_route():
+    return JSONResponse(
+        {
+            "success": True,
+            **auth.get_auto_route_settings(),
+            "tool_endpoint": AUTO_ROUTE_TOOL_ENDPOINT,
+            "chat_endpoint": AUTO_ROUTE_CHAT_ENDPOINT,
+        }
+    )
+
+
+@app.post("/api/auto-route")
+async def api_set_auto_route(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or "enabled" not in body:
+        return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
+    settings = auth.set_auto_route_settings(_truthy(body.get("enabled")))
+    return JSONResponse({"success": True, **settings})
 
 
 @app.get("/api/max-mode")

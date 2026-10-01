@@ -1375,6 +1375,28 @@ def set_max_mode_settings(enabled: bool, models='') -> dict:
 
 
 
+_AUTO_ROUTE_ENV = 'TRAE_AUTO_ROUTE'
+
+
+def get_auto_route_settings() -> dict:
+    """Return the auto endpoint routing switch; the console value wins over env."""
+    with _STORE_LOCK:
+        saved = _settings.get('auto_route')
+    if isinstance(saved, dict):
+        return {'enabled': bool(saved.get('enabled')), 'source': 'console'}
+    enabled = os.environ.get(_AUTO_ROUTE_ENV, '').strip().lower() in ('1', 'true', 'yes', 'on')
+    return {'enabled': enabled, 'source': 'env'}
+
+
+def set_auto_route_settings(enabled: bool) -> dict:
+    with _STORE_LOCK:
+        _settings['auto_route'] = {'enabled': bool(enabled)}
+        _save_accounts()
+    os.environ[_AUTO_ROUTE_ENV] = '1' if enabled else '0'
+    _write_env_values({_AUTO_ROUTE_ENV: '1' if enabled else '0'})
+    return get_auto_route_settings()
+
+
 def set_polling_mode(mode: str) -> None:
     """Set the polling rotation strategy."""
     global _polling_mode
