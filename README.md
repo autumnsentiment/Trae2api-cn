@@ -1,28 +1,37 @@
 # Trae2api-cn
 
-Trae CN / Trae Solo CN 模型与工具调用反代。把 Trae 终端协议包装成 OpenAI 兼容 API，支持调用方终端执行工具、多账号轮询、网页 OAuth 登录、账号并发控制和空闲会话回收。
+Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通道包装成 OpenAI 兼容 API（Chat Completions + Responses），支持调用方工具调用、thinking 分离输出、思考强度映射、多账号并发轮询、每日签到和积分消费记录，可直接接入 Codex、new-api 和各类 OpenAI SDK。
 
 **仅供学习使用。请勿用于商业用途。**
 
 ## 特点
 
 - OpenAI 兼容接口：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/chat`、`POST /v1`
-- 流式与非流式输出
-- OpenAI `tools` / `tool_choice` / `parallel_tool_calls` 兼容，流式输出标准 `delta.tool_calls`
-- Codex Responses API 兼容：支持文本流、`function_call`、`custom_tool_call`、namespace 工具及 `*_call_output` 续轮
-- 调用方工具桥接：请求中声明的 Windows 工作区、Shell、读写和编辑工具由 API 调用方执行，relay 只转发调用与结果
-- 六种上游模式：Trae raw chat、9router 风格 remote 会话、Trae CLI 子进程、旧版网页 remote、IDE chat 端点、可选 TraeWork native bridge
-- `auto` 与 `raw` 都只直连 Trae raw v2 `llm_raw_chat`，不会把请求留在 relay 缓存，也不会回退到 CLI/remote/web/IDE 模拟路径
-- 多账号管理：网页 UI 添加/切换/删除账号，round-robin 轮询
-- 网页 OAuth 登录：在浏览器中直接授权，无需手动抓取 JWT
-- 多账号轮询：每次请求自动切换到下一个有效账号，突破单账号并发限制
-- 账号并发控制：每账号最大 2 个并行会话（与上游一致），超限排队等待
-- 空闲会话回收：60 秒无活动的会话自动中断，释放并发槽位
-- 自动刷新 Cloud-IDE-JWT 令牌
-- 自动轮换设备指纹，降低 IDE 端点风控
-- 未知模型透传上游，无需为每个新模型改代码
-- 网页授权自动检测本机助手（方案 A：下载一次、双击即用）
-- Docker 一键部署
+- 流式与非流式输出，SSE 心跳防止网关空闲断开
+- 完整工具调用：`tools` / `tool_choice`（auto / none / required / 指定函数）/ `parallel_tool_calls`，流式输出标准 `delta.tool_calls`
+- Codex Responses API：文本流、`function_call`、`custom_tool_call`、namespace 工具、`*_call_output` 续轮和 `previous_response_id`
+- thinking 与正文分离：思考内容只进 `reasoning_content` / Responses reasoning 事件，不混入正文，且默认压缩为关键结论
+- 思考强度：`reasoning_effort` / `thinking.budget_tokens` 映射到 Trae 原生 `light` / `high` / `extra_high`，按模型声明的档位自动钳制
+- 四个可切换上游端点：Remote、IDE Agent、Work Agent、IDE Raw，原生端点失败时可自动回落 Remote
+- 多账号：网页 OAuth 登录、手动添加凭证、顺序轮询 / 积分优先轮询、每账号并发槽位与排队
+- 每日签到：一键签到、9074 风控自动换设备 ID 并退避重试、后台错峰自动重试
+- 积分与消费记录：统一显示通用积分，按请求记录 tokens、单次积分和状态
+- 网页控制台：账号与签到、消费记录、轮询与设置、模型连通性测试（可选端点、工具探针和思考强度）
+- 1M Max 上下文模式（可选）、自动刷新 Cloud-IDE-JWT、未知模型透传
+- Docker 一键部署，镜像只包含运行所需源码
+
+## 端点与能力
+
+控制台「轮询与设置 → 上游端点」可在运行时切换，也可用 `UPSTREAM_MODE` 固定。以下为 glm-5.3 / deepseek-v4-pro 实测结果（7 项工具测试：流式与非流式的工具调用、两轮工具续写、并行调用、强制 `tool_choice`、`tool_choice=none`）：
+
+| 端点 | `UPSTREAM_MODE` | 上游路径 | 工具调用 | 思考强度 | 说明 |
+|---|---|---|---|---|---|
+| Remote（默认） | `remote` | `/api/remote/v1/chat_sessions` | glm-5.3 6/7（不支持并行调用） | 生效 | 最稳定的通用通道；Agent 优先，失败回退一次 Work |
+| IDE Agent | `ide` | `/api/agent/v3/llm_utils_chat` | glm-5.3 7/7，deepseek-v4-pro 7/7 | 不生效（端点忽略该字段） | 工具能力最完整，适合 Codex / Agent 类客户端 |
+| Work Agent | `work-agent` | Remote `solo_work_remote` | glm-5.3 6/7 | 生效（无 Work 档位时借用 Agent 档位） | 走 Work 执行器，不会被默认 provider 接管 |
+| IDE Raw | `raw` | `/api/ide/v2/llm_raw_chat` | 不可用 | 不可用 | 个人账号返回 `2001 app config record not found`，需要企业 PAT；保留作协议诊断 |
+
+部分模型在 Remote / Work 上会出现上游 `4028` / 502（例如 deepseek-v4-pro），此时请切换到 IDE Agent。需要完整工具能力（含并行调用）时推荐 IDE Agent；只聊天或需要思考强度时用 Remote。
 
 ## 认证方式
 
@@ -94,6 +103,10 @@ docker compose up -d --build
 |---|---|---|
 | `TRAE_AUTH_SOURCE` | `auto` | 认证来源 |
 | `UPSTREAM_MODE` | `remote` | 上游模式：remote 默认先用 `solo_agent_remote`，创建失败或首个模型事件前空响应时最多回退一次 `solo_work_remote`；其他兼容模式可显式选择 `raw` / `cli` / `web` / `ide` |
+| `TRAE_WEB_SLOT_TIMEOUT` | `60` | 等待账号并发槽位的超时（秒）；所有账号槽位占满时请求排队等待 |
+| `TRAE_VERBOSE_REASONING` | 空 | 设为 `1` 时输出完整思考链；默认只保留压缩后的关键结论 |
+| `TRAE_MAX_COMPLETION_TOKENS` | `64000` | 单次输出 token 上限；Agent 模型最高 64K |
+| `TRAEWORK_CUSTOM_UPSTREAM_MODE` | `remote` | TraeWork custom-model/raw 入站使用的上游；默认走已验证的 remote 会话，`raw` 仅保留作原生协议诊断 |
 | `TRAE_CHECKIN_DEVICE_ID` | 空 | 可选的 TraeWork 原生 `guaranteedDeviceId`；配置后签到优先使用真实客户端设备身份 |
 | `TRAE_CHECKIN_DEVICE_IDS_JSON` | 空 | 可选的账号到 TraeWork 设备 ID 的 JSON 映射，优先级高于全局设备 ID |
 | `TRAE_CHECKIN_INTERVAL_SECONDS` | `60` | 多账号轮询时相邻实际签到请求的间隔 |
@@ -205,9 +218,9 @@ docker compose up -d --build
 }
 ```
 
-`UPSTREAM_MODE=auto` 与 `UPSTREAM_MODE=raw` 的路由完全相同：Chat 与 Responses 请求都只发送到 `/api/ide/v2/llm_raw_chat`。raw HTTP body 固定为 `config_name`、`conversation_id`、`messages`、`model_name`、`session_id`、`stream` 六个字段；OpenAI `tools`、`tool_choice`、`parallel_tool_calls` 和工具历史不会作为顶层 raw 字段发送，而是由 relay 转成稳定的系统提示和不可执行历史，再把模型文本中的工具调用解析回 OpenAI 事件。
+路由规则：选中的端点总是第一个尝试。`raw` 失败时按 `IDE Agent -> Remote` 回落，`ide` / `work-agent` 失败时回落 `remote`；请求进入公开流之后不会再跨端点重放，避免重复消费。`TRAE_REMOTE_ONLY_MODELS` 可把指定模型强制送往 remote，`*` 表示全部。
 
-每个账号与模型使用确定性的独立 raw 会话，并同时在 body 与 `Extra` 中绑定 `config_name` / `model_name`，避免缺失模型选择时回落到默认 provider。显式模型默认走 raw；只有 `TRAE_REMOTE_ONLY_MODELS` 中列出的模型才改走 remote，`*` 可作为诊断时的全量强制开关。
+raw 端点的 HTTP body 固定为 `config_name`、`conversation_id`、`messages`、`model_name`、`session_id`、`stream` 六个字段，OpenAI 工具字段由 relay 转成系统提示，再把模型文本中的工具调用解析回 OpenAI 事件。
 
 ### 传输实现说明
 
@@ -215,11 +228,29 @@ docker compose up -d --build
 
 `ide` 模式保留 trae2api 的 `/api/ide/v1/chat` 请求结构：稳定的 `session_id` / `conversation_id`、`chat_history`、`last_llm_response_info`、设备指纹和 Cloud-IDE-JWT 请求头。两种模式共用现有账号切换、token 快照、SSE 心跳、消费记录和 Responses 会话缓存。
 
+`work-agent` 模式固定使用 Remote 的 `solo_work_remote` 执行器，并设置 `_trae_mode=work`，避免 Work 请求被默认 provider（例如 Kimi/Agent）接管。它保留调用端 `tools` 定义和工具历史；若 Work Remote 创建或首事件失败，则按配置回退到 Remote 通用路径。
+
 raw 模式不会向上游发送其不接受的 OpenAI 顶层工具字段，也不会在空响应后伪造占位正文。只有在首个模型事件出现前允许一次空响应重试；已有输出、provider、usage 或工具事件后不会重放请求，避免重复消费。`GET /v1/status` 的 `tool_execution` 固定为 `client`，并列出当前工具桥接能力。
 
 `UPSTREAM_MODE=cli` 仅作为显式兼容模式保留，会禁用默认工具并合并 `TRAE_CLI_DISALLOWED_TOOLS`；`auto` 不会进入该路径。
 
 工具调用属于不可信模型输出。客户端应校验工具名 allowlist 和 JSON schema，并对路径、命令、权限、超时及输出大小做限制。提示词、`client_context`、工具 schema 和工具结果都会发送给 relay/Trae 上游，敏感内容仍需在调用端裁剪。
+
+## 思考内容与思考强度
+
+思考内容默认不对外输出。请求带 `thinking: {"type": "enabled"}`（或 `include_reasoning: true`）时，Chat 返回 `reasoning_content`，Responses 返回独立的 reasoning 事件，正文 `content` 中不会出现思考文本。思考内容默认被压缩为关键结论，设置 `TRAE_VERBOSE_REASONING=1` 可恢复完整输出。
+
+思考强度支持以下写法，统一映射到 Trae `custom_model.reasoning_effort`：
+
+| 请求参数 | Trae 档位 |
+|---|---|
+| `reasoning_effort: minimal / low` | `light` |
+| `reasoning_effort: medium / high` | `high` |
+| `reasoning_effort: xhigh / max` | `extra_high` |
+| `reasoning: {"effort": ...}`（Responses） | 同上 |
+| `thinking.budget_tokens` < 4096 / < 16384 / 更大 | `light` / `high` / `extra_high` |
+
+档位会被钳制到模型 `reasoning_effort_config` 声明的选项内。模型不支持思考档位或端点不接受该字段时（IDE Agent、IDE Raw），请求照常完成，强度字段被忽略；模型测试页会显示未生效原因。
 
 ## Codex Responses API
 
@@ -245,15 +276,26 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 
 ## 网页管理界面
 
-启动后访问 `http://服务器:8000/web/login`：
+启动后访问 `http://服务器:8000/web/login`，左侧纵向导航四个页面：
 
-- 状态查看
-- 账号列表管理（切换 / 删除）
-- 多账号轮询开关
-- 自定义上游 URL 和端口
-- 手动添加凭证
-- 登出
-- 获取模型列表：一键刷新 `/v1/models`（`TRAE_FETCH_MODEL_LIST=true` 时从上游拉取）
+- **账号与签到**：上方是授权登录（网页授权、本机助手下载、手动填写凭证），下方是整宽账号列表（账号、用户 ID、状态、有效期、通用积分、签到状态，单账号签到 / 切换 / 删除，以及查询签到状态、查询全部积分、一键轮询签到）
+- **消费记录**：按请求显示模型、tokens、单次积分和状态
+- **轮询与设置**：多账号轮询开关、顺序 / 积分优先模式、上游端点预设与自定义 URL、Relay 端口、模型列表刷新
+- **模型测试**：批量测试模型连通性，可选文本 / 工具探针、思考强度、thinking 输出，并可指定端点（测试期间禁止跨端点回落）
+
+## 使用注意事项
+
+- **网络边界**：本项目设计为内网部署。不要把 8000 端口直接暴露到公网；如必须公网访问，请设置 `RELAY_API_KEYS` 并在前面加 TLS 反代。管理接口和模型测试接口对内网地址免鉴权。
+- **敏感数据**：`.env` 与 `data/`（`accounts.json`、`usage_records.json`）包含 JWT、刷新令牌和账号信息，已在 `.gitignore` 和 `.dockerignore` 中排除，切勿提交或分享。
+- **工具执行在调用端**：relay 只转发工具调用和结果，不会替客户端执行命令或写文件。模型声称“已下载 / 已写入”但本地没有文件，说明客户端没有真正执行工具，请检查客户端是否把 `tools` 发给 relay、是否回传了 `role: "tool"` 结果。
+- **端点选择**：需要工具调用时优先用 IDE Agent 或 Remote；IDE Raw 对个人账号不可用。切换端点后无需重启，立即生效。
+- **上下文长度**：remote 扁平化 query 约 500K 字符时上游会静默断流，relay 默认在 480K 字符处裁剪最早的历史。长会话建议客户端自行压缩上下文。
+- **并发**：每账号默认 2 个并行会话（`TRAE_WEB_PARALLEL_LIMIT`），多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。
+- **签到 9074**：9074 是上游风控码。relay 会自动轮换签到设备 ID 并指数退避重试，无需手动反复点击；若长期失败，可在 `TRAE_CHECKIN_DEVICE_IDS_JSON` 中填入真实客户端的设备 ID。
+- **积分**：控制台只显示合并后的通用积分。单次积分需要等上游账单落库后才能计算，个别记录短时间显示 `--` 属于正常现象。
+- **502 / 空响应**：首个模型事件前的空响应会自动重试一次，仍失败时返回 502 并在错误信息中列出每个端点的失败原因。常见原因有模型未绑定到账号、上游 `4028` 和 raw 的 `2001`，可在模型测试页逐个端点排查。
+- **更新部署**：更新前建议先 `docker commit` 备份当前容器镜像；更新后浏览器按 Ctrl+F5 强制刷新控制台。
+- **合规**：使用本项目需自行承担账号风险，请遵守 Trae 服务条款。
 
 ## 项目结构与运维
 
@@ -261,6 +303,14 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 
 ```text
 src/                    relay 服务与协议转换
+  main.py               路由、端点调度、网页控制台、签到与消费记录
+  trae_remote_client.py Remote / Work Agent 会话协议
+  trae_client.py        IDE 端点、账号槽位、模型列表
+  raw_client.py         raw v2 协议与工具提示词桥接
+  responses_api.py      Responses API 转换与会话缓存
+  sse.py                SSE 转换、thinking 分离与工具调用解析
+  reasoning_effort.py   思考强度映射
+  traework_compat.py    TraeWork custom-model 入站兼容
 tests/                  离线协议、流式和路由回归测试
 native/                 TraeWork native 文件清单与说明，不包含 DLL
 tools/                  Windows native helper

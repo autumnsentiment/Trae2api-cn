@@ -1800,8 +1800,102 @@ class CollectNonstreamIdeTests(unittest.TestCase):
                 )
             )
 
+    def test_named_tool_choice_rejects_wrong_call_without_catalog(self):
+        response = _LineResponse(
+            [
+                "data: "
+                + json.dumps(
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "call_write",
+                                "type": "function",
+                                "function": {"name": "Write", "arguments": "{}"},
+                            }
+                        ],
+                        "finish_reason": "tool_calls",
+                    }
+                ),
+                "data: [DONE]",
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "Read"):
+            asyncio.run(
+                sse.collect_nonstream_ide(
+                    response,
+                    "m",
+                    tool_choice={"type": "function", "name": "Read"},
+                )
+            )
+
+    def test_tool_choice_none_suppresses_call_without_catalog(self):
+        response = _LineResponse(
+            [
+                "data: "
+                + json.dumps(
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "call_read",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }
+                        ],
+                        "finish_reason": "tool_calls",
+                    }
+                ),
+                "data: [DONE]",
+            ]
+        )
+        result = asyncio.run(
+            sse.collect_nonstream_ide(response, "m", tool_choice="none")
+        )
+        choice = result["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", choice["message"])
+
+    def test_required_stream_without_text_reports_tool_error_before_empty(self):
+        response = _LineResponse(
+            [
+                "event: token_usage",
+                'data: {"usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}',
+                "event: done",
+                'data: {"finish_reason":"stop"}',
+            ]
+        )
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_ide_stream(
+                    response,
+                    "m",
+                    True,
+                    allowed_tools=[{"type": "function", "function": {"name": "Read"}}],
+                    tool_choice="required",
+                    fail_on_empty=True,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        errors = [event.get("error") for event in parsed if event.get("error")]
+        self.assertTrue(errors)
+        self.assertIn("required tool call", errors[-1]["message"])
+
 
 class WebEventTests(unittest.TestCase):
+    def test_top_level_tool_call_info_is_not_duplicated(self):
+        calls = sse._calls_from_payload(
+            {
+                "id": "event-1",
+                "tool_call_info": {
+                    "name": "download",
+                    "params": {"url": "https://example.com/a.zip"},
+                },
+            }
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "download")
+
     def test_web_hyphenated_keepalive_is_ignored(self):
         async def events():
             yield "keep-alive", {"message": "heartbeat"}
@@ -1837,9 +1931,64 @@ class WebEventTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        self.assertEqual(content, "AB+")
+        # Thought-only remote variants are buffered and reduced to one bounded
+        # fallback instead of streaming every cumulative snapshot.
+        self.assertEqual(content, "A+\nB")
         self.assertEqual(content.count("B"), 1)
         self.assertTrue(done)
+
+    def test_web_thinking_is_separate_and_compact_when_requested(self):
+        trace = "\n".join(f"step {index}: inspect detail {index}" for index in range(20))
+
+        async def events():
+            yield "plan_item", {
+                "id": "p1",
+                "thought": trace,
+                "content": "final answer",
+            }
+            yield "done", {}
+
+        chunks = asyncio.run(
+            _collect(sse.translate_web_events(events(), "m", include_reasoning=True))
+        )
+        parsed, done = _parse_chunks(chunks)
+        content = "".join(
+            choice.get("delta", {}).get("content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        reasoning = "".join(
+            choice.get("delta", {}).get("reasoning_content", "")
+            for event in parsed
+            for choice in event.get("choices", [])
+        )
+        self.assertTrue(done)
+        self.assertEqual(content, "final answer")
+        self.assertTrue(reasoning)
+        self.assertLessEqual(len(reasoning), 800)
+        self.assertLessEqual(len(reasoning.splitlines()), 6)
+
+        result = asyncio.run(
+            sse.collect_nonstream_web(events(), "m", include_reasoning=True)
+        )
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "final answer")
+        self.assertEqual(message["reasoning_content"], reasoning)
+
+    def test_web_thinking_is_not_exposed_by_default(self):
+        async def events():
+            yield "plan_item", {
+                "id": "p1",
+                "thought": "private chain detail",
+                "content": "public answer",
+            }
+            yield "done", {}
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "public answer")
+        self.assertNotIn("reasoning_content", message)
+        self.assertNotIn("private chain detail", message["content"])
 
     def test_summary_only_turn_keeps_its_text(self):
         """Filtering must not empty a turn whose only content is the summary."""
@@ -1858,6 +2007,39 @@ class WebEventTests(unittest.TestCase):
         content = result["choices"][0]["message"]["content"]
         self.assertIn("No tools needed", content)
         self.assertNotIn("empty response", content)
+
+    def test_named_tool_call_in_finish_summary_is_recovered_before_validation(self):
+        block = (
+            '<opencode_tool_call>{"id":"call_read_summary","name":"read_file",'
+            '"input":{"path":"README.md"}}</opencode_tool_call>'
+        )
+
+        async def events():
+            yield "plan_item", {
+                "id": "finish-summary",
+                "tool_call_info": {
+                    "name": "finish",
+                    "params": {"summary": block},
+                },
+            }
+            yield "done", {}
+
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                events(),
+                "m",
+                allowed_tools=[
+                    {"type": "function", "function": {"name": "read_file"}}
+                ],
+                tool_choice={"type": "function", "name": "read_file"},
+            )
+        )
+        choice = result["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "read_file",
+        )
 
     def test_narrated_finish_summary_is_filtered_like_a_plan_thought(self):
         """A narrated summary must not land after the answer already streamed."""
@@ -2029,8 +2211,8 @@ class WebEventTests(unittest.TestCase):
 
         result = asyncio.run(sse.collect_nonstream_web(both(), "m"))
         content = result["choices"][0]["message"]["content"]
-        self.assertIn("thinking", content)
-        self.assertIn("the actual reply", content)
+        self.assertEqual(content, "the actual reply")
+        self.assertNotIn("thinking", content)
 
         result = asyncio.run(sse.collect_nonstream_web(content_only(), "m"))
         self.assertEqual(
@@ -2056,7 +2238,7 @@ class WebEventTests(unittest.TestCase):
             for choice in event.get("choices", [])
         )
         self.assertTrue(done)
-        self.assertEqual(content, "step 1 step 2\n\nfinal answer")
+        self.assertEqual(content, "final answer")
 
     def test_reasoning_narration_is_dropped_from_visible_answer(self):
         """The remote agent ships reasoning and reply in one ``thought`` field."""
@@ -2288,3 +2470,132 @@ class WebEventTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteSplitReasoningLayoutTests(unittest.TestCase):
+    """Current remote plan items: answer in ``thought``, trace in ``reasoning_content``."""
+
+    @staticmethod
+    def _events():
+        async def events():
+            yield "plan_item", {
+                "id": "p1",
+                "thought": "relay-ok",
+                "reasoning_content": "The client tool result confirms the file.",
+            }
+            yield "plan_item", {
+                "id": "p2",
+                "thought": "",
+                "reasoning_content": "",
+                "tool_call_info": {"name": "finish", "params": {"summary": "relay-ok"}},
+            }
+            yield "done", {}
+
+        return events()
+
+    def _stream(self, include_reasoning):
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    self._events(), "m", include_reasoning=include_reasoning
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        content = "".join(
+            c.get("delta", {}).get("content", "") for e in parsed for c in e.get("choices", [])
+        )
+        reasoning = "".join(
+            c.get("delta", {}).get("reasoning_content", "")
+            for e in parsed
+            for c in e.get("choices", [])
+        )
+        return content, reasoning
+
+    def test_stream_keeps_reasoning_out_of_content(self):
+        content, reasoning = self._stream(False)
+        self.assertEqual(content, "relay-ok")
+        self.assertNotIn("client tool result", content)
+        self.assertEqual(reasoning, "")
+
+    def test_stream_thinking_goes_to_reasoning_channel(self):
+        content, reasoning = self._stream(True)
+        self.assertEqual(content, "relay-ok")
+        self.assertIn("client tool result", reasoning)
+
+    def test_nonstream_keeps_reasoning_out_of_content(self):
+        result = asyncio.run(sse.collect_nonstream_web(self._events(), "m"))
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "relay-ok")
+        self.assertNotIn("client tool result", message.get("reasoning_content") or "")
+
+    def test_nonstream_thinking_goes_to_reasoning_field(self):
+        result = asyncio.run(
+            sse.collect_nonstream_web(self._events(), "m", include_reasoning=True)
+        )
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "relay-ok")
+        self.assertIn("client tool result", message["reasoning_content"])
+
+    def test_deepseek_answer_only_in_thought(self):
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "pong", "reasoning_content": ""}
+            yield "done", {}
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(result["choices"][0]["message"]["content"], "pong")
+
+    def test_reasoning_only_never_becomes_content(self):
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "", "reasoning_content": "secret trace"}
+            yield "done", {}
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        message = result["choices"][0]["message"]
+        self.assertNotIn("secret trace", message.get("content") or "")
+        self.assertIn("secret trace", message.get("reasoning_content") or "")
+
+
+class OpaqueProviderModelTests(unittest.TestCase):
+    def test_endpoint_and_encrypted_ids_are_not_mismatches(self):
+        with patch.dict(os.environ, {"TRAE_STRICT_MODEL_MATCH": "true"}):
+            sse._check_provider_model(
+                "deepseek-v4-flash-official", "ep-20260806233355-sc7lq"
+            )
+            sse._check_provider_model("glm-5.3", "t1bA3rQx9+Zk/abcdEFGH12==")
+
+    def test_real_mismatch_still_raises(self):
+        with patch.dict(os.environ, {"TRAE_STRICT_MODEL_MATCH": "true"}):
+            with self.assertRaises(sse.ModelProviderMismatch):
+                sse._check_provider_model("glm-5.3", "kimi-k2.7")
+
+    def test_real_name_still_matches(self):
+        with patch.dict(os.environ, {"TRAE_STRICT_MODEL_MATCH": "true"}):
+            sse._check_provider_model(
+                "deepseek-v4-flash-official", "DeepSeek-V4-Flash-Official__max"
+            )
+
+class SummaryPrefixMergeTests(unittest.TestCase):
+    @staticmethod
+    def _events():
+        async def events():
+            yield "plan_item", {"id": "p1", "thought": "The file r.txt", "reasoning_content": "x"}
+            yield "plan_item", {
+                "id": "p2", "thought": "", "reasoning_content": "",
+                "tool_call_info": {"name": "finish", "params": {"summary": "The file r.txt contains: ok"}},
+            }
+            yield "done", {}
+        return events()
+
+    def test_stream_summary_extends_truncated_answer(self):
+        chunks = asyncio.run(_collect(sse.translate_web_events(self._events(), "m")))
+        parsed, _ = _parse_chunks(chunks)
+        content = "".join(
+            c.get("delta", {}).get("content", "") for e in parsed for c in e.get("choices", [])
+        )
+        self.assertEqual(content, "The file r.txt contains: ok")
+
+    def test_nonstream_summary_extends_truncated_answer(self):
+        result = asyncio.run(sse.collect_nonstream_web(self._events(), "m"))
+        self.assertEqual(result["choices"][0]["message"]["content"], "The file r.txt contains: ok")

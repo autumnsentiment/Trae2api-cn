@@ -894,6 +894,151 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(_response_output_text(completed), "hello world")
 
+    def test_nonstream_thinking_returns_compact_reasoning_item(self):
+        trace = "\n".join(
+            [
+                "Inspect the request and identify the relevant files.",
+                "Inspect the request and identify the relevant files.",
+                "Check the implementation and choose a minimal fix.",
+                "Validate the result with focused tests.",
+                "Final conclusion: return the public answer only.",
+            ]
+        )
+
+        async def fake_stream(messages, model, options=None):
+            yield CliEvent(
+                type="json",
+                data={
+                    "message": {
+                        "reasoning_content": trace,
+                        "content": [{"type": "text", "text": "done"}],
+                    },
+                    "finish_reason": "stop",
+                },
+            )
+
+        with patch("src.main.cli_client.stream_cli_chat", new=fake_stream):
+            hidden = self.client.post(
+                "/v1/responses",
+                json={"model": "auto", "input": "hello"},
+                headers=AUTH_HEADERS,
+            )
+            shown = self.client.post(
+                "/v1/responses",
+                json={"model": "auto", "input": "hello", "thinking": True},
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(hidden.status_code, 200, hidden.text)
+        self.assertEqual(shown.status_code, 200, shown.text)
+        self.assertFalse(any(item.get("type") == "reasoning" for item in hidden.json()["output"]))
+        reasoning = next(
+            item for item in shown.json()["output"] if item.get("type") == "reasoning"
+        )
+        summary = "".join(
+            str(part.get("text") or "")
+            for part in reasoning.get("summary", [])
+            if isinstance(part, dict)
+        )
+        self.assertLessEqual(len(summary), 800)
+        self.assertLessEqual(len(summary.splitlines()), 6)
+        self.assertIn("Final conclusion", summary)
+        self.assertEqual(_response_output_text(shown.json()), "done")
+
+    def test_stream_thinking_emits_reasoning_summary_events_separately(self):
+        trace_a = "step one: inspect\nstep two: compare"
+        trace_b = "step one: inspect\nstep two: compare\nConclusion: use the safe path"
+
+        async def fake_stream(messages, model, options=None):
+            yield CliEvent(
+                type="json",
+                data={
+                    "message": {"reasoning_content": trace_a},
+                    "finish_reason": None,
+                },
+            )
+            yield CliEvent(
+                type="json",
+                data={
+                    "message": {
+                        "reasoning_content": trace_b,
+                        "content": [{"type": "text", "text": "answer"}],
+                    },
+                    "finish_reason": "stop",
+                },
+            )
+
+        with patch("src.main.cli_client.stream_cli_chat", new=fake_stream):
+            response = self.client.post(
+                "/v1/responses",
+                json={"model": "auto", "input": "hello", "stream": True, "thinking": True},
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        events = _parse_responses_sse(response.text)
+        event_types = [name for name, _ in events]
+        self.assertIn("response.reasoning_summary_text.delta", event_types)
+        self.assertIn("response.reasoning_summary_text.done", event_types)
+        self.assertIn("response.reasoning_summary_part.done", event_types)
+        self.assertEqual(event_types[-1], "response.completed")
+        reasoning_deltas = "".join(
+            str(payload.get("delta") or "")
+            for name, payload in events
+            if name == "response.reasoning_summary_text.delta"
+        )
+        self.assertLessEqual(len(reasoning_deltas), 800)
+        self.assertLessEqual(len(reasoning_deltas.splitlines()), 6)
+        self.assertIn("Conclusion", reasoning_deltas)
+        answer_deltas = "".join(
+            str(payload.get("delta") or "")
+            for name, payload in events
+            if name == "response.output_text.delta"
+        )
+        self.assertEqual(answer_deltas, "answer")
+
+    def test_reasoning_summary_is_bounded_in_continuation_history(self):
+        trace = "\n".join(f"checkpoint {index}" for index in range(40))
+        captured = []
+
+        async def fake_stream(messages, model, options=None):
+            captured.append(messages)
+            yield CliEvent(
+                type="json",
+                data={
+                    "message": {
+                        "reasoning_content": trace,
+                        "content": [{"type": "text", "text": "ok"}],
+                    },
+                    "finish_reason": "stop",
+                },
+            )
+
+        with patch("src.main.cli_client.stream_cli_chat", new=fake_stream):
+            first = self.client.post(
+                "/v1/responses",
+                json={"model": "auto", "input": "hello", "thinking": True},
+                headers=AUTH_HEADERS,
+            )
+            self.assertEqual(first.status_code, 200, first.text)
+            second = self.client.post(
+                "/v1/responses",
+                json={
+                    "model": "auto",
+                    "input": "continue",
+                    "previous_response_id": first.json()["id"],
+                },
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(second.status_code, 200, second.text)
+        assistant = captured[1][1]
+        summary = str(assistant.get("reasoning_content") or "")
+        self.assertTrue(summary)
+        self.assertLessEqual(len(summary), 800)
+        self.assertLessEqual(len(summary.splitlines()), 6)
+        self.assertNotEqual(summary, trace)
+
     def test_stream_preserves_sse_keepalive_without_creating_output(self):
         async def inner():
             yield ": relay-keepalive\n\n"

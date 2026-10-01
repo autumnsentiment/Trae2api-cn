@@ -270,8 +270,35 @@ def _model_family(value: Any) -> str:
     return text
 
 
+_OPAQUE_ENDPOINT_RE = re.compile(r"^ep-\d{8,}-[a-z0-9]+$", re.IGNORECASE)
+
+
+def _is_opaque_provider_id(value: Any) -> bool:
+    """Return True for provider ids that do not name a model family.
+
+    ``timing_events`` may report a Volcengine endpoint id (``ep-2026...-x``)
+    or an encrypted base64 token instead of a model name.  Comparing those
+    against the requested family produces false mismatches (and 502 loops).
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if _OPAQUE_ENDPOINT_RE.match(text):
+        return True
+    if any(ch in text for ch in "/+=") and not text.lower().startswith("trae/"):
+        return True
+    if len(text) >= 24 and re.fullmatch(r"[A-Za-z0-9_\-]+", text):
+        has_sep = "-" in text or "_" in text or "." in text
+        if not has_sep:
+            return True
+    return False
+
+
 def _check_provider_model(requested: str, actual: str) -> None:
     if not actual or not requested:
+        return
+    if _is_opaque_provider_id(actual):
         return
     if str(os.environ.get("TRAE_STRICT_MODEL_MATCH", "true")).strip().lower() in {
         "0", "false", "no", "off"
@@ -344,6 +371,7 @@ def openai_completion(
     usage=None,
     tool_calls: Optional[list[dict]] = None,
     provider_model_name: Optional[str] = None,
+    reasoning_content: Optional[str] = None,
 ):
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
@@ -362,6 +390,8 @@ def openai_completion(
                 public_call["function"] = function
             public_calls.append(public_call)
         message["tool_calls"] = public_calls
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     resp = {
         "id": prefix_id,
         "object": "chat.completion",
@@ -444,9 +474,13 @@ def _map_usage(usage: Any) -> Optional[dict]:
         "cacheReadTokens",
         "cached_tokens",
         "cachedTokens",
+        "cache_read_input_tokens",
     )
     if cached is not None:
         mapped["prompt_tokens_details"] = {"cached_tokens": int(cached)}
+    reasoning = optional_number("reasoning_tokens", "reasoningTokens")
+    if reasoning is not None:
+        mapped["completion_tokens_details"] = {"reasoning_tokens": int(reasoning)}
     return mapped
 
 
@@ -513,19 +547,48 @@ def _required_tool_label(tool_choice: Any) -> Optional[str]:
     if tool_choice == "required":
         return "one of the declared tools"
     if isinstance(tool_choice, dict):
-        function = (
-            tool_choice.get("function")
-            if tool_choice.get("type") == "function"
-            else tool_choice
-        )
+        # Accept both Chat Completions' nested shape and the flat
+        # Responses/TraeWork shape (``{type: function, name: ...}``).
+        function = tool_choice.get("function")
+        if not isinstance(function, dict):
+            function = tool_choice
         if isinstance(function, dict) and isinstance(function.get("name"), str):
             return function["name"]
     return None
 
 
-def _required_tool_error(tool_choice: Any, has_tool_calls: bool) -> Optional[dict]:
+def _call_function_name(call: Any) -> str:
+    if not isinstance(call, dict):
+        return ""
+    function = call.get("function")
+    if not isinstance(function, dict):
+        function = call
+    name = function.get("name") if isinstance(function, dict) else ""
+    return str(name or "").strip()
+
+
+def _required_tool_error(
+    tool_choice: Any,
+    has_tool_calls: bool,
+    tool_calls: Any = None,
+) -> Optional[dict]:
     required = _required_tool_label(tool_choice)
-    if not required or has_tool_calls:
+    if not required:
+        return None
+    if tool_choice == "required":
+        satisfied = has_tool_calls
+    elif tool_calls is None:
+        # Keep the legacy boolean-only contract for callers that do not retain
+        # the call list.  Callers with the accumulator should pass its calls so
+        # a named choice can be checked precisely.
+        satisfied = has_tool_calls
+    else:
+        satisfied = any(
+            _call_function_name(call) == required
+            for call in tool_calls
+            if isinstance(call, dict)
+        )
+    if satisfied:
         return None
     return {
         "message": f"Trae upstream did not return the required tool call: {required}",
@@ -533,8 +596,12 @@ def _required_tool_error(tool_choice: Any, has_tool_calls: bool) -> Optional[dic
     }
 
 
-def _ensure_required_tool_call(tool_choice: Any, has_tool_calls: bool) -> None:
-    error = _required_tool_error(tool_choice, has_tool_calls)
+def _ensure_required_tool_call(
+    tool_choice: Any,
+    has_tool_calls: bool,
+    tool_calls: Any = None,
+) -> None:
+    error = _required_tool_error(tool_choice, has_tool_calls, tool_calls)
     if error:
         raise RuntimeError(error["message"])
 
@@ -691,7 +758,25 @@ def _calls_from_payload(data: Any) -> list[dict]:
         item = dict(tool_info)
         item.setdefault("id", tool_info.get("tool_call_id") or data.get("id"))
         call = _normalize_tool_call(item, index=len(calls))
-        if call:
+        # ``extract_tool_calls`` now understands top-level ``tool_call_info``
+        # natively.  Keep this compatibility fallback for older/partial
+        # payloads, but do not append the same call a second time when the
+        # native extractor already returned it (missing ids otherwise produce
+        # two synthetic ids and two client-visible invocations).
+        call_signature = _tool_call_signature(call) if call else ""
+        already_present = bool(
+            call
+            and any(
+                str(existing.get("id") or "") == str(call.get("id") or "")
+                or (
+                    call_signature
+                    and call_signature == _tool_call_signature(existing)
+                )
+                for existing in calls
+                if isinstance(existing, dict)
+            )
+        )
+        if call and not already_present:
             calls.append(call)
     deduped: dict[str, dict] = {}
     for call in calls:
@@ -733,13 +818,19 @@ def _filter_tool_calls(
     if not isinstance(calls, list):
         return []
     names = _tool_names(allowed_tools)
-    if names is None:
-        return calls
     if tool_choice == "none" or not names:
-        return []
+        # ``names is None`` means the caller omitted an explicit catalog.  It
+        # must still honor an explicit ``tool_choice=none``; an empty set means
+        # tools were explicitly disabled and therefore suppresses calls too.
+        if tool_choice == "none" or names == set():
+            return []
+        # No catalog + auto/required is a valid TraeWork custom ingress. Keep
+        # parsed protocol calls and apply the remaining policy below.
     selected: Optional[str] = None
     if isinstance(tool_choice, dict):
-        fn = tool_choice.get("function") if tool_choice.get("type") == "function" else tool_choice
+        fn = tool_choice.get("function")
+        if not isinstance(fn, dict):
+            fn = tool_choice
         if isinstance(fn, dict) and isinstance(fn.get("name"), str):
             selected = fn["name"].strip()
     filtered: list[dict] = []
@@ -747,11 +838,10 @@ def _filter_tool_calls(
     for call in calls:
         if not isinstance(call, dict):
             continue
-        function = call.get("function")
-        name = function.get("name") if isinstance(function, dict) else None
-        if not isinstance(name, str) or name.strip() not in names:
+        name = _call_function_name(call)
+        if names is not None and name not in names:
             continue
-        if selected and name.strip() != selected:
+        if selected and name != selected:
             continue
         call_id = str(call.get("id") or "")
         if call_id and call_id in seen:
@@ -978,6 +1068,27 @@ class ThinkingTracker:
         return "".join(parts)
 
 
+_EMBEDDED_THINK_BLOCK_RE = re.compile(
+    r"<(?P<tag>think|thinking)\b[^>]*>(?P<body>[\s\S]*?)</(?P=tag)>",
+    flags=re.IGNORECASE,
+)
+
+
+def _split_embedded_reasoning(text: Any) -> tuple[str, str]:
+    """Split optional ``<think>`` markup from ordinary assistant text."""
+
+    if not isinstance(text, str) or not text:
+        return "", ""
+    matches = list(_EMBEDDED_THINK_BLOCK_RE.finditer(text))
+    if not matches:
+        return "", text
+    reasoning = "\n".join(
+        match.group("body") for match in matches if match.group("body")
+    )
+    visible = _EMBEDDED_THINK_BLOCK_RE.sub("", text)
+    return reasoning, visible
+
+
 def parse_ide_sse_line(data: str) -> Optional[str]:
     data = data.strip()
     if not data.startswith("data:"):
@@ -1015,6 +1126,7 @@ async def translate_ide_stream(
     completed_tool_signatures: Any = None,
     require_terminal: bool = True,
     upstream_metadata: Optional[dict] = None,
+    include_reasoning: bool = False,
 ):
     """Translate /api/ide chat or llm_raw_chat SSE into OpenAI SSE."""
     prefix_id = make_id()
@@ -1108,10 +1220,15 @@ async def translate_ide_stream(
             provider_model_name = reported_provider
             _check_provider_model(model, reported_provider)
 
-        reasoning = obj.get("reasoning_content") if isinstance(obj.get("reasoning_content"), str) else ""
+        reasoning = _payload_reasoning_text(obj)
         raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
+        embedded_reasoning, visible_response = _split_embedded_reasoning(raw_response)
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
-        response_delta, response_calls = response_text.add(raw_response)
+        if embedded_reasoning:
+            embedded_delta, embedded_calls = reasoning_text.add(embedded_reasoning)
+            reasoning_delta += embedded_delta
+            reasoning_calls.extend(embedded_calls)
+        response_delta, response_calls = response_text.add(visible_response)
         calls = _calls_from_payload(obj)
         calls.extend(reasoning_calls)
         calls.extend(response_calls)
@@ -1139,7 +1256,7 @@ async def translate_ide_stream(
         for chunk in tool_chunks:
             yield chunk
 
-        text_delta = tracker.merge(reasoning_delta, response_delta)
+        text_delta = response_delta
         if text_delta:
             if not started:
                 started = True
@@ -1191,7 +1308,7 @@ async def translate_ide_stream(
     for chunk in final_tool_chunks:
         yield chunk
 
-    final_text_delta = tracker.merge(reasoning_delta, response_delta)
+    final_text_delta = response_delta
     if final_text_delta:
         if not started:
             started = True
@@ -1202,6 +1319,22 @@ async def translate_ide_stream(
         completion_bytes += len(final_text_delta.encode("utf-8"))
         content_count += 1
         yield openai_chunk(prefix_id, model, {"content": final_text_delta})
+
+    reasoning_summary = (
+        compact_reasoning_text(reasoning_text.raw) if include_reasoning else ""
+    )
+    if reasoning_summary:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {"reasoning_content": reasoning_summary},
+        )
 
     if terminal_event_pending:
         saw_terminal = True
@@ -1230,7 +1363,25 @@ async def translate_ide_stream(
             usage=final_usage,
             observed_model_event=True,
         )
-    if fail_on_empty and content_count == 0 and not tool_calls.has_calls:
+    required_error = _required_tool_error(
+        tool_choice, tool_calls.has_calls, tool_calls.calls()
+    )
+    if required_error:
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {},
+            finish_reason="stop",
+            error=required_error,
+        )
+        yield "data: [DONE]\n\n"
+        return
+    if (
+        fail_on_empty
+        and content_count == 0
+        and not tool_calls.has_calls
+        and not reasoning_summary
+    ):
         observed_model_event = bool(
             final_usage is not None
             or provider_model_name
@@ -1246,18 +1397,7 @@ async def translate_ide_stream(
             observed_model_event=observed_model_event,
         )
 
-    required_error = _required_tool_error(tool_choice, tool_calls.has_calls)
-    if required_error:
-        yield openai_chunk(
-            prefix_id,
-            model,
-            {},
-            finish_reason="stop",
-            error=required_error,
-        )
-        yield "data: [DONE]\n\n"
-        return
-    if content_count == 0 and not tool_calls.has_calls:
+    if content_count == 0 and not tool_calls.has_calls and not reasoning_summary:
         yield openai_chunk(prefix_id, model, {"content": "(trae upstream returned an empty response)"})
     usage = final_usage
     if forward_usage and usage is None:
@@ -1364,6 +1504,157 @@ def strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> st
     return remainder.lstrip(" \t\n")
 
 
+_REASONING_NODE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])\s*|\r?\n+")
+_REASONING_PRIORITY_RE = re.compile(
+    r"(?:结论|结果|原因|关键|方案|修复|验证|完成|失败|成功|风险|因此|最终|"
+    r"conclusion|result|because|therefore|fix(?:ed)?|verified|success|fail(?:ed)?|risk)",
+    re.IGNORECASE,
+)
+
+
+def compact_reasoning_text(
+    text: Any, *, max_chars: int = 800, max_lines: int = 6
+) -> str:
+    """Return a few reasoning checkpoints instead of the model's full trace.
+
+    This is intentionally extractive and bounded.  It removes serialized tool
+    protocol first, splits long paragraphs into sentence-sized checkpoints,
+    de-duplicates cumulative snapshots, and retains a small set of salient or
+    final nodes.  Tool calls are parsed from the unmodified upstream payload by
+    the callers before this presentation-only summary is produced.
+    """
+
+    if not isinstance(text, str) or not text.strip() or max_chars <= 0 or max_lines <= 0:
+        return ""
+    cleaned = _visible_text(text)
+    cleaned = re.sub(
+        r"<(?:think|thinking)\b[^>]*>|</(?:think|thinking)>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = strip_reasoning_narration(
+        cleaned.strip(), hold_incomplete=False
+    ).strip()
+    if not cleaned:
+        return ""
+
+    nodes: list[str] = []
+    seen: set[str] = set()
+    for raw in _REASONING_NODE_SPLIT_RE.split(cleaned):
+        node = re.sub(r"[ \t]+", " ", raw).strip()
+        if not node:
+            continue
+        # A single generated line can contain a very long working trace.  A
+        # bounded node prevents one paragraph from defeating the summary cap.
+        if len(node) > 240:
+            node = node[:237].rstrip() + "..."
+        fingerprint = re.sub(r"\s+", " ", node).casefold()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        nodes.append(node)
+    if not nodes:
+        return ""
+
+    if len(nodes) > max_lines:
+        priority = [
+            index for index, node in enumerate(nodes) if _REASONING_PRIORITY_RE.search(node)
+        ]
+        selected: list[int] = []
+        # Preserve one orienting node, then prefer conclusions and the newest
+        # checkpoints.  Sorting restores the original reasoning order.
+        selected.append(0)
+        for index in priority:
+            if index not in selected:
+                selected.append(index)
+            if len(selected) >= max_lines:
+                break
+        for index in range(len(nodes) - 1, -1, -1):
+            if index not in selected:
+                selected.append(index)
+            if len(selected) >= max_lines:
+                break
+        nodes = [nodes[index] for index in sorted(selected[:max_lines])]
+
+    result = "\n".join(nodes)
+    if len(result) > max_chars:
+        result = result[: max_chars - 3].rstrip() + "..."
+    return result
+
+
+def _payload_reasoning_text(data: Any) -> str:
+    """Extract a reasoning field without treating it as assistant content."""
+
+    if not isinstance(data, dict):
+        return ""
+    for key in ("reasoning_content", "reasoningContent", "thought", "thinking"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            for nested_key in ("content", "text", "summary"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str) and nested:
+                    return nested
+    message = data.get("message")
+    if isinstance(message, dict):
+        nested = _payload_reasoning_text(message)
+        if nested:
+            return nested
+        content = message.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "").lower() not in {
+                    "reasoning",
+                    "thinking",
+                    "reasoning_text",
+                }:
+                    continue
+                value = block.get("text") or block.get("content") or block.get("value")
+                if isinstance(value, str):
+                    parts.append(value)
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def _web_plan_has_split_reasoning(data: dict) -> bool:
+    """Current remote plan items carry reasoning in ``reasoning_content``.
+
+    In that layout ``thought`` is the visible answer snapshot (for example
+    ``thought="pong", reasoning_content=""``).  Older variants omit the
+    ``reasoning_content`` key and use ``thought`` as the trace.
+    """
+
+    return isinstance(data, dict) and any(
+        key in data for key in ("reasoning_content", "reasoningContent")
+    )
+
+
+def _web_plan_reasoning(data: dict) -> str:
+    if _web_plan_has_split_reasoning(data):
+        value = data.get("reasoning_content")
+        if not isinstance(value, str) or not value:
+            value = data.get("reasoningContent")
+        return value if isinstance(value, str) else ""
+    return _payload_reasoning_text(data)
+
+
+def _web_plan_content(data: dict) -> str:
+    content = _web_message_text({"content": data.get("content")})
+    if content:
+        return content
+    if _web_plan_has_split_reasoning(data):
+        thought = data.get("thought")
+        if isinstance(thought, str):
+            return thought
+    return ""
+
+
 def _web_plan_text(data: dict, *, hold_incomplete: bool = False) -> str:
     """Return the visible text of a remote ``plan_item`` event.
 
@@ -1389,7 +1680,7 @@ def _web_plan_text(data: dict, *, hold_incomplete: bool = False) -> str:
 
 
 def _web_finish_summary(data: dict) -> str:
-    tci = data.get("tool_call_info") or {}
+    tci = data.get("tool_call_info") or data.get("toolCallInfo") or {}
     if isinstance(tci, dict) and tci.get("name") == "finish":
         params = tci.get("params") or {}
         if isinstance(params, dict):
@@ -1415,6 +1706,12 @@ def _web_message_text(data: dict) -> str:
             if isinstance(block, str):
                 parts.append(block)
             elif isinstance(block, dict):
+                if str(block.get("type") or "").lower() in {
+                    "reasoning",
+                    "thinking",
+                    "reasoning_text",
+                }:
+                    continue
                 text = block.get("text") or block.get("content")
                 if isinstance(text, str):
                     parts.append(text)
@@ -1443,11 +1740,12 @@ async def translate_web_events(
     parallel_tool_calls: Any = None,
     completed_tool_signatures: Any = None,
     fail_on_empty: bool = False,
+    include_reasoning: bool = False,
 ):
     prefix_id = make_id()
-    order: list[str] = []
-    thoughts: dict[str, str] = {}
-    held_thoughts: dict[str, str] = {}
+    reasoning_order: list[str] = []
+    reasoning_states: dict[str, ProtocolTextAccumulator] = {}
+    plan_visible_states: dict[str, ProtocolTextAccumulator] = {}
     streamed_text = ""
     message_text = ProtocolTextAccumulator()
     usage = None
@@ -1457,6 +1755,9 @@ async def translate_web_events(
     provider_model_name = ""
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
     started = not fail_on_empty
+    # True once a plan item used the legacy layout where ``thought`` is the
+    # only text surface.  Only that layout may fall back to reasoning text.
+    legacy_plan_reasoning = False
 
     if started:
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1483,10 +1784,32 @@ async def translate_web_events(
             continue
         if event == "plan_item":
             emitted_tool = False
+            pid = str(data.get("id") or f"plan-{len(reasoning_order)}")
+            plan_reasoning = _web_plan_reasoning(data)
+            if not _web_plan_has_split_reasoning(data) and plan_reasoning:
+                legacy_plan_reasoning = True
+            reasoning_state = reasoning_states.setdefault(
+                pid, ProtocolTextAccumulator()
+            )
+            if pid not in reasoning_order:
+                reasoning_order.append(pid)
+            _, reasoning_calls = reasoning_state.add(plan_reasoning)
+            visible_state = plan_visible_states.setdefault(
+                pid, ProtocolTextAccumulator()
+            )
+            # ``thought`` is a cumulative snapshot.  Filter leading
+            # meta-narration before feeding it to the public accumulator, while
+            # retaining the raw snapshot above for compact reasoning and tool
+            # extraction.  The explicit ``content`` field is appended as the
+            # actual answer when present.
+            # Only the explicit ``content`` field is public answer text.  The
+            # adjacent ``thought`` snapshot remains in ``reasoning_state`` and
+            # is compacted once at the end of the turn.
+            visible_snapshot = _web_plan_content(data)
+            content_delta, content_calls = visible_state.add(visible_snapshot)
             plan_calls = _calls_from_payload(data)
-            plan_thought = _web_plan_text(data)
-            if plan_thought:
-                plan_calls.extend(_extract_tool_calls({"response": plan_thought}))
+            plan_calls.extend(reasoning_calls)
+            plan_calls.extend(content_calls)
             plan_chunks = list(_emit_tool_deltas(
                 prefix_id,
                 model,
@@ -1505,32 +1828,30 @@ async def translate_web_events(
                 yield chunk
             if emitted_tool and allowed_tools is not None:
                 break
-            pid = str(data.get("id") or "")
-            if pid:
-                thought = _hold_incomplete_tool_block(
-                    _visible_text(_web_plan_text(data, hold_incomplete=True))
-                )
-                held = _hold_incomplete_tool_block(_visible_text(_web_plan_text(data)))
-                if len(held) >= len(held_thoughts.get(pid, "")):
-                    held_thoughts[pid] = held
-                if pid not in thoughts:
-                    order.append(pid)
-                previous = thoughts.get(pid, "")
-                piece = ""
-                if len(thought) >= len(previous):
-                    thoughts[pid] = thought
-                    piece = _cli_text_delta(previous, thought)
-                if piece:
-                    if not started:
-                        started = True
-                        yield openai_chunk(prefix_id, model, {"role": "assistant"})
-                    streamed_text += piece
-                    yield openai_chunk(prefix_id, model, {"content": piece})
+            if content_delta:
+                if not started:
+                    started = True
+                    yield openai_chunk(prefix_id, model, {"role": "assistant"})
+                streamed_text += content_delta
+                yield openai_chunk(prefix_id, model, {"content": content_delta})
             summary = _web_finish_summary(data)
             if summary:
                 final_summary = summary
         if event in {"message", "assistant_message", "response", "text", "output"}:
             text = _web_message_text(data)
+            event_reasoning = _payload_reasoning_text(data)
+            embedded_reasoning, text = _split_embedded_reasoning(text)
+            if event_reasoning or embedded_reasoning:
+                reasoning_key = "__messages__"
+                reasoning_state = reasoning_states.setdefault(
+                    reasoning_key, ProtocolTextAccumulator()
+                )
+                if reasoning_key not in reasoning_order:
+                    reasoning_order.append(reasoning_key)
+                if event_reasoning:
+                    reasoning_state.add(event_reasoning)
+                if embedded_reasoning:
+                    reasoning_state.add(embedded_reasoning)
             if text:
                 message_delta, message_calls = message_text.add_snapshot(text)
                 for chunk in _emit_tool_deltas(
@@ -1557,6 +1878,47 @@ async def translate_web_events(
             final_reason = _payload_finish_reason(data) or final_reason
             break
 
+    # Finalize every protocol accumulator so a harmless trailing backslash is
+    # released while incomplete tool markup remains hidden from presentation.
+    for state in reasoning_states.values():
+        _, calls = state.finalize()
+        for chunk in _emit_tool_deltas(
+            prefix_id,
+            model,
+            tool_calls,
+            calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        ):
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            yield chunk
+    for state in plan_visible_states.values():
+        content_delta, calls = state.finalize()
+        for chunk in _emit_tool_deltas(
+            prefix_id,
+            model,
+            tool_calls,
+            calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        ):
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            yield chunk
+        if content_delta:
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            streamed_text += content_delta
+            yield openai_chunk(prefix_id, model, {"content": content_delta})
+
     if final_summary:
         summary_calls = _extract_tool_calls({"response": final_summary})
         if summary_calls:
@@ -1580,6 +1942,20 @@ async def translate_web_events(
         final_summary = strip_reasoning_narration(
             _visible_text(final_summary).strip(), hold_incomplete=True
         ).strip()
+    reasoning_raw = "\n".join(
+        reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
+    )
+    reasoning_summary = compact_reasoning_text(reasoning_raw)
+    if include_reasoning and reasoning_summary:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {"reasoning_content": reasoning_summary},
+        )
+
     # Do not present a web agent's remote tool result as the external client's
     # tool result. The API client owns execution and the following turn.
     if not tool_calls.has_calls:
@@ -1587,29 +1963,76 @@ async def translate_web_events(
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            streamed_text += final_summary
             yield openai_chunk(prefix_id, model, {"content": final_summary})
         elif final_summary:
-            full = "".join(thoughts.get(item, "") for item in order)
             summary = final_summary.rstrip()
-            if not full.rstrip().endswith(summary) and not streamed_text.rstrip().endswith(summary):
+            streamed_head = streamed_text.strip()
+            if streamed_head and summary.startswith(streamed_head):
+                # The answer snapshot is a prefix of the finish summary (the
+                # last snapshot was cut short); emit only the missing tail.
+                tail = summary[len(streamed_head):]
+                if tail:
+                    streamed_text += tail
+                    yield openai_chunk(prefix_id, model, {"content": tail})
+            elif not streamed_text.rstrip().endswith(summary):
                 if not started:
                     started = True
                     yield openai_chunk(prefix_id, model, {"role": "assistant"})
+                streamed_text += "\n\n" + final_summary
                 yield openai_chunk(prefix_id, model, {"content": "\n\n" + final_summary})
 
-    if not streamed_text and not tool_calls.has_calls:
-        # Every plan item was narration that the filter held back. Flush it
-        # rather than letting the turn look like an empty upstream response.
-        held = "".join(held_thoughts.get(item, "") for item in order)
-        if held.strip():
+    if (
+        not streamed_text
+        and not tool_calls.has_calls
+        and reasoning_summary
+        and not include_reasoning
+        and not legacy_plan_reasoning
+    ):
+        # Split layout with reasoning but no answer: keep the trace in the
+        # dedicated reasoning channel instead of presenting it as content.
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+        yield openai_chunk(
+            prefix_id, model, {"reasoning_content": reasoning_summary}
+        )
+        include_reasoning = True
+    if (
+        not streamed_text
+        and not tool_calls.has_calls
+        and reasoning_summary
+        and not include_reasoning
+    ):
+        # Older remote variants place the final answer only in ``thought``.
+        # Return a bounded fallback instead of the complete trace or an empty
+        # response; explicit thinking requests receive it in the dedicated
+        # reasoning channel above.
+        if reasoning_summary.strip():
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            streamed_text += held
-            yield openai_chunk(prefix_id, model, {"content": held})
+            streamed_text += reasoning_summary
+            yield openai_chunk(prefix_id, model, {"content": reasoning_summary})
 
-    if fail_on_empty and not streamed_text and not tool_calls.has_calls:
-        observed_model_event = bool(usage is not None or provider_model_name)
+    saw_reasoning_output = bool(include_reasoning and reasoning_summary)
+    required_error = _required_tool_error(
+        tool_choice, tool_calls.has_calls, tool_calls.calls()
+    )
+    if required_error and not error_event:
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {},
+            finish_reason="stop",
+            error=required_error,
+        )
+        yield "data: [DONE]\n\n"
+        return
+    if fail_on_empty and not streamed_text and not tool_calls.has_calls and not saw_reasoning_output:
+        observed_model_event = bool(
+            usage is not None or provider_model_name or reasoning_raw
+        )
         message = "Trae remote upstream returned no text or tool call"
         if error_event:
             message = (
@@ -1635,7 +2058,6 @@ async def translate_web_events(
             },
         )
     else:
-        required_error = _required_tool_error(tool_choice, tool_calls.has_calls)
         if required_error:
             yield openai_chunk(
                 prefix_id,
@@ -1646,7 +2068,7 @@ async def translate_web_events(
             )
             yield "data: [DONE]\n\n"
             return
-        if not tool_calls.has_calls and not streamed_text:
+        if not tool_calls.has_calls and not streamed_text and not saw_reasoning_output:
             yield openai_chunk(
                 prefix_id,
                 model,
@@ -1671,10 +2093,12 @@ async def translate_cli_stream(
     tool_choice: Any = None,
     parallel_tool_calls: Any = None,
     completed_tool_signatures: Any = None,
+    include_reasoning: bool = False,
 ):
     """Translate Trae CLI JSON/text output without executing returned calls."""
     prefix_id = make_id()
     text_state = ProtocolTextAccumulator()
+    reasoning_state = ProtocolTextAccumulator()
     usage = None
     saw_output = False
     final_reason = "stop"
@@ -1696,7 +2120,10 @@ async def translate_cli_stream(
             yield "data: [DONE]\n\n"
             return
         if event_type == "text":
-            text_delta, text_calls = text_state.add_delta(event.text or "")
+            embedded_reasoning, visible_text = _split_embedded_reasoning(event.text or "")
+            _, reasoning_calls = reasoning_state.add_delta(embedded_reasoning)
+            text_delta, text_calls = text_state.add_delta(visible_text)
+            text_calls.extend(reasoning_calls)
             for chunk in _emit_tool_deltas(
                 prefix_id,
                 model,
@@ -1722,8 +2149,10 @@ async def translate_cli_stream(
         result_reason = _payload_finish_reason(result)
         if result_reason:
             final_reason = result_reason
+        _, reasoning_calls = reasoning_state.add(_payload_reasoning_text(result))
         text_delta, text_calls = text_state.add_snapshot(_cli_extract_text(result))
         calls = _extract_tool_calls(result)
+        calls.extend(reasoning_calls)
         calls.extend(text_calls)
         for chunk in _emit_tool_deltas(
             prefix_id,
@@ -1746,6 +2175,8 @@ async def translate_cli_stream(
         # reaches EOF so later text and tool arguments are not truncated.
 
     text_delta, text_calls = text_state.finalize()
+    _, reasoning_calls = reasoning_state.finalize()
+    text_calls.extend(reasoning_calls)
     for chunk in _emit_tool_deltas(
         prefix_id,
         model,
@@ -1762,7 +2193,20 @@ async def translate_cli_stream(
         saw_output = True
         yield openai_chunk(prefix_id, model, {"content": text_delta})
 
-    required_error = _required_tool_error(tool_choice, tool_calls.has_calls)
+    reasoning_summary = (
+        compact_reasoning_text(reasoning_state.raw) if include_reasoning else ""
+    )
+    if reasoning_summary:
+        saw_output = True
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {"reasoning_content": reasoning_summary},
+        )
+
+    required_error = _required_tool_error(
+        tool_choice, tool_calls.has_calls, tool_calls.calls()
+    )
     if required_error:
         yield openai_chunk(
             prefix_id,
@@ -1792,18 +2236,23 @@ async def collect_nonstream_cli(
     tool_choice: Any = None,
     parallel_tool_calls: Any = None,
     completed_tool_signatures: Any = None,
+    include_reasoning: bool = False,
 ) -> dict:
     prefix_id = make_id()
     usage = None
     final_reason = "stop"
     text_state = ProtocolTextAccumulator()
+    reasoning_state = ProtocolTextAccumulator()
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
     async for event in event_iter:
         event_type = _normalize_event_name(event.type)
         if event_type == "error":
             raise RuntimeError(event.error or "Trae CLI failed")
         if event_type == "text" and event.text:
-            _, text_calls = text_state.add_delta(event.text)
+            embedded_reasoning, visible_text = _split_embedded_reasoning(event.text)
+            _, reasoning_calls = reasoning_state.add_delta(embedded_reasoning)
+            _, text_calls = text_state.add_delta(visible_text)
+            text_calls.extend(reasoning_calls)
             tool_calls.add(
                 _filter_for_accumulator(
                     tool_calls,
@@ -1815,10 +2264,14 @@ async def collect_nonstream_cli(
                 )
             )
         elif event_type == "json" and event.data:
+            _, reasoning_calls = reasoning_state.add(
+                _payload_reasoning_text(event.data)
+            )
             _, text_calls = text_state.add_snapshot(
                 _cli_extract_text(event.data)
             )
             calls = _extract_tool_calls(event.data)
+            calls.extend(reasoning_calls)
             calls.extend(text_calls)
             tool_calls.add(
                 _filter_for_accumulator(
@@ -1840,6 +2293,8 @@ async def collect_nonstream_cli(
                 # stream has no uniformly reliable terminal event; EOF is the
                 # authoritative boundary for non-stream collection.
     _, final_text_calls = text_state.finalize()
+    _, final_reasoning_calls = reasoning_state.finalize()
+    final_text_calls.extend(final_reasoning_calls)
     tool_calls.add(
         _filter_for_accumulator(
             tool_calls,
@@ -1850,15 +2305,20 @@ async def collect_nonstream_cli(
             completed_tool_signatures,
         )
     )
-    _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
+    _ensure_required_tool_call(
+        tool_choice, tool_calls.has_calls, tool_calls.calls()
+    )
     content = text_state.visible.strip()
-    if not content and not tool_calls.has_calls:
+    reasoning_summary = (
+        compact_reasoning_text(reasoning_state.raw) if include_reasoning else ""
+    )
+    if not content and not reasoning_summary and not tool_calls.has_calls:
         content = "(trae cli returned an empty response)"
     if usage is None:
         usage = {
             "prompt_tokens": 0,
-            "completion_tokens": estimate_tokens(content),
-            "total_tokens": estimate_tokens(content),
+            "completion_tokens": estimate_tokens(content + reasoning_summary),
+            "total_tokens": estimate_tokens(content + reasoning_summary),
         }
     return openai_completion(
         prefix_id,
@@ -1867,6 +2327,7 @@ async def collect_nonstream_cli(
         _finish_reason(final_reason, tool_calls.has_calls),
         usage,
         tool_calls.calls(),
+        reasoning_content=reasoning_summary or None,
     )
 
 
@@ -1880,9 +2341,9 @@ async def collect_nonstream_ide(
     completed_tool_signatures: Any = None,
     require_terminal: bool = True,
     upstream_metadata: Optional[dict] = None,
+    include_reasoning: bool = False,
 ) -> dict:
     prefix_id = make_id()
-    tracker = ThinkingTracker()
     full = ""
     reasoning_text = ProtocolTextAccumulator()
     response_text = ProtocolTextAccumulator()
@@ -1937,10 +2398,15 @@ async def collect_nonstream_ide(
         if reported_provider:
             provider_model_name = reported_provider
             _check_provider_model(model, reported_provider)
-        reasoning = obj.get("reasoning_content") or ""
-        raw_response = obj.get("response") or ""
+        reasoning = _payload_reasoning_text(obj)
+        raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
+        embedded_reasoning, visible_response = _split_embedded_reasoning(raw_response)
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
-        response_delta, response_calls = response_text.add(raw_response)
+        if embedded_reasoning:
+            embedded_delta, embedded_calls = reasoning_text.add(embedded_reasoning)
+            reasoning_delta += embedded_delta
+            reasoning_calls.extend(embedded_calls)
+        response_delta, response_calls = response_text.add(visible_response)
         calls = _calls_from_payload(obj)
         calls.extend(reasoning_calls)
         calls.extend(response_calls)
@@ -1956,8 +2422,8 @@ async def collect_nonstream_ide(
                 completed_tool_signatures,
             )
         )
-        if reasoning_delta or response_delta:
-            full += tracker.merge(reasoning_delta, response_delta)
+        if response_delta:
+            full += response_delta
         if obj.get("finish_reason"):
             finish_reason = str(obj.get("finish_reason"))
         if obj.get("usage"):
@@ -1984,13 +2450,17 @@ async def collect_nonstream_ide(
             completed_tool_signatures,
         )
     )
-    if reasoning_delta or response_delta:
-        full += tracker.merge(reasoning_delta, response_delta)
+    if response_delta:
+        full += response_delta
+    reasoning_summary = (
+        compact_reasoning_text(reasoning_text.raw) if include_reasoning else ""
+    )
     if terminal_event_pending:
         saw_terminal = True
     if not saw_terminal and require_terminal:
         observed_model_event = bool(
             full
+            or reasoning_text.raw
             or tool_calls.has_calls
             or usage is not None
             or provider_model_name
@@ -2006,14 +2476,17 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    if not full and not tool_calls.has_calls and saw_completed_repeat:
+    if not full and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
             retryable=False,
             usage=usage,
             observed_model_event=True,
         )
-    if fail_on_empty and not full and not tool_calls.has_calls:
+    _ensure_required_tool_call(
+        tool_choice, tool_calls.has_calls, tool_calls.calls()
+    )
+    if fail_on_empty and not full and not reasoning_summary and not tool_calls.has_calls:
         observed_model_event = bool(
             usage is not None
             or provider_model_name
@@ -2028,14 +2501,13 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
-    if not full and not tool_calls.has_calls:
+    if not full and not reasoning_summary and not tool_calls.has_calls:
         full = "(trae upstream returned an empty response)"
     if usage is None:
         usage = {
             "prompt_tokens": 0,
-            "completion_tokens": estimate_tokens(full),
-            "total_tokens": estimate_tokens(full),
+            "completion_tokens": estimate_tokens(full + reasoning_summary),
+            "total_tokens": estimate_tokens(full + reasoning_summary),
         }
     return openai_completion(
         prefix_id,
@@ -2045,6 +2517,7 @@ async def collect_nonstream_ide(
         usage,
         tool_calls.calls(),
         provider_model_name=provider_model_name,
+        reasoning_content=reasoning_summary or None,
     )
 
 
@@ -2056,11 +2529,12 @@ async def collect_nonstream_web(
     parallel_tool_calls: Any = None,
     completed_tool_signatures: Any = None,
     fail_on_empty: bool = False,
+    include_reasoning: bool = False,
 ) -> dict:
     prefix_id = make_id()
-    order: list[str] = []
-    thoughts: dict[str, str] = {}
-    held_thoughts: dict[str, str] = {}
+    reasoning_order: list[str] = []
+    reasoning_states: dict[str, ProtocolTextAccumulator] = {}
+    plan_visible_states: dict[str, ProtocolTextAccumulator] = {}
     message_text = ProtocolTextAccumulator()
     usage = None
     error_event = None
@@ -2068,6 +2542,7 @@ async def collect_nonstream_web(
     final_reason = "stop"
     provider_model_name = ""
     tool_calls = ToolCallAccumulator(1 if parallel_tool_calls is False else None)
+    legacy_plan_reasoning = False
     async for event, data in event_iter:
         event = _normalize_event_name(event)
         if not isinstance(data, dict):
@@ -2088,10 +2563,25 @@ async def collect_nonstream_web(
             usage = _map_usage(data.get("usage") or data)
             continue
         if event == "plan_item":
+            pid = str(data.get("id") or f"plan-{len(reasoning_order)}")
+            reasoning_state = reasoning_states.setdefault(
+                pid, ProtocolTextAccumulator()
+            )
+            if pid not in reasoning_order:
+                reasoning_order.append(pid)
+            plan_reasoning = _web_plan_reasoning(data)
+            if not _web_plan_has_split_reasoning(data) and plan_reasoning:
+                legacy_plan_reasoning = True
+            _, reasoning_calls = reasoning_state.add(plan_reasoning)
+            content_state = plan_visible_states.setdefault(
+                pid, ProtocolTextAccumulator()
+            )
+            _, content_calls = content_state.add(
+                _web_plan_content(data)
+            )
             calls = list(_calls_from_payload(data))
-            plan_thought = _web_plan_text(data)
-            if plan_thought:
-                calls.extend(_extract_tool_calls({"response": plan_thought}))
+            calls.extend(reasoning_calls)
+            calls.extend(content_calls)
             calls = _filter_for_accumulator(
                 tool_calls,
                 calls,
@@ -2103,25 +2593,22 @@ async def collect_nonstream_web(
             tool_calls.add(calls)
             if calls and allowed_tools is not None:
                 break
-            pid = str(data.get("id") or "")
-            if pid:
-                thought = _hold_incomplete_tool_block(
-                    _visible_text(_web_plan_text(data, hold_incomplete=True))
-                )
-                # Remember the unfiltered text so a turn that never gets past
-                # narration still has something to return.
-                held = _hold_incomplete_tool_block(_visible_text(_web_plan_text(data)))
-                if len(held) >= len(held_thoughts.get(pid, "")):
-                    held_thoughts[pid] = held
-                if pid not in thoughts:
-                    order.append(pid)
-                if len(thought) >= len(thoughts.get(pid, "")):
-                    thoughts[pid] = thought
             summary = _web_finish_summary(data)
             if summary:
                 final_summary = summary
         if event in {"message", "assistant_message", "response", "text", "output"}:
             text = _web_message_text(data)
+            event_reasoning = _payload_reasoning_text(data)
+            embedded_reasoning, text = _split_embedded_reasoning(text)
+            if event_reasoning or embedded_reasoning:
+                key = "__messages__"
+                state = reasoning_states.setdefault(key, ProtocolTextAccumulator())
+                if key not in reasoning_order:
+                    reasoning_order.append(key)
+                if event_reasoning:
+                    state.add(event_reasoning)
+                if embedded_reasoning:
+                    state.add(embedded_reasoning)
             if text:
                 _, message_calls = message_text.add_snapshot(text)
                 filtered_calls = _filter_for_accumulator(
@@ -2140,12 +2627,36 @@ async def collect_nonstream_web(
             break
     if error_event:
         raise RuntimeError(f"trae {error_event.get('code','')}: {error_event.get('message','')}")
-    _ensure_required_tool_call(tool_choice, tool_calls.has_calls)
-    content = "".join(thoughts.get(item, "") for item in order)
-    if not content.strip():
-        # Every plan item was pure narration. Returning it is better than
-        # reporting an empty upstream response.
-        content = "".join(held_thoughts.get(item, "") for item in order)
+
+    for state in reasoning_states.values():
+        _, calls = state.finalize()
+        tool_calls.add(
+            _filter_for_accumulator(
+                tool_calls,
+                calls,
+                allowed_tools,
+                tool_choice,
+                parallel_tool_calls,
+                completed_tool_signatures,
+            )
+        )
+    for state in plan_visible_states.values():
+        _, calls = state.finalize()
+        tool_calls.add(
+            _filter_for_accumulator(
+                tool_calls,
+                calls,
+                allowed_tools,
+                tool_choice,
+                parallel_tool_calls,
+                completed_tool_signatures,
+            )
+        )
+    content = "\n\n".join(
+        state.visible.strip()
+        for state in plan_visible_states.values()
+        if state.visible.strip()
+    )
     message_content = message_text.visible.strip()
     if message_content:
         if not content:
@@ -2170,17 +2681,55 @@ async def collect_nonstream_web(
         filtered_summary = strip_reasoning_narration(
             summary_text, hold_incomplete=True
         ).strip()
-        # Keep the raw summary only when it is the turn's sole content.
+        # Keep an all-narration raw summary only when there is no plan trace to
+        # summarize.  Otherwise it would re-introduce the chain-of-thought that
+        # this translator deliberately keeps out of ordinary content.
+        has_plan_reasoning = any(state.raw for state in reasoning_states.values())
         final_summary = filtered_summary or (
-            summary_text if not any(thoughts.values()) else ""
+            summary_text if not content and not has_plan_reasoning else ""
         )
+    # A finish summary can carry the only client tool call. Extract it before
+    # validating a required/named choice, otherwise a valid summary call is
+    # reported as a missing tool and the non-stream request fails.
+    _ensure_required_tool_call(
+        tool_choice, tool_calls.has_calls, tool_calls.calls()
+    )
     if not tool_calls.has_calls:
         if not content:
             content = final_summary
+        elif final_summary and final_summary.strip().startswith(content.strip()):
+            content = final_summary.strip()
         elif final_summary and not content.rstrip().endswith(final_summary.rstrip()):
             content = content.rstrip() + "\n\n" + final_summary
-    if fail_on_empty and not content and not tool_calls.has_calls:
-        observed_model_event = bool(usage is not None or provider_model_name)
+    reasoning_raw = "\n".join(
+        reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
+    )
+    reasoning_summary = compact_reasoning_text(reasoning_raw)
+    public_reasoning = reasoning_summary if include_reasoning else ""
+    if (
+        not content
+        and not tool_calls.has_calls
+        and reasoning_summary
+        and not include_reasoning
+        and not legacy_plan_reasoning
+    ):
+        # Split layout: never promote the reasoning trace into content.
+        public_reasoning = reasoning_summary
+    if (
+        not content
+        and not public_reasoning
+        and not tool_calls.has_calls
+        and reasoning_summary
+        and not include_reasoning
+    ):
+        # Compatibility fallback for remote versions that return the final
+        # answer only through plan_item.thought.  Keep it compact rather than
+        # exposing the complete working trace.
+        content = reasoning_summary
+    if fail_on_empty and not content and not public_reasoning and not tool_calls.has_calls:
+        observed_model_event = bool(
+            usage is not None or provider_model_name or reasoning_raw
+        )
         message = "Trae remote upstream returned no text or tool call"
         if error_event:
             message = (
@@ -2193,13 +2742,13 @@ async def collect_nonstream_web(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    if not content and not tool_calls.has_calls:
+    if not content and not public_reasoning and not tool_calls.has_calls:
         content = "(trae upstream returned an empty response)"
     if usage is None:
         usage = {
             "prompt_tokens": 0,
-            "completion_tokens": estimate_tokens(content),
-            "total_tokens": estimate_tokens(content),
+            "completion_tokens": estimate_tokens(content + public_reasoning),
+            "total_tokens": estimate_tokens(content + public_reasoning),
         }
     return openai_completion(
         prefix_id,
@@ -2209,4 +2758,5 @@ async def collect_nonstream_web(
         usage,
         tool_calls.calls(),
         provider_model_name=provider_model_name,
+        reasoning_content=public_reasoning or None,
     )

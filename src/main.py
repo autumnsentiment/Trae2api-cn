@@ -22,6 +22,7 @@ import codecs
 import gzip
 import hashlib
 import html as html_mod
+import ipaddress
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ from . import (
     responses_api,
     trae_client,
     trae_remote_client,
+    traework_compat,
     traework_native_bridge,
 )
 from .model_limits import clamp_max_completion_tokens
@@ -80,6 +82,19 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 API_KEYS = [k.strip() for k in os.environ.get("RELAY_API_KEYS", "").split(",") if k.strip()]
 UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "remote") or "remote").lower()
+_VALID_UPSTREAM_MODES = (
+    "remote", "raw", "direct", "auto", "web", "ide", "work-agent",
+    "9router", "trae-remote", "cli", "traework-native",
+    "native", "traework",
+)
+
+
+def _current_upstream_mode() -> str:
+    """Read the upstream mode at request time so preset changes apply immediately."""
+    # The module attribute is authoritative.  The startup read already merged
+    # env defaults, and runtime preset changes update both env and the module
+    # value.  Tests can patch ``src.main.UPSTREAM_MODE`` to isolate scenarios.
+    return str(globals().get("UPSTREAM_MODE") or "remote").lower()
 
 FORWARD_USAGE = (os.environ.get("FORWARD_USAGE", "true") or "true").lower() == "true"
 CHECKIN_INTERVAL = float(os.environ.get("TRAE_CHECKIN_INTERVAL_SECONDS", "60") or "60")
@@ -98,6 +113,32 @@ CHECKIN_AUTO_RETRY_INTERVAL = float(
     os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
 )
 WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+UPSTREAM_ENDPOINT_PRESETS = (
+    {
+        "id": "remote",
+        "label": "Remote / chat_sessions",
+        "base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        "mode": "remote",
+    },
+    {
+        "id": "raw",
+        "label": "IDE Raw / llm_raw_chat",
+        "base_url": "https://trae-api-cn.mchost.guru",
+        "mode": "raw",
+    },
+    {
+        "id": "ide",
+        "label": "IDE Agent / llm_utils_chat",
+        "base_url": "https://trae-api-cn.mchost.guru",
+        "mode": "ide",
+    },
+    {
+        "id": "agent",
+        "label": "Work Agent / solo_work_remote",
+        "base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        "mode": "work-agent",
+    },
+)
 CHAT_OPTION_FIELDS = (
     "tools",
     "tool_choice",
@@ -115,6 +156,11 @@ CHAT_OPTION_FIELDS = (
     "presence_penalty",
     "frequency_penalty",
     "seed",
+    # ``thinking`` is a client-visible presentation/request hint.  It must be
+    # retained through the relay even though the native raw body has no field
+    # for it; the SSE/Responses translators use it to expose a compact
+    # reasoning summary without leaking the full upstream trace.
+    "thinking",
     "reasoning_effort",
     "stream_options",
     "response_format",
@@ -256,6 +302,7 @@ PUBLIC_PATHS = {
     "/healthz",
     "/v1/status",
     "/v1/models",
+    "/models",
     "/web/login",
     "/web/login/download",
     "/authorize",
@@ -276,9 +323,12 @@ PUBLIC_PATHS = {
     "/api/checkin/work-credits",
     "/api/usage/last",
     "/api/usage/records",
-    # Dashboard-only diagnostic, grouped with the other local console
-    # endpoints. It sends a fixed one-line probe and returns no credential.
-    "/api/model-test",
+    # TraeWork custom-model management probes cannot reliably attach the
+    # relay API key before the model has been saved. Chat ingress remains
+    # protected by the normal middleware; only connectivity is public.
+    "/api/agent/v3/custom_model_connectivity_check",
+    "/api/ide/v1/custom_model_connectivity_check",
+    "/v1/custom_model/connectivity",
 }
 PUBLIC_PATH_PREFIXES = ("/api/checkin", "/api/accounts")
 WEB_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "web_login.py"
@@ -653,7 +703,7 @@ def _web_login_html() -> str:
       <span class="label">源</span>
       <code>{html_mod.escape(state.source)}</code>
       <span class="label separator">上游</span>
-      <code>{html_mod.escape(UPSTREAM_MODE)}</code>
+      <code>{html_mod.escape(_current_upstream_mode())}</code>
     </div>
     <div class="status-row">
       <span class="label">轮询</span>
@@ -699,27 +749,13 @@ def _web_login_html() -> str:
         label = acc.get("label") or acc.get("user_id") or aid
         uid = acc.get("user_id") or aid
         expires = (acc.get("expires") or "")[:16]
-        acct_credits = acc.get("account_credits") or {}
-        if acct_credits.get("unlimited"):
-            credits_text = "\u2606 \u65e0\u9650"
-        elif acct_credits.get("remaining") is not None:
-            credits_text = f"\u5269{acct_credits['remaining']}/\u603b{acct_credits.get('total_limit','?')}"
+        account_credits = acc.get("account_credits") or {}
+        if account_credits.get("unlimited"):
+            credits_text = "☆ 无限"
+        elif account_credits.get("remaining") is not None:
+            credits_text = f"剩{float(account_credits['remaining']):.2f}/总{float(account_credits.get('total_limit') or 0):.2f}"
         else:
             credits_text = "-"
-        work_acct = acc.get("work_credits") or {}
-        if work_acct.get("unlimited"):
-            work_credits_text = "☆ 无限"
-        elif work_acct.get("remaining") is not None:
-            work_credits_text = f"剩{float(work_acct['remaining']):.2f}/总{float(work_acct.get('total_limit') or 0):.2f}"
-        else:
-            work_credits_text = "-"
-        total = acc.get("total_credits") or {}
-        if total.get("unlimited"):
-            total_credits_text = "☆ 无限"
-        elif total.get("remaining") is not None:
-            total_credits_text = f"剩{float(total['remaining']):.2f}/总{float(total.get('total_limit') or 0):.2f}"
-        else:
-            total_credits_text = "-"
         credits = acc.get("credits")
         checked_in = acc.get("checked_in")
         if checked_in is True:
@@ -733,9 +769,7 @@ def _web_login_html() -> str:
           <td><code>{html_mod.escape(uid)}</code></td>
           <td>{st} {act}</td>
           <td class="muted-cell">{html_mod.escape(expires)}</td>
-          <td><span id="credits-{html_mod.escape(aid)}" class="credit-value">{credits_text}</span></td>
-          <td><span id="work-credits-{html_mod.escape(aid)}" class="credit-value">{work_credits_text}</span></td>
-          <td><span id="total-credits-{html_mod.escape(aid)}" class="credit-value">{total_credits_text}</span></td>
+          <td><span id="general-credits-{html_mod.escape(aid)}" class="credit-value">{credits_text}</span></td>
           <td><span id="checkin-{html_mod.escape(aid)}" class="checkin-state">{checkin_badge}</span><small id="checkin-detail-{html_mod.escape(aid)}" class="row-subtitle"></small></td>
           <td class="row-actions">
             <button class="btn btn-ghost btn-sm" data-action="checkin" onclick="checkinAccount('{html_mod.escape(aid)}')" title="签到">签到</button>
@@ -755,7 +789,7 @@ def _web_login_html() -> str:
             <span id="checkin-busy" class="busy-indicator" role="status" aria-live="polite">正在处理...</span>
           </div>
           <table class="acct-table">
-            <thead><tr><th>账号</th><th>用户ID</th><th>状态</th><th>有效期</th><th>通用积分</th><th>Work积分</th><th>总积分</th><th>签到状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>账号</th><th>用户ID</th><th>状态</th><th>有效期</th><th>通用积分</th><th>签到状态</th><th>操作</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </div>"""
@@ -765,7 +799,7 @@ def _web_login_html() -> str:
         # frontend code handle an account list that becomes populated after a
         # login without requiring a page-specific script branch.
         accounts_html = '''
-        <p style="font-size:13px;color:#9aa0b0;margin-bottom:8px">暂无账号，请先登录或手动添加。</p>
+        <p class="card-hint">暂无账号，请先登录或手动添加。</p>
         <div class="account-toolbar" hidden>
           <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">查询签到状态</button>
           <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">查询全部积分</button>
@@ -778,6 +812,35 @@ def _web_login_html() -> str:
 
     settings_web = settings.get("web_base_url") or WEB_BASE
     settings_port = settings.get("relay_port") or PORT
+    matched_endpoint = next(
+        (
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if settings_web == item["base_url"]
+        ),
+        None,
+    )
+    # Custom URLs that aren't in the preset list still appear as saved options.
+    custom_is_saved = bool(settings.get("web_base_url")) and not matched_endpoint
+    custom_selected = " selected" if not matched_endpoint else ""
+    endpoint_options = [f'<option value=""{custom_selected}>自定义</option>']
+    if custom_is_saved:
+        endpoint_options.append(
+            f'<option value="__saved" selected>{html_mod.escape(settings_web)}</option>'
+        )
+    for item in UPSTREAM_ENDPOINT_PRESETS:
+        selected = " selected" if matched_endpoint and matched_endpoint["id"] == item["id"] else ""
+        endpoint_options.append(
+            f'<option value="{html_mod.escape(item["id"])}"{selected}>{html_mod.escape(item["label"])}</option>'
+        )
+    endpoint_options_html = "".join(endpoint_options)
+    endpoint_map_json = json.dumps(
+        {
+            item["id"]: {"base_url": item["base_url"], "mode": item["mode"]}
+            for item in UPSTREAM_ENDPOINT_PRESETS
+        },
+        ensure_ascii=False,
+    )
     poll_checked = 'checked' if polling.get("enabled") else ''
     poll_mode_rr = 'checked' if polling.get('mode', 'round-robin') == 'round-robin' else ''
     poll_mode_cp = 'checked' if polling.get('mode') == 'credit-priority' else ''
@@ -789,193 +852,309 @@ def _web_login_html() -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trae CN Relay 控制台</title>
 <style>
+:root {{
+  --bg: #eef0f4;
+  --panel: #ffffff;
+  --panel2: #f6f7fa;
+  --border: #e3e6ec;
+  --border-strong: #c9cfdb;
+  --text: #1d2331;
+  --muted: #5b6474;
+  --faint: #8b93a5;
+  --accent: #0d8a5f;
+  --accent-strong: #0a7451;
+  --accent-soft: #e2f3eb;
+  --accent-border: #bfe3d3;
+  --info: #2563eb;
+  --info-soft: #e9effd;
+  --info-border: #c8d8f8;
+  --warn: #b45309;
+  --warn-soft: #fdf1e2;
+  --warn-border: #f3dcb8;
+  --danger: #dc2626;
+  --danger-soft: #fdecec;
+  --danger-border: #f3c6c6;
+  --sidebar-bg: #181b25;
+  --sidebar-hover: #232838;
+  --sidebar-active: #272d40;
+  --sidebar-text: #a7aebf;
+  --sidebar-border: #262b3a;
+}}
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  background: #0f1117; color: #e8eaed; min-height: 100vh; display: flex; align-items: flex-start; justify-content: center;
-  padding: 24px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg); color: var(--text); min-height: 100vh;
+  font-size: 14px; line-height: 1.5;
 }}
-.panel {{
-  background: #1a1d28; border-radius: 8px; max-width: 1500px; width: 100%;
-  padding: 24px; border: 1px solid #2d3140; box-shadow: 0 18px 45px rgba(0,0,0,.18);
+.app {{ display: flex; min-height: 100vh; }}
+.sidebar {{
+  width: 232px; flex-shrink: 0; background: var(--sidebar-bg); color: var(--sidebar-text);
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+  overflow-y: auto;
 }}
-.panel-grid {{
-  display: block;
-  width: 100%;
+.brand {{ display: flex; align-items: center; gap: 10px; padding: 18px 16px 16px; border-bottom: 1px solid var(--sidebar-border); }}
+.brand-mark {{
+  width: 34px; height: 34px; border-radius: 8px; flex-shrink: 0;
+  background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; letter-spacing: .5px;
 }}
+.brand-block {{ display: flex; flex-direction: column; min-width: 0; }}
+.brand-block h1 {{ font-size: 15px; font-weight: 650; color: #f2f4f8; letter-spacing: .2px; white-space: nowrap; }}
+.brand-sub {{ color: #79839a; font-size: 11px; margin-top: 1px; }}
+.nav-list {{ display: flex; flex-direction: column; gap: 2px; padding: 12px; }}
+.nav-item {{
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  border: none; background: transparent; color: var(--sidebar-text);
+  font-size: 13px; font-weight: 550; padding: 9px 12px; border-radius: 8px; cursor: pointer;
+  transition: background .15s, color .15s; font-family: inherit; text-align: left;
+}}
+.nav-item svg {{ width: 16px; height: 16px; flex-shrink: 0; opacity: .9; }}
+.nav-item:hover {{ color: #e8ebf2; background: var(--sidebar-hover); }}
+.nav-item.active {{ color: #fff; background: var(--sidebar-active); box-shadow: inset 2px 0 0 var(--accent); }}
+.sidebar-status {{ padding: 12px 16px; border-top: 1px solid var(--sidebar-border); margin-top: auto; }}
+.sidebar-foot {{ padding: 12px 16px 16px; border-top: 1px solid var(--sidebar-border); }}
+.main {{ flex: 1; min-width: 0; padding: 24px 28px 48px; }}
+.main-inner {{ max-width: 1180px; margin: 0 auto; }}
+.status-strip {{ display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--sidebar-text); }}
+.status-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+.status-row .label {{ color: #6d7690; min-width: 30px; }}
+.status-row .separator {{ margin-left: 4px; }}
+.status-row code {{ background: #232838; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: #c3c9d8; }}
+.user-id {{ color: #7db3f5; font-size: 12px; }}
+.tab-page {{ display: none; }}
+.tab-page.active {{ display: block; }}
+.panel-grid {{ display: grid; grid-template-columns: 1fr; gap: 14px; }}
+.panel-grid.cols-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }}
+.panel-stack {{ display: flex; flex-direction: column; gap: 14px; }}
+.login-layout {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px 24px; align-items: start; }}
+.login-steps {{ margin: 0; padding-left: 18px; font-size: 12px; color: var(--muted); line-height: 1.7; }}
+.login-steps code {{ background: var(--panel2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-size: 11px; color:#39415a; }}
+.login-steps a {{ color: var(--info); }}
+.login-actions {{ display: flex; flex-direction: column; align-items: flex-end; }}
+.login-actions .btn-group {{ margin-top: 0; justify-content: flex-end; }}
+.login-actions .btn-group + .btn-group {{ margin-top: 8px; }}
+.manual-add {{ margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }}
+.manual-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 12px; margin-top: 12px; }}
+.manual-grid .span-all {{ grid-column: 1 / -1; }}
+.manual-submit {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }}
+.manual-submit .msg {{ margin-top: 0; }}
 .panel-card {{
-  background: #151823;
-  border: 1px solid #2d3140;
-  border-radius: 8px;
-  padding: 18px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
   min-width: 0;
   overflow-x: auto;
-  margin-bottom: 16px;
+  box-shadow: 0 1px 2px rgba(20,26,40,.05);
 }}
-h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 16px; }}
 .section-head {{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
 .section-head > div {{ display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }}
-.section-meta {{ color:#7f8799; font-size:12px; font-weight:400; }}
-.status-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; font-size: 13px; }}
-.status-row .label {{ color: #9aa0b0; }}
-.status-row .separator {{ margin-left: 8px; }}
-.status-row code {{ background: #252836; padding: 1px 6px; border-radius: 4px; font-size: 12px; }}
+.section-meta {{ color:var(--faint); font-size:12px; font-weight:400; }}
 .badge {{ display:inline-flex; align-items:center; gap:4px; font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 600; white-space:nowrap; }}
 [hidden] {{ display:none !important; }}
-.badge-ok {{ background: #1f6c3a; color: #a8e6b8; }}
-.badge-expired {{ background: #6c3a1f; color: #e6b8a8; }}
-.badge-none {{ background: #2d3140; color: #9aa0b0; }}
-.badge-active {{ background: #1a3a6c; color: #a8c6e6; }}
-.user-id {{ color: #8ab4f8; font-size: 12px; }}
-hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
+.badge-ok {{ background: var(--accent-soft); color: var(--accent-strong); border:1px solid var(--accent-border); }}
+.badge-expired {{ background: var(--warn-soft); color: var(--warn); border:1px solid var(--warn-border); }}
+.badge-none {{ background: var(--panel2); color: var(--muted); border:1px solid var(--border); }}
+.badge-active {{ background: var(--info-soft); color: var(--info); border:1px solid var(--info-border); }}
+hr {{ border: none; border-top: 1px solid var(--border); margin: 16px 0; }}
 .btn {{
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  padding: 10px 20px; border-radius: 6px; font-size: 14px; font-weight: 500;
+  padding: 9px 18px; border-radius: 8px; font-size: 13px; font-weight: 550;
   cursor: pointer; border: 1px solid transparent; transition: all .15s;
-  text-decoration: none; color: #fff; min-height: 32px;
+  text-decoration: none; min-height: 32px;
 }}
-.btn-sm {{ padding: 5px 10px; font-size: 12px; }}
-.btn-primary {{ background: #1a8c5c; border-color: #1a8c5c; }}
-.btn-primary:hover {{ background: #14a06a; }}
+.btn-sm {{ padding: 5px 10px; font-size: 12px; min-height: 26px; }}
+.btn-primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
+.btn-primary:hover {{ background: var(--accent-strong); border-color: var(--accent-strong); }}
 .btn-primary:disabled {{ opacity: .5; cursor: not-allowed; }}
-.btn-secondary {{ background: #2d3140; border-color: #3a3f54; }}
-.btn-secondary:hover {{ background: #3a3f54; }}
-.btn-danger {{ background: #8c1f1f; border-color: #8c1f1f; }}
-.btn-danger:hover {{ background: #a02020; }}
-.btn-ghost {{ background: transparent; border-color: #3a3f54; color: #9aa0b0; }}
-.btn-ghost:hover {{ border-color: #5a5f74; color: #e8eaed; }}
-.btn-danger {{ background: transparent; border-color:#67323a; color:#e9a8ae; }}
-.btn-danger:hover {{ background:#55252d; border-color:#914550; color:#ffd9dd; }}
+.btn-secondary {{ background: var(--panel); border-color: var(--border-strong); color: var(--text); }}
+.btn-secondary:hover {{ background: var(--panel2); }}
+.btn-ghost {{ background: transparent; border-color: var(--border-strong); color: var(--muted); }}
+.btn-ghost:hover {{ border-color: #9aa5b5; color: var(--text); }}
+.btn-danger {{ background: transparent; border-color: var(--danger-border); color: var(--danger); }}
+.btn-danger:hover {{ background: var(--danger-soft); border-color: #e59a9e; }}
 .btn-group {{ display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }}
 .account-toolbar {{ align-items:center; margin: 10px 0 14px; }}
 .account-toolbar .inline-msg {{ margin:0; flex:1 1 260px; }}
-.form-group {{ margin-bottom: 12px; }}
-.form-group label {{ display: block; font-size: 12px; color: #9aa0b0; margin-bottom: 4px; }}
-.form-group input, .form-group textarea {{
-  width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #3a3f54;
-  background: #252836; color: #e8eaed; font-size: 13px; font-family: "SF Mono", Consolas, monospace;
+.form-group {{ margin-bottom: 10px; }}
+.form-group label {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
+.form-group input, .form-group textarea, .form-group select {{
+  width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-strong);
+  background: var(--panel); color: var(--text); font-size: 13px; font-family: "SF Mono", Consolas, monospace;
 }}
+.form-group select {{ font-family: inherit; }}
 .form-group textarea {{ resize: vertical; min-height: 60px; }}
-.form-group input:focus, .form-group textarea:focus {{ outline: none; border-color: #1a8c5c; }}
-.acct-table {{ width: 100%; min-width: 980px; border-collapse: collapse; font-size: 13px; }}
-.acct-table th, .acct-table td {{ text-align: left; padding: 9px 8px; border-bottom: 1px solid #2d3140; vertical-align: middle; }}
+.form-group input:focus, .form-group textarea:focus, .form-group select:focus {{ outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(13,138,95,.12); }}
+.form-inline {{ display:flex; gap:12px; flex-wrap:wrap; }}
+.form-inline .form-group {{ flex:1 1 220px; }}
+.acct-table {{ width: 100%; min-width: 920px; border-collapse: collapse; font-size: 13px; }}
+.acct-table th, .acct-table td {{ text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }}
 .acct-table tbody tr {{ transition: background .15s ease; }}
-.acct-table tbody tr:hover {{ background:#1d2130; }}
-.acct-table tbody tr.active-row {{ background:rgba(26,140,92,.12); box-shadow:inset 3px 0 #1a8c5c; }}
-.acct-table tbody tr.active-row:hover {{ background:rgba(26,140,92,.18); }}
-.acct-table tbody tr.row-failed {{ background:rgba(140,31,31,.12); }}
-.acct-table tbody tr.row-failed:hover {{ background:rgba(140,31,31,.2); }}
-.acct-table th {{ color: #9aa0b0; font-weight: 600; font-size: 12px; position:sticky; top:0; background:#151823; z-index:1; }}
-.acct-table th:nth-child(n+5):nth-child(-n+7), .acct-table td:nth-child(n+5):nth-child(-n+7) {{ text-align:right; }}
-.credit-value {{ font-variant-numeric: tabular-nums; white-space:nowrap; color:#cbd0dc; }}
-.muted-cell {{ color:#8c93a4; font-size:12px; white-space:nowrap; }}
-.row-subtitle {{ display:block; color:#7f8799; font-size:11px; margin-top:3px; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.acct-table tbody tr:hover {{ background: var(--panel2); }}
+.acct-table tbody tr.active-row {{ background: var(--accent-soft); box-shadow:inset 3px 0 var(--accent); }}
+.acct-table tbody tr.active-row:hover {{ background:#d5ecdf; }}
+.acct-table tbody tr.row-failed {{ background: var(--danger-soft); }}
+.acct-table tbody tr.row-failed:hover {{ background:#fbdddd; }}
+.acct-table th {{ color: var(--muted); font-weight: 600; font-size: 12px; position:sticky; top:0; background:var(--panel); z-index:1; }}
+.acct-table th:nth-child(5), .acct-table td:nth-child(5) {{ text-align:right; }}
+.credit-value {{ font-variant-numeric: tabular-nums; white-space:nowrap; color:#39415a; }}
+.muted-cell {{ color:var(--faint); font-size:12px; white-space:nowrap; }}
+.row-subtitle {{ display:block; color:var(--faint); font-size:11px; margin-top:3px; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
 .row-actions {{ white-space:nowrap; }}
 .row-actions .btn {{ margin:2px 0; }}
 .usage-records-container {{ max-height: 320px; overflow: auto; }}
 .usage-table {{ width: 100%; min-width: 760px; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
-.usage-table th, .usage-table td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid #2d3140; overflow-wrap: anywhere; }}
-.usage-table th {{ color: #9aa0b0; font-weight: 500; font-size: 12px; position: sticky; top: 0; background: #151823; }}
+.usage-table th, .usage-table td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }}
+.usage-table th {{ color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }}
 .usage-table .numeric {{ text-align: right; font-variant-numeric:tabular-nums; }}
 .usage-table .usage-status {{ white-space:nowrap; }}
-.usage-empty {{ padding: 18px 12px; color: #888; text-align: center; font-size: 13px; }}
+.usage-empty {{ padding: 18px 12px; color: var(--faint); text-align: center; font-size: 13px; }}
 .msg {{ margin-top: 12px; padding: 8px 12px; border-radius: 6px; font-size: 13px; display: none; line-height:1.45; }}
-.msg-ok {{ background: #1f6c3a; color: #a8e6b8; display: block; }}
-.msg-err {{ background: #6c1f1f; color: #e6a8a8; display: block; }}
-.busy-indicator {{ display:none; color:#9aa0b0; font-size:12px; align-items:center; gap:6px; }}
+.msg-ok {{ background: var(--accent-soft); color: var(--accent-strong); display: block; border:1px solid var(--accent-border); }}
+.msg-err {{ background: var(--danger-soft); color: var(--danger); display: block; border:1px solid var(--danger-border); }}
+.busy-indicator {{ display:none; color:var(--muted); font-size:12px; align-items:center; gap:6px; }}
 .busy-indicator.visible {{ display:inline-flex; }}
-.busy-indicator::before {{ content:""; width:10px; height:10px; border:2px solid #4a5064; border-top-color:#76d5a5; border-radius:50%; animation:relay-spin .7s linear infinite; }}
+.busy-indicator::before {{ content:""; width:10px; height:10px; border:2px solid var(--border-strong); border-top-color:var(--accent); border-radius:50%; animation:relay-spin .7s linear infinite; }}
 @keyframes relay-spin {{ to {{ transform:rotate(360deg); }} }}
-.toast {{ position:fixed; top:20px; right:20px; z-index:20; width:min(420px,calc(100vw - 40px)); padding:12px 14px; border:1px solid #3a3f54; border-radius:8px; background:#1d2130; color:#e8eaed; box-shadow:0 12px 32px rgba(0,0,0,.35); opacity:0; transform:translateY(-8px); pointer-events:none; transition:opacity .18s ease, transform .18s ease; white-space:pre-wrap; line-height:1.45; }}
+.toast {{ position:fixed; top:20px; right:20px; z-index:20; width:min(420px,calc(100vw - 40px)); padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--panel); color:var(--text); box-shadow:0 12px 32px rgba(20,26,40,.16); opacity:0; transform:translateY(-8px); pointer-events:none; transition:opacity .18s ease, transform .18s ease; white-space:pre-wrap; line-height:1.45; }}
 .toast.visible {{ opacity:1; transform:translateY(0); }}
-.toast.ok {{ border-color:#2c8150; }}
-.toast.error {{ border-color:#9a3d47; color:#ffd9dd; background:#331d25; }}
-.toast-title {{ display:block; font-size:12px; font-weight:700; margin-bottom:3px; color:#a8e6b8; }}
-.toast.error .toast-title {{ color:#ffb7bf; }}
+.toast.ok {{ border-color:var(--accent-border); }}
+.toast.error {{ border-color:var(--danger-border); color:var(--danger); background:var(--danger-soft); }}
+.toast-title {{ display:block; font-size:12px; font-weight:700; margin-bottom:3px; color:var(--accent-strong); }}
+.toast.error .toast-title {{ color:var(--danger); }}
 .busy {{ opacity:.65; pointer-events:none; }}
-.loading {{ margin-top: 12px; display: none; font-size: 13px; color: #9aa0b0; }}
-.section-title {{ font-size: 14px; font-weight: 600; color: #c8cbd6; margin: 14px 0 8px; }}
-.check-row {{ display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9aa0b0; }}
-@media (max-width: 720px) {{
-  body {{ padding:10px; }}
-  .panel {{ padding:14px 10px; }}
-  .panel-card {{ padding:14px 10px; }}
-  h1 {{ font-size:18px; }}
-  .status-row {{ font-size:12px; }}
+.loading {{ margin-top: 12px; display: none; font-size: 13px; color: var(--muted); }}
+.section-title {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 0 0 10px; letter-spacing: .2px; }}
+.section-title-block {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid var(--border); }}
+.card-hint {{ font-size:12px; color:var(--muted); line-height:1.6; margin-bottom:10px; }}
+.card-hint code {{ background: var(--panel2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-size: 11px; color:#39415a; }}
+.card-hint a {{ color:var(--info); }}
+.check-row {{ display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }}
+.check-row .label {{ color:var(--faint); }}
+pre.code-out {{ margin-top:12px; padding:12px; background:var(--panel2); border:1px solid var(--border); border-radius:6px; font-size:12px; max-height:220px; overflow:auto; white-space:pre-wrap; color:#39415a; display:none; }}
+details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
+@media (max-width: 960px) {{
+  .panel-grid.cols-2 {{ grid-template-columns: 1fr; }}
+  .login-layout {{ grid-template-columns: 1fr; }}
+  .login-actions {{ align-items: stretch; }}
+  .login-actions .btn-group {{ justify-content: flex-start; }}
+  .manual-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+}}
+@media (max-width: 820px) {{
+  .app {{ flex-direction: column; }}
+  .sidebar {{ width: 100%; height: auto; position: static; }}
+  .nav-list {{ flex-direction: row; overflow-x: auto; padding: 8px 12px; }}
+  .nav-item {{ width: auto; white-space: nowrap; }}
+  .sidebar-status {{ margin-top: 0; border-top: 1px solid var(--sidebar-border); }}
+  .sidebar-foot {{ border-top: none; }}
+  .main {{ padding: 16px 14px 36px; }}
+  .panel-card {{ padding: 14px 12px; }}
   .btn {{ padding:8px 12px; }}
   .btn-sm {{ padding:6px 9px; }}
   .account-toolbar {{ align-items:stretch; }}
   .account-toolbar .btn {{ flex:1 1 150px; }}
   .account-toolbar .inline-msg {{ flex-basis:100%; }}
   .usage-table {{ min-width:560px; }}
+  .manual-grid {{ grid-template-columns: 1fr; }}
 }}
 </style>
 </head>
 <body>
 <div id="toast" class="toast" role="alert" aria-live="assertive"><span id="toast-title" class="toast-title"></span><span id="toast-text"></span></div>
-<div class="panel">
-<h1>Trae CN Relay 控制台</h1>
-<div class="status-row" style="justify-content:space-between;align-items:center">
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{status_html}</div>
-  {logout_btn}
-</div>
-<hr>
-<div class="panel-grid">
-<div class="panel-card">
-<div class="section-title">授权登录</div>
-<p style="font-size:13px;color:#9aa0b0;margin-bottom:8px;line-height:1.5">
-  1. 点击下方按钮后会自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。<br>
-  2. 若未检测到，请先下载 <code>web_login.py</code>（或一键 <code>start_auth.bat</code>）并在<b>本机</b>运行，再重试。<br>
-  3. 确保浏览器已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener" style="color:#8ab4f8">trae.cn</a>，授权完成后凭据自动写入服务器。
-</p>
-<div class="btn-group">
-  <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">使用 Trae 网页授权登录</button>
-  <a class="btn btn-ghost" href="https://www.trae.cn" target="_blank" rel="noopener">访问 trae.cn</a>
-</div>
-<div class="btn-group">
-  <a class="btn btn-secondary" href="/web/login/download" download>下载本机授权助手 web_login.py</a>
-  <a class="btn btn-ghost" href="/web/login/download?as=bat" download id="bat-link" style="display:none">下载一键启动 start_auth.bat</a>
+<div class="app">
+<aside class="sidebar">
+  <div class="brand">
+    <span class="brand-mark">TR</span>
+    <div class="brand-block">
+      <h1>Trae CN Relay</h1>
+      <span class="brand-sub">控制台</span>
+    </div>
+  </div>
+  <nav class="nav-list" role="tablist">
+    <button class="nav-item active" data-tab="accounts" onclick="switchTab('accounts')">账号与签到</button>
+    <button class="nav-item" data-tab="usage" onclick="switchTab('usage')">消费记录</button>
+    <button class="nav-item" data-tab="settings" onclick="switchTab('settings')">轮询与设置</button>
+    <button class="nav-item" data-tab="models" onclick="switchTab('models')">模型测试</button>
+  </nav>
+  <div class="sidebar-status">
+    <div class="status-strip">{status_html}</div>
+  </div>
+  <div class="sidebar-foot">
+    {logout_btn}
+  </div>
+</aside>
+<main class="main">
+<div class="main-inner">
+<div class="tab-page active" data-page="accounts">
+<div class="panel-stack">
+<section class="panel-card" aria-labelledby="login-title">
+<div class="section-head"><div class="section-title" id="login-title">授权登录</div></div>
+<div class="login-layout">
+  <ol class="login-steps">
+    <li>点击授权登录，自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。</li>
+    <li>未检测到时，下载 <code>web_login.py</code> 或 <code>start_auth.bat</code> 在<b>本机</b>运行后重试。</li>
+    <li>确保浏览器已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener">trae.cn</a>，授权完成后凭据自动写入服务器。</li>
+  </ol>
+  <div class="login-actions">
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">使用 Trae 网页授权登录</button>
+      <a class="btn btn-ghost" href="https://www.trae.cn" target="_blank" rel="noopener">访问 trae.cn</a>
+    </div>
+    <div class="btn-group">
+      <a class="btn btn-secondary" href="/web/login/download" download>下载授权助手 web_login.py</a>
+      <a class="btn btn-ghost" href="/web/login/download?as=bat" download id="bat-link" style="display:none">下载 start_auth.bat</a>
+    </div>
+  </div>
 </div>
 <div id="loading" class="loading">等待授权中...</div>
 <div id="auth-msg" class="msg"></div>
-<hr>
-</div>
-<div class="panel-card">
-<div class="section-title">账号列表</div>
-{accounts_html}
-<details>
-  <summary style="font-size:13px;color:#9aa0b0;cursor:pointer">手动填写凭证添加账号</summary>
-  <form id="manual-form" style="margin-top:12px">
-    <div class="form-group">
-      <label>Token（Cloud-IDE-JWT）<span style="color:#e6a8a8">*</span></label>
-      <textarea name="token" required placeholder="eyJhbGciOiJSUzI1NiI6Ik9wZW5TU0..."></textarea>
+<details class="manual-add">
+  <summary>手动填写凭证添加账号</summary>
+  <form id="manual-form" class="manual-grid">
+    <div class="form-group span-all">
+      <label for="manual-token">Token（Cloud-IDE-JWT）<span style="color:var(--danger)">*</span></label>
+      <textarea id="manual-token" name="token" required placeholder="eyJhbGciOiJSUzI1NiI6Ik9wZW5TU0..."></textarea>
     </div>
     <div class="form-group">
-      <label>Refresh Token</label>
-      <input name="refreshToken" placeholder="可选">
+      <label for="manual-refresh">Refresh Token</label>
+      <input id="manual-refresh" name="refreshToken" placeholder="可选">
     </div>
     <div class="form-group">
-      <label>User ID</label>
-      <input name="userId" placeholder="可选">
+      <label for="manual-uid">User ID</label>
+      <input id="manual-uid" name="userId" placeholder="可选">
     </div>
     <div class="form-group">
-      <label>Client ID</label>
-      <input name="clientId" value="{html_mod.escape(client_id)}">
+      <label for="manual-cid">Client ID</label>
+      <input id="manual-cid" name="clientId" value="{html_mod.escape(client_id)}">
     </div>
     <div class="form-group">
-      <label>备注（标签）</label>
-      <input name="label" placeholder="可选">
+      <label for="manual-label">备注（标签）</label>
+      <input id="manual-label" name="label" placeholder="可选">
     </div>
-    <button type="submit" class="btn btn-primary">添加账号</button>
-    <div id="manual-msg" class="msg"></div>
+    <div class="span-all manual-submit">
+      <button type="submit" class="btn btn-primary">添加账号</button>
+      <div id="manual-msg" class="msg"></div>
+    </div>
   </form>
 </details>
+</section>
+<section class="panel-card" aria-label="账号列表">
+<div class="section-title">账号列表</div>
+{accounts_html}
+</section>
 </div>
+</div>
+<div class="tab-page" data-page="usage">
+<div class="panel-grid">
 <div class="panel-card" id="usage-panel">
 <div class="section-head"><div class="section-title">消费记录</div><span id="usage-updated" class="section-meta"></span></div>
 <div id="usage-msg" class="msg" role="status" aria-live="polite"></div>
 {usage_records_html}
 </div>
+</div>
+</div>
+<div class="tab-page" data-page="settings">
+<div class="panel-grid cols-2">
 <div class="panel-card">
 <div class="section-title">多账号轮询</div>
 <div class="check-row">
@@ -991,11 +1170,19 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
     <input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}> 积分优先
   </label>
 </div>
-<p id="poll-status" style="font-size:12px;color:#9aa0b0;margin-top:4px">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
-<hr>
-<div class="section-title">自定义 URL / 端口</div>
+<p id="poll-status" style="font-size:12px;color:var(--faint);margin-top:6px">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
+</div>
+<div class="panel-card">
+  <div class="section-title">上游端点</div>
 <div class="form-group">
-  <label>Web Base URL</label>
+  <label>预设端点</label>
+  <select id="settings-endpoint-preset" onchange="applyEndpointPreset()">
+    <option value="">自定义</option>
+    {endpoint_options_html}
+  </select>
+</div>
+<div class="form-group">
+  <label>自定义 Web Base URL</label>
   <input id="settings-web" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1">
 </div>
 <div class="form-group">
@@ -1006,7 +1193,12 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
   <button class="btn btn-secondary" onclick="saveSettings()">保存设置</button>
 </div>
 <div id="settings-msg" class="msg"></div>
-<hr>
+</div>
+</div>
+</div>
+<div class="tab-page" data-page="models">
+<div class="panel-grid">
+<div class="panel-card">
 <div class="section-title">模型列表</div>
 <div class="form-group">
   <label>刷新 /v1/models（TRAE_FETCH_MODEL_LIST=true 时从上游拉取，否则返回内置列表）</label>
@@ -1014,7 +1206,7 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
 <div class="btn-group">
   <button class="btn btn-secondary" onclick="refreshModels()">获取模型列表</button>
 </div>
-<pre id="models-out" style="margin-top:12px;padding:12px;background:#252836;border-radius:6px;font-size:12px;max-height:220px;overflow:auto;white-space:pre-wrap;color:#c8cbd6;display:none"></pre>
+<pre id="models-out" class="code-out"></pre>
 <div id="models-msg" class="msg"></div>
 </div>
 <div class="panel-card" id="conn-panel">
@@ -1025,7 +1217,7 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
   <div class="form-group">
     <label for="conn-models">测试模型（逗号或换行分隔，留空使用下方常用模型）</label>
     <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"
-      style="width:100%;box-sizing:border-box;padding:8px;background:#252836;border:1px solid #363a4a;border-radius:6px;color:#e6e8ef;font-size:12px;font-family:inherit"></textarea>
+      style="width:100%;box-sizing:border-box;padding:8px;background:var(--panel);border:1px solid var(--border-strong);border-radius:6px;color:var(--text);font-size:12px;font-family:inherit"></textarea>
   </div>
   <div class="form-group">
     <label>测试内容</label>
@@ -1037,17 +1229,40 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
         <input type="checkbox" id="conn-mode-tool"> 工具调用
       </label>
       <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+        思考强度
+        <select id="conn-effort" title="映射到 Trae custom_model.reasoning_effort：low=light，medium/high=high，xhigh=extra_high，超出模型支持的档位会向下取"
+          style="width:auto;padding:4px 6px;background:var(--panel);border:1px solid var(--border-strong);border-radius:4px;color:var(--text)">
+          <option value="">默认（不传）</option>
+          <option value="low">low / 轻</option>
+          <option value="medium">medium / 高</option>
+          <option value="high">high / 高</option>
+          <option value="xhigh">xhigh / 极高</option>
+        </select>
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+        <input type="checkbox" id="conn-thinking"> 返回思考内容
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
         超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"
-          style="width:72px;padding:4px 6px;background:#252836;border:1px solid #363a4a;border-radius:4px;color:#e6e8ef">
+          style="width:72px;padding:4px 6px;background:var(--panel);border:1px solid var(--border-strong);border-radius:4px;color:var(--text)">
       </label>
     </div>
+  </div>
+  <div class="form-group">
+    <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
+    <select id="conn-endpoint">
+      <option value="remote">Remote / chat_sessions</option>
+      <option value="raw">IDE Raw / llm_raw_chat</option>
+      <option value="ide">IDE Agent / llm_utils_chat</option>
+      <option value="work-agent">Work Agent / solo_work_remote</option>
+    </select>
   </div>
   <div class="btn-group">
     <button class="btn btn-secondary" id="conn-run-btn" onclick="runConnTest()">开始测试</button>
     <button class="btn btn-secondary" onclick="fillConnPreset()">填入常用模型</button>
   </div>
   <table id="conn-table" style="width:100%;margin-top:12px;border-collapse:collapse;font-size:12px;display:none">
-    <thead><tr style="text-align:left;color:#9aa0b0">
+    <thead><tr style="text-align:left;color:var(--muted)">
       <th style="padding:6px 4px">模型</th><th style="padding:6px 4px">类型</th>
       <th style="padding:6px 4px">结果</th><th style="padding:6px 4px">耗时</th>
       <th style="padding:6px 4px">详情</th>
@@ -1057,13 +1272,21 @@ hr {{ border: none; border-top: 1px solid #2d3140; margin: 16px 0; }}
   <div id="conn-msg" class="msg"></div>
 </div>
 </div>
+</div>
+</div>
+</main>
+</div>
 <script>
+function switchTab(name){{
+  document.querySelectorAll('.nav-item').forEach(function(b){{ b.classList.toggle('active', b.getAttribute('data-tab')===name); }});
+  document.querySelectorAll('.tab-page').forEach(function(p){{ p.classList.toggle('active', p.getAttribute('data-page')===name); }});
+}}
 const state = {{ traceId: null, win: null }};
 let currentCodeVerifier = '';
 function uuid() {{ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){{var r=Math.random()*16|0;return(c==='x'?r:(r&3|8)).toString(16)}}) }}
 function randomHex(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('') }}
 function randomDigits(n) {{ var s='';while(s.length<n)s+=Math.floor(Math.random()*1e10).toString();return s.slice(0,n) }}
-function randomBase64Url(n) {{ var a=new Uint8Array(n); if(window.crypto&&crypto.getRandomValues){{ crypto.getRandomValues(a) }} else {{ for(var i=0;i<n;i++)a[i]=Math.floor(Math.random()*256) }} return btoa(String.fromCharCode.apply(null,a)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'') }}
+function randomBase64Url(n) {{ var a=new Uint8Array(n); if(window.crypto&&crypto.getRandomValues){{ crypto.getRandomValues(a) }} else {{ for(var i=0;i<n;i++)a[i]=Math.floor(Math.random()*256) }} return btoa(String.fromCharCode.apply(null,a)).replace(/[+]/g,'-').split('/').join('_').replace(/=+$/,'') }}
 function buildChallenge() {{ currentCodeVerifier=randomBase64Url(32); return sha256Base64Url(currentCodeVerifier) }}
 async function buildAuthUrl() {{
   // Trae 授权页强制要求回调为 http://127.0.0.1:<port>/authorize，
@@ -1108,6 +1331,16 @@ async function startAuth() {{
 }}
 
 let usageRefreshing = false;
+function usageRecordsFromPayload(payload){{
+  // Keep the console compatible with both the historical bare-array endpoint
+  // and deployments that wrap records in an object for metadata/versioning.
+  if(Array.isArray(payload)) return payload;
+  if(!payload || typeof payload!=='object') return null;
+  if(Array.isArray(payload.records)) return payload.records;
+  if(Array.isArray(payload.data)) return payload.data;
+  if(payload.data && typeof payload.data==='object' && Array.isArray(payload.data.records)) return payload.data.records;
+  return null;
+}}
 async function refreshUsage() {{
   if(usageRefreshing) return;
   usageRefreshing=true;
@@ -1117,7 +1350,8 @@ async function refreshUsage() {{
   try {{
     var result=await requestJSON('/api/usage/records',{{method:'GET'}},15000);
     if(!result.ok) throw new Error(apiError(result.data,result.status));
-    var records=Array.isArray(result.data)?result.data:[];
+    var records=usageRecordsFromPayload(result.data);
+    if(records===null) throw new Error(apiError(result.data,result.status));
     if(!tbody) return;
     if(records.length===0) {{
       tbody.innerHTML='';
@@ -1264,7 +1498,7 @@ function setAccountCheckinBusy(id,busy){{
   syncCheckinBusyUI();
 }}
 function setCredits(id,data){{
-  var values=[['credits-',data&&data.account_credits],['work-credits-',data&&data.work_credits],['total-credits-',data&&data.total_credits]];
+  var values=[['general-credits-',data&&data.account_credits]];
   values.forEach(function(pair){{
     var el=document.getElementById(pair[0]+id), value=pair[1];
     if(!el) return;
@@ -1353,13 +1587,16 @@ function checkinFailureText(account){{
   var message=(account&&account.error)||((account&&account.data&&account.data.message)||'未知错误');
   return (account&&account.label||account&&account.id||'账号')+'：'+(code?'业务码 '+code+'，':'')+message;
 }}
-const CONN_PRESET = ['glm-5.3','glm-5.2','DeepSeek-V4-Pro-Official','DeepSeek-V4-Flash-Official'];
+const CONN_PRESET = ['glm-5.3','glm-5.2','kimi-k2.7-code','kimi-k3','qwen3.8-max','DeepSeek-V4-Pro-Official','DeepSeek-V4-Flash-Official'];
 function fillConnPreset(){{
   document.getElementById('conn-models').value = CONN_PRESET.join(', ');
 }}
 function connModelList(){{
   var raw = document.getElementById('conn-models').value || '';
-  var items = raw.split(/[\n,]+/).map(function(s){{ return s.trim(); }}).filter(Boolean);
+  // Keep the newline escape intact when this script is rendered from the
+  // Python f-string.  A literal line break makes the whole inline script
+  // invalid JavaScript and disables every account/usage control on the page.
+  var items = raw.split(/[\\n,]+/).map(function(s){{ return s.trim(); }}).filter(Boolean);
   return items.length ? items : CONN_PRESET.slice();
 }}
 function connModes(){{
@@ -1370,13 +1607,13 @@ function connModes(){{
 }}
 function connRow(model, mode){{
   var tr = document.createElement('tr');
-  tr.style.borderTop = '1px solid #2c303d';
+  tr.style.borderTop = '1px solid var(--border)';
   var label = mode === 'tool' ? '工具调用' : '文本回复';
   tr.innerHTML = '<td style="padding:6px 4px">' + model + '</td>'
     + '<td style="padding:6px 4px">' + label + '</td>'
     + '<td style="padding:6px 4px" class="conn-status">排队中</td>'
     + '<td style="padding:6px 4px" class="conn-time">-</td>'
-    + '<td style="padding:6px 4px;color:#9aa0b0" class="conn-detail">-</td>';
+    + '<td style="padding:6px 4px;color:var(--muted)" class="conn-detail">-</td>';
   return tr;
 }}
 async function runConnTest(){{
@@ -1388,6 +1625,9 @@ async function runConnTest(){{
   var modes = connModes();
   if(!modes.length){{ showMsg('conn-msg','请至少选择一种测试内容',false); return; }}
   var timeout = parseInt(document.getElementById('conn-timeout').value,10) || 120;
+  var endpoint = document.getElementById('conn-endpoint').value || 'remote';
+  var effort = document.getElementById('conn-effort').value || '';
+  var thinking = document.getElementById('conn-thinking').checked;
   btn.disabled = true;
   table.style.display = 'table';
   tbody.innerHTML = '';
@@ -1408,31 +1648,49 @@ async function runConnTest(){{
     var timeCell = job.row.querySelector('.conn-time');
     var detailCell = job.row.querySelector('.conn-detail');
     statusCell.textContent = '测试中...';
-    statusCell.style.color = '#9aa0b0';
+    statusCell.style.color = '#5b6474';
     try{{
       var d = await postJSON('/api/model-test',
-        {{model: job.model, mode: job.mode, timeout: timeout}}, (timeout + 20) * 1000);
+        {{model: job.model, mode: job.mode, timeout: timeout, endpoint: endpoint,
+          reasoning_effort: effort, thinking: thinking}}, (timeout + 20) * 1000);
       timeCell.textContent = (d.elapsed_ms !== undefined ? d.elapsed_ms + ' ms' : '-');
       if(d.success){{
         passed++;
         statusCell.textContent = '通过';
-        statusCell.style.color = '#4ade80';
+        statusCell.style.color = '#0d8a5f';
         if(job.mode === 'tool'){{
           var names = (d.tool_calls || []).map(function(c){{ return c.name; }}).join(', ');
-          detailCell.textContent = 'tool=' + (names || '-')
+          detailCell.textContent = 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
+            + (d.fallback_used ? ' (fallback)' : '') + ' | tool=' + (names || '-')
             + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
         }} else {{
-          detailCell.textContent = JSON.stringify(d.reply || '')
+          detailCell.textContent = 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
+            + (d.fallback_used ? ' (fallback)' : '') + ' | ' + JSON.stringify(d.reply || '')
             + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
+        }}
+        var extra = [];
+        if(d.requested_reasoning_effort){{
+          extra.push('强度=' + d.requested_reasoning_effort + ' -> '
+            + (d.reasoning_effort_applied || ('未生效: ' + (d.reasoning_effort_note || '模型不支持'))));
+        }}
+        if(d.usage && d.usage.reasoning_tokens !== undefined && d.usage.reasoning_tokens !== null){{
+          extra.push('reasoning_tokens=' + d.usage.reasoning_tokens);
+        }}
+        if(extra.length) detailCell.textContent += ' | ' + extra.join(' | ');
+        if(d.reasoning){{
+          var rd = document.createElement('div');
+          rd.style.cssText = 'margin-top:4px;color:#5b6474;white-space:pre-wrap';
+          rd.textContent = '思考: ' + d.reasoning;
+          detailCell.appendChild(rd);
         }}
       }} else {{
         statusCell.textContent = '失败';
-        statusCell.style.color = '#f87171';
+        statusCell.style.color = '#dc2626';
         detailCell.textContent = String(d.error || 'unknown');
       }}
     }}catch(e){{
       statusCell.textContent = '失败';
-      statusCell.style.color = '#f87171';
+      statusCell.style.color = '#dc2626';
       timeCell.textContent = '-';
       detailCell.textContent = String(e);
     }}
@@ -1491,9 +1749,26 @@ async function togglePolling(){{
 async function saveSettings(){{
   var web=document.getElementById('settings-web').value.trim();
   var port=document.getElementById('settings-port').value.trim();
-  var d=await postJSON('/api/settings',{{web_base_url:web,relay_port:port}});
+  var mode=(typeof ENDPOINT_PRESET_MAP !== 'undefined' && ENDPOINT_PRESET_MAP[document.getElementById('settings-endpoint-preset')?.value || '']) ? ENDPOINT_PRESET_MAP[document.getElementById('settings-endpoint-preset').value].mode : '';
+  var d=await postJSON('/api/settings',{{web_base_url:web,relay_port:port,upstream_mode:mode}});
   if(d.success){{ showMsg('settings-msg',d.note||'设置已保存',true); setTimeout(function(){{ location.reload(); }},800); }}
   else showMsg('settings-msg',d.error||'保存失败',false);
+}}
+const ENDPOINT_PRESET_MAP = {endpoint_map_json};
+async function applyEndpointPreset(){{
+  var selector=document.getElementById('settings-endpoint-preset');
+  var input=document.getElementById('settings-web');
+  if(!selector||!input) return;
+  var map=ENDPOINT_PRESET_MAP;
+  var entry=map[selector.value]||null;
+  var value=entry?entry.base_url:'';
+  if(value) input.value=value;
+  // Custom saved URL just selects, doesn't need save.
+  if (selector.value === '__saved') return;
+  // Auto-save on preset change (unless switching to custom).
+  if (selector.value) {{
+    await saveSettings();
+  }}
 }}
 async function checkinRefreshAll(){{
   setBusy(true);
@@ -1539,7 +1814,7 @@ async function checkinAccount(id){{
   try{{
     var result=await requestJSON('/api/checkin/account/'+encodeURIComponent(id),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}},90000);
     var d=result.data||{{}};
-    var account={{id:id,data:d.data,checked_in:d.checked_in,account_credits:d.account_credits,work_credits:d.work_credits,total_credits:d.total_credits,success:d.success,error:d.success?'':apiError(d,result.status)}};
+    var account={{id:id,data:d.data,checked_in:d.checked_in,account_credits:d.account_credits,success:d.success,error:d.success?'':apiError(d,result.status)}};
     updateAccountRow(account);
     if(!result.ok||!d||!d.success){{ showMsg('checkin-msg','账号 '+id+' 签到失败：'+apiError(d,result.status),false,12000); return; }}
     account.checked_in=true;
@@ -1570,7 +1845,8 @@ async function checkinClaimAll(){{
   }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
   finally{{ setBusy(false); }}
 }}
-document.getElementById('manual-form').addEventListener('submit',async function(e){{
+var manualForm=document.getElementById('manual-form');
+if(manualForm) manualForm.addEventListener('submit',async function(e){{
   e.preventDefault();var fd=new FormData(e.target);
   var payload={{}};
   for(var[k,v]of fd.entries())if(v)payload[k]=v;
@@ -1590,10 +1866,10 @@ def _oauth_result_html(success: bool, message: str, login_trace_id: str = "") ->
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>Trae 授权</title>
 <style>
-body {{ font:16px -apple-system,sans-serif;background:#0f1117;color:#e8eaed;padding:40px; }}
-.msg {{ padding:20px;border-radius:8px;margin-bottom:16px; }}
-.ok {{ background:#1f6c3a; }}
-.err {{ background:#6c1f1f; }}
+body {{ font:16px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#eef0f4;color:#1d2331;padding:40px; }}
+.msg {{ padding:20px;border-radius:10px;margin-bottom:16px;border:1px solid; }}
+.ok {{ background:#e2f3eb;color:#0a7451;border-color:#bfe3d3; }}
+.err {{ background:#fdecec;color:#dc2626;border-color:#f3c6c6; }}
 </style>
 </head>
 <body>
@@ -1717,6 +1993,25 @@ async def _deferred_dispatch_stream(
     # response and close the HTTP stream before asking for the next frame. The
     # old ordering created the upstream task *after* that first yield, so the
     # request could be cancelled without ever reaching Trae.
+    options = dict(options or {})
+    requested_mode = str(
+        options.get("_upstream_mode") or _current_upstream_mode()
+    ).strip().lower()
+    fallback_allowed = (
+        not bool(options.get("_disable_upstream_fallback"))
+        and requested_mode
+        in {
+            "raw",
+            "direct",
+            "auto",
+            "ide",
+            "work-agent",
+            "traework-native",
+            "native",
+            "traework",
+        }
+    )
+    fallback_attempted = False
     task = asyncio.create_task(_dispatch_chat(messages, model, True, options))
     # Give the task one event-loop turn to enter the selected upstream path
     # (and, for raw/remote transports, begin opening the provider request).
@@ -1726,9 +2021,110 @@ async def _deferred_dispatch_stream(
     request_id = str((options or {}).get("_relay_request_id") or "")
     started_at = time.monotonic()
     upstream_chunks = 0
+    upstream_payload_chunks = 0
     saw_done = False
     stream_status = "opening"
     sent_start_event = False
+
+    async def close_current() -> None:
+        """Close the currently selected response/iterator before a retry."""
+
+        nonlocal iterator, response
+        if iterator is not None:
+            close_iterator = getattr(iterator, "aclose", None)
+            if close_iterator is not None:
+                try:
+                    await close_iterator()
+                except Exception:
+                    pass
+            iterator = None
+        close_response = getattr(response, "close", None)
+        if close_response is not None:
+            try:
+                close_response()
+            except Exception:
+                pass
+        response = None
+
+    async def try_remote_fallback(reason: str):
+        """Open one Remote stream after a native path fails before output."""
+
+        nonlocal fallback_attempted
+        if not fallback_allowed or fallback_attempted:
+            return None
+        fallback_attempted = True
+        fallback_options = _remote_fallback_options(options, requested_mode)
+        logger.warning(
+            "stream endpoint failed before output; falling back to remote "
+            "id=%s requested_mode=%s reason=%s",
+            request_id,
+            requested_mode,
+            reason,
+        )
+        try:
+            fallback = await _dispatch_chat(
+                messages, model, True, fallback_options
+            )
+        except Exception as exc:
+            logger.warning(
+                "stream remote fallback failed id=%s requested_mode=%s error=%s",
+                request_id,
+                requested_mode,
+                exc,
+            )
+            return None
+        if _upstream_response_error(fallback):
+            logger.warning(
+                "stream remote fallback returned error id=%s requested_mode=%s detail=%s",
+                request_id,
+                requested_mode,
+                _upstream_response_error(fallback),
+            )
+            close = getattr(fallback, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
+            return None
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                actual_mode="remote",
+                actual_endpoint="remote",
+                fallback_used=True,
+            )
+        return fallback
+
+    async def forward_response(current_response):
+        """Forward one StreamingResponse and propagate pre-output failures."""
+
+        nonlocal iterator, upstream_chunks, upstream_payload_chunks
+        nonlocal saw_done, stream_status, sent_start_event
+        iterator = getattr(current_response, "body_iterator", None)
+        if iterator is None:
+            body = getattr(current_response, "body", b"")
+            if body:
+                yield body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+            return
+        async for chunk in iterator:
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="replace")
+            if chunk:
+                upstream_chunks += 1
+                if any(
+                    line.lstrip().startswith("data:")
+                    for line in chunk.splitlines()
+                ):
+                    upstream_payload_chunks += 1
+                if "data: [DONE]" in chunk:
+                    saw_done = True
+                    stream_status = "completed"
+                if not sent_start_event and chunk.lstrip().startswith(":"):
+                    yield _stream_start_event(model)
+                    sent_start_event = True
+                yield chunk
+
     try:
         # The task may still be establishing the Trae request.  Emit one real
         # data frame before comment heartbeats so zcode/OpenCode does not treat
@@ -1750,33 +2146,37 @@ async def _deferred_dispatch_stream(
                 yield ": relay-keepalive\n\n"
 
         if getattr(response, "status_code", 200) >= 400:
-            stream_status = "upstream_error"
-            yield _stream_error_event(response)
-            yield "data: [DONE]\n\n"
-            saw_done = True
-            return
+            fallback = await try_remote_fallback(
+                _upstream_response_error(response) or "http error"
+            )
+            if fallback is None:
+                stream_status = "upstream_error"
+                yield _stream_error_event(response)
+                yield "data: [DONE]\n\n"
+                saw_done = True
+                return
+            await close_current()
+            response = fallback
 
-        iterator = getattr(response, "body_iterator", None)
-        if iterator is None:
-            body = getattr(response, "body", b"")
-            if body:
-                yield body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-            return
-        async for chunk in iterator:
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode("utf-8", errors="replace")
-            if chunk:
-                upstream_chunks += 1
-                if "data: [DONE]" in chunk:
-                    saw_done = True
-                    stream_status = "completed"
-                # When headers arrived quickly but the model has not produced
-                # its first data frame, the raw translator emits a comment
-                # heartbeat. Put one parseable OpenAI start event before that
-                # first comment so zcode does not classify the stream as empty.
-                if not sent_start_event and chunk.lstrip().startswith(":"):
-                    yield _stream_start_event(model)
-                    sent_start_event = True
+        try:
+            async for chunk in forward_response(response):
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as exc:
+            # A StreamingResponse can be returned with HTTP 200 and fail only
+            # when its body iterator starts (empty native SSE, invalid headers,
+            # or a provider disconnect).  Retry Remote only before any native
+            # payload has reached the caller; once partial output is visible we
+            # preserve that stream and surface the original failure.
+            if upstream_payload_chunks or fallback_attempted:
+                raise
+            await close_current()
+            fallback = await try_remote_fallback(str(exc))
+            if fallback is None:
+                raise
+            response = fallback
+            async for chunk in forward_response(response):
                 yield chunk
         stream_status = "completed"
     except asyncio.CancelledError:
@@ -1816,19 +2216,7 @@ async def _deferred_dispatch_stream(
         yield "data: [DONE]\n\n"
         saw_done = True
     finally:
-        if iterator is not None:
-            close_iterator = getattr(iterator, "aclose", None)
-            if close_iterator is not None:
-                try:
-                    await close_iterator()
-                except Exception:
-                    pass
-        close_response = getattr(response, "close", None)
-        if close_response is not None:
-            try:
-                close_response()
-            except Exception:
-                pass
+        await close_current()
         logger.info(
             "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
             request_id,
@@ -1843,17 +2231,30 @@ def _tool_translation_options(
     options: Optional[dict], messages: Optional[list[dict]] = None
 ) -> dict:
     options = options or {}
+    has_explicit_catalog = "tools" in options or "_inherited_tools" in options
     tool_catalog = (
         options["tools"]
         if "tools" in options
         else options.get("_inherited_tools", [])
     )
+    # TraeWork's custom-model adapter owns the local toolhost and its raw
+    # six-field request normally has no OpenAI ``tools`` array.  Passing an
+    # empty list to the OpenAI translator means "suppress every tool call";
+    # for this ingress that would turn a valid model tool request into plain
+    # text and the desktop client could never execute it.  ``None`` preserves
+    # the caller-owned protocol and lets the custom SSE adapter forward calls
+    # parsed from native fields or the XML marker in the model response.
+    if options.get("_traework_custom_model") and not has_explicit_catalog:
+        tool_catalog = None
     return {
         # API callers execute tools. With no tools field, suppress any internal
         # Trae tool event instead of exposing a call the client cannot handle.
         "allowed_tools": tool_catalog,
         "tool_choice": options.get("tool_choice"),
         "parallel_tool_calls": options.get("parallel_tool_calls"),
+        # Keep reasoning presentation separate from the raw upstream request.
+        # ``thinking`` is intentionally consumed only by the translators.
+        "include_reasoning": responses_api.thinking_requested(options),
         # Protect the continuation turn from an upstream model that echoes an
         # already completed call with a fresh id. A new user message after the
         # result clears this set in cli_client.completed_tool_signatures().
@@ -1872,16 +2273,36 @@ def _tool_protocol_requested(
     ):
         return True
     return any(
-        isinstance(message, dict)
-        and (
-            message.get("role") == "tool"
-            or (
-                message.get("role") == "assistant"
-                and isinstance(message.get("tool_calls"), list)
-                and bool(message["tool_calls"])
-            )
-        )
+        isinstance(message, dict) and _message_contains_tool_protocol(message)
         for message in (messages or [])
+    )
+
+
+def _message_contains_tool_protocol(message: Mapping[str, Any]) -> bool:
+    """Detect OpenAI and TraeWork renderer tool messages in request history.
+
+    TraeWork does not always use an OpenAI ``role=tool`` message. Its renderer
+    serializes calls/results as ``tool_use``/``tool_result`` content blocks,
+    with results commonly carried by a ``role=user`` message. Those turns
+    still require the tool-aware runtime prompt and the raw-safe route.
+    """
+
+    role = str(message.get("role") or "").strip().lower()
+    if role in {"tool", "function"}:
+        return True
+    if role == "assistant" and (
+        (isinstance(message.get("tool_calls"), list) and bool(message["tool_calls"]))
+        or isinstance(message.get("function_call"), Mapping)
+    ):
+        return True
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, Mapping)
+        and str(block.get("type") or "").strip().lower()
+        in {"tool_use", "tool_call", "function_call", "tool_result"}
+        for block in content
     )
 
 
@@ -2171,7 +2592,7 @@ def _bind_chat_session(
 
         lease = _UPSTREAM_SESSION_LEASES.get(session_id)
         if lease is None:
-            if rotate_for_new and UPSTREAM_MODE in (
+            if rotate_for_new and _current_upstream_mode() in (
                 "raw",
                 "direct",
                 "web",
@@ -2226,13 +2647,13 @@ def _bind_chat_session(
     bound["session_id"] = session_id
     if lease.account_id:
         bound["_account_id"] = lease.account_id
-        if UPSTREAM_MODE in ("raw", "direct", "auto"):
+        if _current_upstream_mode() in ("raw", "direct", "auto"):
             bound["_auth_user_id"] = lease.billing_id or lease.account_id
     if lease.billing_id:
         bound["_billing_id"] = lease.billing_id
     if lease.auth_token:
         bound["_auth_token"] = lease.auth_token
-    if UPSTREAM_MODE != "cli":
+    if _current_upstream_mode() != "cli":
         # Keep account metadata pinned with the credential. The global auth
         # state may switch before the remote request has built its headers.
         # An explicit empty mapping prevents fallback to another account's
@@ -2750,9 +3171,9 @@ class _UsageTracker:
         elif values.get("credits_consumed") is not None:
             self.usage["credits_consumed"] = values["credits_consumed"]
 
-    def bind_usage_turn(self, usage_turn_id: Any) -> None:
+    def bind_usage_turn(self, usage_turn_id: Any, *, replace: bool = False) -> None:
         value = str(usage_turn_id or "").strip()
-        if value and not self.usage_turn_id:
+        if value and (replace or not self.usage_turn_id):
             self.usage_turn_id = value
 
     async def rebind(self, options: Optional[Mapping[str, Any]] = None) -> None:
@@ -2877,36 +3298,73 @@ def _track_usage_from_result(result: dict, model: str) -> None:
 
 
 def _track_usage_from_chunk(chunk: str, model: str) -> None:
-    """Pass SSE usage to the request tracker without duplicating rows."""
-    if not chunk.startswith("data: "):
+    """Pass OpenAI and TraeWork SSE usage to the request tracker.
+
+    Ordinary relay streams put usage on a ``data:`` JSON frame. The TraeWork
+    custom-model adapter wraps the same payload as ``event: token_usage``.
+    Parse complete SSE blocks instead of requiring a chunk to start with
+    ``data:``; an ASGI chunk may contain several events.
+    """
+    if isinstance(chunk, (bytes, bytearray)):
+        text = bytes(chunk).decode("utf-8", errors="replace")
+    else:
+        text = str(chunk or "")
+    if not text:
         return
-    try:
-        data = json.loads(chunk[len("data: "):].strip())
-    except Exception:
-        return
-    usage = data.get("usage")
-    if not usage:
-        return
+
     tracker = _USAGE_TRACKER.get()
-    if tracker is not None:
-        tracker.update(usage)
-        return
-    values = _usage_values(usage)
-    account_id, _ = _request_account_identity()
-    _record_usage(
-        account_id,
-        model,
-        values["prompt_tokens"],
-        values["completion_tokens"],
-        credits_consumed=values.get("credits_consumed"),
-        credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
-    )
+    normalized = text.replace("\r\n", "\n")
+    for block in normalized.split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = ""
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            stripped = line.strip()
+            if stripped.lower().startswith("event:"):
+                event_name = stripped.split(":", 1)[1].strip().lower()
+            elif stripped.lower().startswith("data:"):
+                data_lines.append(stripped.split(":", 1)[1].lstrip())
+        if not data_lines:
+            continue
+        payload_text = "\n".join(data_lines).strip()
+        if payload_text == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload_text)
+        except Exception:
+            continue
+        if not isinstance(data, Mapping):
+            continue
+        usage = data.get("usage")
+        if not usage and event_name == "token_usage":
+            usage = data
+        if not isinstance(usage, Mapping):
+            continue
+        if tracker is not None:
+            update = getattr(tracker, "update", None)
+            if callable(update):
+                update(usage)
+            # Test/dummy trackers may only expose ``saw_usage``; they already
+            # own their terminal bookkeeping and should not create a second
+            # fallback usage row here.
+            continue
+        values = _usage_values(usage)
+        account_id, _ = _request_account_identity()
+        _record_usage(
+            account_id,
+            model,
+            values["prompt_tokens"],
+            values["completion_tokens"],
+            credits_consumed=values.get("credits_consumed"),
+            credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
+        )
 
 
-def _bind_usage_turn(usage_turn_id: Any) -> None:
+def _bind_usage_turn(usage_turn_id: Any, *, replace: bool = False) -> None:
     tracker = _USAGE_TRACKER.get()
     if tracker is not None:
-        tracker.bind_usage_turn(usage_turn_id)
+        tracker.bind_usage_turn(usage_turn_id, replace=replace)
 
 
 def _bind_usage_turn_from_metadata(metadata: Any) -> None:
@@ -3069,13 +3527,15 @@ def _requires_remote_model(model: str) -> bool:
     return bool(candidates & configured)
 
 
-def _chunk_marks_terminal(chunk: Any) -> bool:
-    """Whether an SSE chunk proves the response reached its end.
+def _chunk_stream_state(chunk: Any) -> str | None:
+    """Return the public stream state proven by one SSE chunk.
 
-    Chat Completions ends with ``data: [DONE]``; the Responses translation
-    ends with a ``response.completed``/``response.incomplete`` event.  Both
-    mean the upstream finished and billed the turn even if the API client
-    disconnects a moment later.
+    Clients commonly close immediately after the final Chat Completions
+    frame (the one carrying ``finish_reason``), before they consume the
+    protocol ``[DONE]`` sentinel.  Treating that normal close as a cancelled
+    turn makes already-billed streaming requests look unpaid in the console.
+    Parse both OpenAI data frames and Responses event names here so usage
+    tracking has one protocol-aware terminal check.
     """
     if isinstance(chunk, (bytes, bytearray)):
         try:
@@ -3086,28 +3546,116 @@ def _chunk_marks_terminal(chunk: Any) -> bool:
         text = chunk
     else:
         text = str(chunk)
-    return (
-        "data: [DONE]" in text
-        or "event: response.completed" in text
-        or "event: response.incomplete" in text
-    )
+    normalized = text.replace("\r\n", "\n")
+    # Parse one SSE block at a time so a custom ``event: output`` line stays
+    # associated with its data payload. This also handles a proxy coalescing
+    # ``token_usage`` and ``done`` events in one chunk.
+    for block in normalized.split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = ""
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            stripped = line.strip()
+            if stripped.lower().startswith("event:"):
+                event_name = stripped.split(":", 1)[1].strip().lower()
+            elif stripped.lower().startswith("data:"):
+                data_lines.append(stripped.split(":", 1)[1].lstrip())
+        if event_name in {"response.failed", "error"}:
+            return "error"
+        if event_name in {"response.completed", "response.incomplete"}:
+            return "completed"
+        if not data_lines:
+            if event_name == "done":
+                return "completed"
+            continue
+        payload = "\n".join(data_lines).strip()
+        if payload == "[DONE]":
+            return "completed"
+        try:
+            value = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(value, Mapping):
+            if event_name == "done":
+                return "completed"
+            continue
+        value_type = str(value.get("type") or "").strip().lower()
+        if value_type in {"response.failed", "error"}:
+            return "error"
+        if value_type in {"response.completed", "response.incomplete"}:
+            return "completed"
+        if isinstance(value.get("error"), Mapping):
+            return "error"
+        if event_name == "done":
+            status = str(value.get("status") or "").strip().lower()
+            if status in {"error", "failed", "cancelled", "canceled"}:
+                return "error"
+            return "completed"
+        # TraeWork's output event carries the terminal finish reason in its
+        # own payload. A client may close immediately after consuming this
+        # frame, before the adapter's later ``event: done`` sentinel arrives.
+        if event_name == "output" and value.get("finish_reason") not in (None, ""):
+            return "completed"
+        # The public translators put finish_reason inside ``choices`` only on
+        # the final OpenAI frame. Upstream cumulative snapshots are consumed
+        # before translation, so this is safe to use when a client disconnects
+        # just before the following [DONE].
+        choices = value.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                if choice.get("finish_reason") in (None, ""):
+                    continue
+                # A terminal translated frame has an empty delta. Do not
+                # classify a cumulative frame that carries both text/tool data
+                # and a provisional finish_reason as complete.
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping) and not any(
+                    item not in (None, "", [], {}) for item in delta.values()
+                ):
+                    return "completed"
+    return None
+
+
+def _chunk_marks_terminal(chunk: Any) -> bool:
+    """Whether an SSE chunk proves the response reached its end."""
+    return _chunk_stream_state(chunk) is not None
 
 
 async def _tracked_stream(source, tracker: _UsageTracker):
     context_token = _USAGE_TRACKER.set(tracker)
-    status = "completed"
+    status = "cancelled"
     saw_terminal = False
+    terminal_status: str | None = None
     try:
         await tracker.begin()
         async for chunk in source:
-            if not saw_terminal and _chunk_marks_terminal(chunk):
+            # TraeWork custom streams expose usage as ``event: token_usage``;
+            # feed every frame through the shared parser so streaming and
+            # non-stream requests settle the same usage record.
+            _track_usage_from_chunk(chunk, getattr(tracker, "model", ""))
+            chunk_status = _chunk_stream_state(chunk)
+            if chunk_status is not None:
                 saw_terminal = True
+                # Keep an error terminal state sticky if a cleanup sentinel is
+                # emitted after it.
+                if chunk_status == "error" or terminal_status is None:
+                    terminal_status = chunk_status
             yield chunk
+        usage_seen = bool(getattr(tracker, "saw_usage", False))
+        status = terminal_status or ("completed" if usage_seen else "cancelled")
     except asyncio.CancelledError:
-        status = "completed" if saw_terminal else "cancelled"
+        # A final usage frame is emitted immediately before [DONE] by the
+        # OpenAI translators.  Some clients close after consuming that frame
+        # but before reading [DONE]; preserve the billable turn as completed.
+        usage_seen = bool(getattr(tracker, "saw_usage", False))
+        status = terminal_status or ("completed" if saw_terminal or usage_seen else "cancelled")
         raise
     except GeneratorExit:
-        status = "completed" if saw_terminal else "cancelled"
+        usage_seen = bool(getattr(tracker, "saw_usage", False))
+        status = terminal_status or ("completed" if saw_terminal or usage_seen else "cancelled")
         raise
     except Exception:
         status = "error"
@@ -3310,6 +3858,12 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
     remote_options = dict(options)
+    # Caller-owned tools must run in the API client's workspace.  Agent owns a
+    # separate remote workspace and can consume file/shell work internally,
+    # then return only a success sentence; Work keeps the advertised tools as
+    # calls for Codex/the API client to execute.  Plain text requests remain
+    # Agent-first (including the 1M/max profile), and operators can explicitly
+    # opt tool requests back into Agent with ``...USE_WORK=0`` for diagnostics.
     caller_tools_use_work = (
         os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "1").strip().lower()
         in {"1", "true", "yes", "on"}
@@ -3658,7 +4212,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                     options=retry_options,
                                 )
                             )
-                            _bind_usage_turn(retry_message_id)
+                            # The first Agent attempt ended before any model
+                            # event. Credit enrichment must follow the Work (or
+                            # rotated-account) attempt that actually completed.
+                            _bind_usage_turn(retry_message_id, replace=True)
                             retry_event_iter = trae_remote_client.stream_events(
                                 retry_client,
                                 retry_token,
@@ -3767,7 +4324,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 prepared_messages,
                 options=remote_options,
             )
-            _bind_usage_turn(message_id)
+            # Replace the empty Agent attempt's message id with the Work turn
+            # that produced the response and incurred the final charge.
+            _bind_usage_turn(message_id, replace=True)
             fallback_events = trae_remote_client.stream_events(
                 client,
                 token,
@@ -3790,6 +4349,22 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         raise
 
 
+def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
+    """Explain why a requested thinking strength was not applied."""
+
+    if not effort or trace.get("reasoning_effort_applied"):
+        return None
+    mode = str(trace.get("actual_mode") or trace.get("actual_endpoint") or "")
+    if mode == "ide":
+        # llm_utils_chat is the IDE utility route (titles/prompt tools); the
+        # real IDE sends strength only via the ai-agent task, so the field is
+        # ignored here.
+        return "llm_utils_chat 端点不接受强度字段"
+    if mode == "raw":
+        return "raw 端点需要企业 PAT"
+    return "该模型未声明 reasoning_effort_config"
+
+
 async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = None):
     """trae2api 风格 IDE chat，流式响应消费完成后关闭 response 和 client。"""
     ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
@@ -3803,6 +4378,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                     response,
                     model,
                     FORWARD_USAGE,
+                    fail_on_empty=True,
                     upstream_metadata=upstream_metadata,
                     **translation_options,
                 ):
@@ -3821,6 +4397,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
         result = await collect_nonstream_ide(
             response,
             model,
+            fail_on_empty=True,
             upstream_metadata=upstream_metadata,
             **translation_options,
         )
@@ -3857,6 +4434,7 @@ async def run_traework_native_chat(
                     native_resp.response,
                     model,
                     FORWARD_USAGE,
+                    fail_on_empty=True,
                     upstream_metadata=upstream_metadata,
                     **translation_options,
                 ):
@@ -3876,6 +4454,7 @@ async def run_traework_native_chat(
         result = await collect_nonstream_ide(
             native_resp.response,
             model,
+            fail_on_empty=True,
             upstream_metadata=upstream_metadata,
             **translation_options,
         )
@@ -4261,11 +4840,27 @@ async def _run_remote_with_retry(
                 continue
             except RuntimeError as exc:
                 message = str(exc)
-                if "parallel" not in message.lower() and "429" not in message:
+                lowered = message.lower()
+                unavailable = (
+                    "remote model is not available for the bound account" in lowered
+                    or "model binding mismatch" in lowered
+                )
+                if unavailable:
+                    # Model entitlements differ per account. A bound account
+                    # missing the requested model is not a request failure;
+                    # rotate to the next polling account that can serve it.
+                    reason = "model unavailable on bound account"
+                elif "parallel" in lowered or "429" in lowered:
+                    reason = "parallel limit"
+                else:
                     raise
                 if attempt_index + 1 >= attempts:
+                    if unavailable:
+                        raise
                     break
-                if not await rotate_remote_account("parallel limit"):
+                if not await rotate_remote_account(reason):
+                    if unavailable:
+                        raise
                     break
                 continue
         raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
@@ -4411,6 +5006,54 @@ def _record_usage(
     return record
 
 
+def _upstream_response_error(response: Any) -> str:
+    """Return a concise error for an upstream response, or ``""``.
+
+    Adapters normally raise on non-2xx responses, but a few native bridges
+    return a JSON error response instead.  Treat both forms uniformly so the
+    dispatcher can continue to the configured Remote fallback.
+    """
+
+    status = int(getattr(response, "status_code", 200) or 200)
+    if status < 400:
+        return ""
+    payload = _response_json_payload(response)
+    error = payload.get("error") if isinstance(payload, Mapping) else None
+    if isinstance(error, Mapping):
+        message = str(error.get("message") or "").strip()
+    else:
+        message = str(error or "").strip()
+    return f"HTTP {status}: {message or 'upstream returned an error'}"
+
+
+def _remote_fallback_options(
+    options: Optional[Mapping[str, Any]], requested_mode: str
+) -> dict[str, Any]:
+    """Build options for a native-endpoint -> Remote fallback attempt."""
+
+    fallback = dict(options or {})
+    fallback["_upstream_mode"] = "remote"
+    fallback["_upstream_fallback_from"] = requested_mode
+    fallback_agent_type = (
+        "solo_work_remote"
+        if requested_mode in {
+            "work-agent",
+            "traework-native",
+            "native",
+            "traework",
+        }
+        else "solo_agent_remote"
+    )
+    if not (
+        fallback.get("_remote_agent_type")
+        or fallback.get("remote_agent_type")
+    ):
+        fallback["_remote_agent_type"] = fallback_agent_type
+    fallback.setdefault("_session_variant", f"{requested_mode}-fallback")
+    fallback.pop("_upstream_trace", None)
+    return fallback
+
+
 def _update_usage_record(request_id: str, **updates: Any) -> None:
     if not request_id:
         return
@@ -4429,8 +5072,48 @@ def _update_usage_record(request_id: str, **updates: Any) -> None:
             return
 
 
+# Raw v2 answers ``2001 failed to get app config: record not found`` when the
+# account has no enterprise app config.  That is deterministic, so remember it
+# briefly and route straight to the next candidate instead of paying the
+# round-trip on every request.
+_RAW_APP_CONFIG_MISSING: dict[str, float] = {}
+_RAW_APP_CONFIG_TTL_SECONDS = 600.0
+
+
+def _raw_app_config_missing_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "app config" in text and "record not found" in text
+
+
+def _raw_app_config_key(model: Any, options: Mapping) -> str:
+    return f"{options.get('_account_id') or 'default'}|{str(model or '').lower()}"
+
+
+def _raw_app_config_known_missing(model: Any, options: Mapping) -> bool:
+    if not options.get("_account_id"):
+        return False
+    key = _raw_app_config_key(model, options)
+    expires = _RAW_APP_CONFIG_MISSING.get(key)
+    if not expires:
+        return False
+    if expires < time.monotonic():
+        _RAW_APP_CONFIG_MISSING.pop(key, None)
+        return False
+    return True
+
+
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
     options = options or {}
+    active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
+    trace = options.get("_upstream_trace")
+    if isinstance(trace, dict):
+        trace.update(
+            requested_mode=active_mode,
+            requested_endpoint=active_mode,
+            actual_mode="",
+            actual_endpoint="",
+            fallback_used=False,
+        )
     logger.info(
         "dispatch start model=%s stream=%s messages=%d last_role=%s last_chars=%d "
         "tools=%s session=%s",
@@ -4452,6 +5135,38 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     if not trae_client.is_model_supported(model):
         return _openai_error(400, f"Unsupported model: {model}", "invalid_request_error", "model")
 
+    # TraeWork's custom-model adapter is a separate ingress contract while the
+    # actual file/shell tools remain owned by the Windows client. The official
+    # raw endpoint currently returns a business authentication error for these
+    # account credentials, so the verified remote transport is the default.
+    # Keep raw/direct as explicit diagnostics instead of advertising a fallback
+    # that cannot catch errors raised later by a StreamingResponse iterator.
+    if options.get("_traework_custom_model"):
+        custom_mode = str(
+            options.get("_traework_upstream_mode")
+            or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
+        ).strip().lower()
+        if custom_mode in {"raw", "direct", "auto"}:
+            logger.info(
+                "dispatch TraeWork custom-model ingress id=%s mode=raw model=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+            )
+            return await run_raw_chat(messages, model, stream, options)
+        if custom_mode in {"remote", "web"}:
+            logger.info(
+                "dispatch TraeWork custom-model ingress id=%s mode=%s model=%s",
+                str(options.get("_relay_request_id") or ""),
+                custom_mode,
+                model,
+            )
+            if custom_mode == "web":
+                return await _run_web_with_retry(messages, model, stream, options)
+            return await _run_remote_with_retry(messages, model, stream, options)
+        raise RuntimeError(
+            "Unsupported TRAEWORK_CUSTOM_UPSTREAM_MODE: " + custom_mode
+        )
+
     # External tools always execute on the API caller.  Web/IDE agent routes
     # may execute their own tools on the relay host, so they are never valid
     # fallbacks for a request that advertises caller-owned tools.
@@ -4464,13 +5179,13 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         logger.info(
             "dispatch tool protocol id=%s mode=%s model=%s",
             str(options.get("_relay_request_id") or ""),
-            UPSTREAM_MODE,
+            active_mode,
             model,
         )
 
     # Raw v2 is the default for every model. Operators can opt specific models
     # (or ``*``) into the account-bound remote executor for diagnostics.
-    if _requires_remote_model(model) and UPSTREAM_MODE in (
+    if not options.get("_disable_upstream_fallback") and _requires_remote_model(model) and active_mode in (
         "raw",
         "direct",
         "auto",
@@ -4483,6 +5198,12 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             str(options.get("_account_id") or "default"),
         )
         try:
+            if isinstance(trace, dict):
+                trace.update(
+                    actual_mode="remote",
+                    actual_endpoint="remote",
+                    fallback_used=True,
+                )
             return await _run_remote_with_retry(messages, model, stream, options)
         except ModelProviderMismatch as exc:
             logger.error(
@@ -4498,56 +5219,263 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     # diagnostics, but they are never silent fallbacks for API traffic.
     errors = []
     modes = []
-    if UPSTREAM_MODE == "cli":
+    if active_mode == "cli":
         modes = ["cli"]
-    elif UPSTREAM_MODE in ("raw", "direct"):
+    elif active_mode in ("raw", "direct"):
         modes = ["raw"]
-    elif UPSTREAM_MODE in ("remote", "9router", "trae-remote"):
+    elif active_mode in ("remote", "9router", "trae-remote"):
         modes = ["remote"]
-    elif UPSTREAM_MODE == "web":
+    elif active_mode == "web":
         modes = ["web"]
-    elif UPSTREAM_MODE == "ide":
+    elif active_mode == "ide":
         modes = ["ide"]
-    elif UPSTREAM_MODE in ("traework-native", "native", "traework"):
+    elif active_mode == "work-agent":
+        modes = ["work-agent"]
+    elif active_mode in ("traework-native", "native", "traework"):
         modes = ["traework-native"]
     else:
         modes = ["raw"]
 
+    # Native IDE/Work/Raw paths are useful diagnostics, but the current CN
+    # gateway does not expose all three paths for every account.  Keep the
+    # selected path first and automatically try the verified Remote transport
+    # for both plain and caller-owned-tool requests.  The old implementation
+    # excluded tool requests here, which turned a transient native rejection
+    # into a guaranteed 502 for Codex clients.
+    fallback_enabled = not bool(options.get("_disable_upstream_fallback"))
+    fallback_modes = {
+        "raw",
+        "direct",
+        "auto",
+        "ide",
+        "work-agent",
+        "traework-native",
+        "native",
+        "traework",
+    }
+    if fallback_enabled and active_mode in ("raw", "direct"):
+        modes.append("ide")
+    if fallback_enabled and active_mode in fallback_modes and "remote" not in modes:
+        modes.append("remote")
+    if (
+        fallback_enabled
+        and modes[:1] == ["raw"]
+        and len(modes) > 1
+        and _raw_app_config_known_missing(model, options)
+    ):
+        errors.append("raw: skipped (app config record not found, cached)")
+        modes = modes[1:]
+
     logger.info(
         "dispatch route id=%s mode=%s candidates=%s tool_protocol=%s",
         str(options.get("_relay_request_id") or ""),
-        UPSTREAM_MODE,
+        active_mode,
         ",".join(modes),
         tool_protocol_requested,
     )
 
     for mode in modes:
         try:
-            if mode == "raw":
-                return await run_raw_chat(messages, model, stream, options)
+            if isinstance(trace, dict):
+                trace.update(
+                    actual_mode=mode,
+                    actual_endpoint=mode,
+                    fallback_used=mode != modes[0],
+                )
             mode_options = dict(options)
+            if mode == "raw":
+                result = await run_raw_chat(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"raw returned {error}")
+                return result
             # Web and remote routes must receive the lease-bound credential;
             # otherwise a concurrent account switch can make the upstream bill
             # one token while the usage tracker records another.
-            if mode not in ("remote", "web", "ide", "traework-native"):
+            if mode not in ("remote", "web", "ide", "work-agent", "traework-native"):
                 mode_options.pop("_auth_token", None)
                 mode_options.pop("_account_id", None)
             if mode == "cli":
-                return await run_cli_chat(messages, model, stream, mode_options)
+                result = await run_cli_chat(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"cli returned {error}")
+                return result
             if mode == "web":
-                return await _run_web_with_retry(messages, model, stream, mode_options)
+                result = await _run_web_with_retry(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"web returned {error}")
+                return result
             if mode == "remote":
-                return await _run_remote_with_retry(messages, model, stream, mode_options)
-            if mode == "traework-native":
-                return await run_traework_native_chat(
+                if modes[0] != "remote":
+                    mode_options = _remote_fallback_options(
+                        mode_options, active_mode
+                    )
+                result = await _run_remote_with_retry(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"remote returned {error}")
+                return result
+            if mode == "work-agent":
+                mode_options["_trae_mode"] = "work"
+                mode_options["_remote_agent_type"] = "solo_work_remote"
+                mode_options.setdefault("_session_variant", "work-agent")
+                if isinstance(trace, dict):
+                    trace.update(actual_endpoint="remote-work")
+                result = await _run_remote_with_retry(
                     messages, model, stream, mode_options
                 )
-            return await run_ide_chat(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"work-agent returned {error}")
+                return result
+            if mode == "traework-native":
+                result = await run_traework_native_chat(
+                    messages, model, stream, mode_options
+                )
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"traework-native returned {error}")
+                return result
+            if mode == "ide":
+                mode_options["_ide_endpoint"] = "/api/agent/v3/llm_utils_chat"
+            result = await run_ide_chat(messages, model, stream, mode_options)
+            if getattr(result, "status_code", 200) >= 400:
+                payload = _response_json_payload(result)
+                detail = payload.get("error") if isinstance(payload, Mapping) else None
+                detail = (
+                    detail.get("message")
+                    if isinstance(detail, Mapping)
+                    else str(detail or "upstream returned an error")
+                )
+                raise RuntimeError(
+                    f"{mode} returned HTTP {getattr(result, 'status_code', 0)}: {detail}"
+                )
+            return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
             errors.append(f"{mode}: {e}")
+            if (
+                mode == "raw"
+                and options.get("_account_id")
+                and _raw_app_config_missing_error(e)
+            ):
+                _RAW_APP_CONFIG_MISSING[_raw_app_config_key(model, options)] = (
+                    time.monotonic() + _RAW_APP_CONFIG_TTL_SECONDS
+                )
 
     return _openai_error(502, "All upstream paths failed: " + "; ".join(errors), "api_error")
+
+
+def _response_json_payload(response: Any) -> dict[str, Any]:
+    """Decode a Starlette JSON response without assuming a concrete class."""
+
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    if isinstance(body, str):
+        try:
+            value = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+    return dict(body) if isinstance(body, Mapping) else {}
+
+
+async def _handle_traework_custom(
+    req: Request,
+    body: Optional[Mapping[str, Any]] = None,
+    *,
+    request_id: str = "",
+):
+    """Serve TraeWork's custom-model/raw ingress and preserve client tools.
+
+    The desktop client owns the toolhost. This endpoint only converts its raw
+    request into the existing relay dispatch and converts the OpenAI-shaped
+    result back to TraeWork's cumulative ``event: output`` stream. No tool is
+    executed in the relay container.
+    """
+
+    request_id = request_id or ("req-" + uuid_mod.uuid4().hex)
+    if body is None:
+        try:
+            body, _ = await _read_json_body(
+                req, endpoint="traework-custom", trace_id=request_id
+            )
+        except _RequestBodyError as exc:
+            return _openai_error(400, str(exc), "invalid_request_error")
+    try:
+        descriptor = traework_compat.normalize_inbound_request(
+            body,
+            headers=dict(req.headers),
+            path=req.url.path,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _openai_error(400, str(exc), "invalid_request_error")
+
+    messages = cli_client.sanitize_assistant_history_messages(
+        _normalize_chat_messages(descriptor.messages)
+    )
+    options = dict(descriptor.options)
+    options = _apply_tool_header_hints(req, options)
+    options = _with_auto_client_context(req, body, messages, options)
+    options = _bind_chat_session(
+        messages,
+        options,
+        requested_session_id=descriptor.session_id,
+    )
+    # These values are deliberately set after session binding. The lease owns
+    # the account/JWT; the custom model's Bearer key must never replace it.
+    options["_traework_custom_model"] = True
+    options["_relay_request_id"] = request_id
+    tracker = _UsageTracker(descriptor.model, req.url.path, descriptor.stream, options)
+    tracker.request_id = request_id
+    logger.info(
+        "traework custom ingress id=%s path=%s model=%s stream=%s messages=%d tools=%s session=%s",
+        request_id,
+        req.url.path,
+        descriptor.model,
+        descriptor.stream,
+        len(messages),
+        _tool_protocol_requested(options, messages),
+        descriptor.session_id[:32],
+    )
+
+    if descriptor.stream:
+        async def openai_source():
+            async for chunk in _deferred_dispatch_stream(
+                messages, descriptor.model, options
+            ):
+                yield chunk
+
+        translated = traework_compat.translate_openai_stream_to_traework(
+            openai_source(), model=descriptor.model, request_id=request_id
+        )
+        session_id = str(options.get("session_id") or descriptor.session_id)
+        return StreamingResponse(
+            _tracked_stream(_lease_stream(translated, session_id), tracker),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+
+    response = await _tracked_dispatch(messages, descriptor.model, options, tracker)
+    if getattr(response, "status_code", 200) >= 400:
+        payload = _response_json_payload(response)
+        return JSONResponse(
+            traework_compat.openai_error_to_traework(
+                payload,
+                model=descriptor.model,
+                request_id=request_id,
+            ),
+            status_code=getattr(response, "status_code", 502),
+        )
+    payload = _response_json_payload(response)
+    return JSONResponse(
+        traework_compat.openai_completion_to_traework(
+            payload, model=descriptor.model
+        )
+    )
 
 
 async def handle_chat(req: Request):
@@ -4566,6 +5494,16 @@ async def handle_chat(req: Request):
             exc,
         )
         return _openai_error(400, str(exc), "invalid_request_error")
+
+    # A TraeWork custom model may use the ordinary /v1/chat/completions URL,
+    # but native raw paths and the client's identifying headers are distinct
+    # enough to route it without changing OpenAI callers.
+    if traework_compat.is_traework_request(
+        req.url.path, dict(req.headers), body
+    ):
+        return await _handle_traework_custom(
+            req, body=body, request_id=request_id
+        )
 
     messages = _normalize_chat_messages(body.get("messages"))
     if not isinstance(messages, list) or not messages:
@@ -4881,39 +5819,24 @@ async def api_usage_last():
     return JSONResponse(records, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/checkin/work-credits/{account_id}")
-async def api_checkin_work_credits(account_id: str):
-    """Fetch work-specific account credits for one account.
-
-    Work credits = total (all packs) - general (req_source=1).
-    """
-    rec = auth.get_account_record(account_id)
-    token = rec.get("token") or ""
-    if not token:
-        return JSONResponse({"success": False, "error": "account not found or token missing"}, status_code=404)
-    try:
-        # Fetch general and total
-        raw_ac = await trae_client.fetch_account_credits(token)
-        general = trae_client.parse_account_credits(raw_ac)
-        raw_total = await trae_client.fetch_account_total_credits(token)
-        total = trae_client.parse_account_credits(raw_total)
-        work = _sub_credits(total, general)
-        auth.merge_account_credits(
-            account_id,
-            {
-                "work_credits": work,
-                "total_credits": total,
-                "account_credits": general,
-            },
-        )
-        return JSONResponse({"success": True, "id": account_id, "credits": work, "raw_total": raw_total, "raw_general": raw_ac})
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=502)
-
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if not API_KEYS:
         return await call_next(request)
+    if request.url.path == "/api/model-test":
+        # Keep the dashboard probe usable on loopback/RFC1918 management
+        # networks without exposing a billable model endpoint to the public.
+        client_host = str(getattr(request.client, "host", "") or "").strip()
+        try:
+            client_ip = ipaddress.ip_address(client_host)
+        except ValueError:
+            client_ip = None
+        if client_ip is not None and (
+            client_ip.is_loopback
+            or client_ip.is_private
+            or client_ip.is_link_local
+        ):
+            return await call_next(request)
     if request.url.path in PUBLIC_PATHS or request.url.path.startswith(PUBLIC_PATH_PREFIXES):
         return await call_next(request)
     header = request.headers.get("authorization", "")
@@ -4944,8 +5867,8 @@ async def status():
         "edition": state.edition,
         "source": state.source,
         "base_url": state.host,
-        "web_base": WEB_BASE,
-        "upstream_mode": UPSTREAM_MODE,
+        "web_base": auth.get_settings().get("web_base_url") or WEB_BASE,
+        "upstream_mode": _current_upstream_mode(),
         "build_revision": os.environ.get("RELAY_BUILD_REVISION", "local"),
         "traework_native": {
             "enabled": traework_native_bridge.NativeBridgeConfig.from_env().enabled,
@@ -4963,15 +5886,18 @@ async def status():
             "responses_namespaces": True,
             "client_context": True,
             "tool_result_continuation": True,
+            "traework_custom_model": True,
+            "traework_raw_ingress": True,
+            "traework_connectivity_check": True,
             "parallel_tool_calls": True,
             "server_executes_caller_tools": False,
             "tool_upstreams": (
                 ["raw"]
-                if UPSTREAM_MODE in ("raw", "direct", "auto")
+                if _current_upstream_mode() in ("raw", "direct", "auto")
                 else ["cli"]
-                if UPSTREAM_MODE == "cli"
+                if _current_upstream_mode() == "cli"
                 else ["traework-native"]
-                if UPSTREAM_MODE in ("traework-native", "native", "traework")
+                if _current_upstream_mode() in ("traework-native", "native", "traework")
                 else []
             ),
             "terminal_session_leases": True,
@@ -4994,6 +5920,13 @@ async def models(request: Request):
     return {"object": "list", "data": items}
 
 
+@app.get("/models")
+async def models_compat(request: Request):
+    """Unversioned discovery alias used by some TraeWork model forms."""
+
+    return await models(request)
+
+
 @app.post("/v1")
 async def chat_v1(req: Request):
     return await handle_chat(req)
@@ -5007,6 +5940,44 @@ async def chat_v1_chat(req: Request):
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     return await handle_chat(req)
+
+
+@app.post("/chat/completions")
+async def chat_completions_compat(req: Request):
+    """OpenAI-compatible alias for custom-model base URLs without ``/v1``."""
+
+    return await handle_chat(req)
+
+
+@app.post("/api/ide/v2/llm_raw_chat")
+@app.post("/api/agent/v3/llm_raw_chat_custom_model")
+@app.post("/api/agent/v3/custom_model_proxy/chat")
+@app.post("/v1/traework/chat")
+async def traework_custom_chat(req: Request):
+    return await _handle_traework_custom(req)
+
+
+@app.post("/api/agent/v3/custom_model_connectivity_check")
+@app.post("/api/ide/v1/custom_model_connectivity_check")
+@app.post("/v1/custom_model/connectivity")
+async def traework_custom_connectivity(req: Request):
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _ = await _read_json_body(
+            req, endpoint="traework-connectivity", trace_id=request_id
+        )
+    except _RequestBodyError:
+        # Several TraeWork builds send an empty connectivity POST and expect
+        # the backend to report its default model. Keep that probe useful.
+        body = {}
+    try:
+        upstream_models = await trae_client.get_models(force=False)
+    except Exception as exc:
+        logger.warning("traework connectivity model list failed: %s", exc)
+        upstream_models = []
+    return JSONResponse(
+        traework_compat.connectivity_response(body, models=upstream_models)
+    )
 
 
 @app.post("/v1/responses")
@@ -5044,6 +6015,12 @@ async def api_model_test(req: Request):
     except (TypeError, ValueError):
         timeout = 120.0
     timeout = max(10.0, min(timeout, 600.0))
+    endpoint = str(body.get("endpoint") or _current_upstream_mode()).strip().lower()
+    if endpoint not in set(_VALID_UPSTREAM_MODES):
+        return JSONResponse(
+            {"success": False, "error": f"unsupported endpoint: {endpoint}"},
+            status_code=400,
+        )
 
     probe_tools = [
         {
@@ -5078,6 +6055,25 @@ async def api_model_test(req: Request):
         messages = [{"role": "user", "content": "Reply with exactly: pong"}]
         options = {}
     options["max_tokens"] = 64
+    effort = str(body.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        if effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+            return JSONResponse(
+                {"success": False, "error": f"unsupported reasoning_effort: {effort}"},
+                status_code=400,
+            )
+        options["reasoning_effort"] = effort
+        # Effort only matters when the model actually thinks; give it room.
+        options["max_tokens"] = 4096
+    if bool(body.get("thinking")):
+        options["thinking"] = {"type": "enabled"}
+    trace: dict[str, Any] = {}
+    options["_upstream_mode"] = endpoint
+    # Connectivity checks should exercise the same resilient route as a real
+    # API request.  Operators can still pass ``disable_fallback=true`` when
+    # diagnosing one native endpoint in isolation.
+    options["_disable_upstream_fallback"] = bool(body.get("disable_fallback", False))
+    options["_upstream_trace"] = trace
 
     started = time.monotonic()
     try:
@@ -5091,6 +6087,8 @@ async def api_model_test(req: Request):
                 "success": False,
                 "model": model,
                 "mode": mode,
+                "requested_endpoint": endpoint,
+                **trace,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "error": f"timed out after {int(timeout)}s",
             }
@@ -5101,6 +6099,8 @@ async def api_model_test(req: Request):
                 "success": False,
                 "model": model,
                 "mode": mode,
+                "requested_endpoint": endpoint,
+                **trace,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "error": str(exc)[:400],
             }
@@ -5129,6 +6129,8 @@ async def api_model_test(req: Request):
                 "success": False,
                 "model": model,
                 "mode": mode,
+                "requested_endpoint": endpoint,
+                **trace,
                 "elapsed_ms": elapsed_ms,
                 "error": (message or f"upstream returned HTTP {http_status}")[:400],
             }
@@ -5149,9 +6151,15 @@ async def api_model_test(req: Request):
             "success": ok,
             "model": model,
             "mode": mode,
+            "requested_endpoint": endpoint,
+            **trace,
             "elapsed_ms": elapsed_ms,
             "finish_reason": choice.get("finish_reason"),
             "provider_model_name": (result or {}).get("provider_model_name") or "",
+            "requested_reasoning_effort": effort or None,
+            "reasoning_effort_applied": trace.get("reasoning_effort_applied") or None,
+            "reasoning_effort_note": _effort_note(effort, trace),
+            "reasoning": str(message.get("reasoning_content") or "")[:600] or None,
             "reply": content[:200],
             "tool_calls": [
                 {
@@ -5167,6 +6175,11 @@ async def api_model_test(req: Request):
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
+                "reasoning_tokens": (
+                    usage["completion_tokens_details"].get("reasoning_tokens")
+                    if isinstance(usage.get("completion_tokens_details"), Mapping)
+                    else usage.get("reasoning_tokens")
+                ),
             },
             "error": None if ok else (
                 "upstream returned an empty response"
@@ -5389,57 +6402,38 @@ async def api_checkin_credits(account_id: str):
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=502)
 
-def _sub_credits(total: dict | None, general: dict | None) -> dict | None:
-    """Calculate work-specific credits = total - general."""
-    if not total or not general:
-        return None
-    if total.get("unlimited") or general.get("unlimited"):
-        return {"total_limit": -1, "used": 0, "remaining": None, "unlimited": True}
-    t_limit = total.get("total_limit") or 0
-    g_limit = general.get("total_limit") or 0
-    t_used = total.get("used") or 0
-    g_used = general.get("used") or 0
-    wt = max(t_limit - g_limit, 0)
-    wu = max(t_used - g_used, 0)
-    return {
-        "total_limit": wt,
-        "used": wu,
-        "remaining": max(wt - wu, 0),
-        "unlimited": False,
-    }
+
+def _credits_user_name(raw: dict) -> str:
+    """Extract the upstream 用户名 from an entitlement-usage response.
+
+    The pay API sometimes carries the profile name (user_name / userName /
+    screenName) next to the pack list; use whichever key shows up first.
+    """
+    if not isinstance(raw, dict):
+        return ""
+    for key in ("user_name", "userName", "screenName", "screen_name", "userNickName"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    user = raw.get("user") or raw.get("user_info")
+    if isinstance(user, dict):
+        for key in ("user_name", "userName", "screenName", "name"):
+            value = user.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
 
 async def _fetch_full_credits(token: str) -> dict:
-    """Fetch general credits and the combined (all-packs) credits for one token.
+    """Fetch the merged general (通用) credits for one token.
 
-    Upstream semantics:
-      - req_source=1 returns only general IDE packs (account_credits).
-      - req_source=0/2 returns all packs, i.e. the actual TOTAL credits.
-    So total_credits = req_source=0 result, and work_credits = total - general.
+    Upstream merged every pack into a single 通用积分 pool, so the relay only
+    queries req_source=1 and no longer derives work/total splits.
     """
-    raw_ac, raw_total = await asyncio.gather(
-        trae_client.fetch_account_credits(token),
-        trae_client.fetch_account_total_credits(token),
-        return_exceptions=True,
-    )
-    if isinstance(raw_ac, BaseException) and isinstance(raw_total, BaseException):
-        raise RuntimeError(
-            "Trae credits query failed: general and total credits are unavailable"
-        ) from raw_ac
-    account_credits = (
-        None
-        if isinstance(raw_ac, BaseException)
-        else trae_client.parse_account_credits(raw_ac)
-    )
-    total_credits = (
-        None
-        if isinstance(raw_total, BaseException)
-        else trae_client.parse_account_credits(raw_total)
-    )
-    work_credits = _sub_credits(total_credits, account_credits)
+    raw_ac = await trae_client.fetch_account_credits(token)
     return {
-        "account_credits": account_credits,
-        "work_credits": work_credits,
-        "total_credits": total_credits,
+        "account_credits": trae_client.parse_account_credits(raw_ac),
+        "user_name": _credits_user_name(raw_ac),
     }
 
 
@@ -5463,8 +6457,6 @@ def _cached_checkin_account_snapshot(
         "credits": cached.get("credits"),
         "checkin_enable": cached.get("enable"),
         "account_credits": cached.get("account_credits"),
-        "work_credits": cached.get("work_credits"),
-        "total_credits": cached.get("total_credits"),
         "checkin_updated_at": record.get(
             "checkin_status_updated_at", record.get("checkin_updated_at", 0)
         ),
@@ -5532,14 +6524,19 @@ async def _fetch_credit_account_snapshot(
         else dict(record.get("checkin") or {})
     )
     row = _cached_checkin_account_snapshot(account_id, record)
+    user_name = full.get("user_name") or ""
+    if user_name:
+        auth.sync_account_label_from_credits(account_id, user_name)
+    row = _cached_checkin_account_snapshot(account_id, record)
     row.update(
         {
             "account_credits": merged.get("account_credits"),
-            "work_credits": merged.get("work_credits"),
-            "total_credits": merged.get("total_credits"),
             "checkin": merged,
+            "label": auth.get_account_record(account_id).get("label") or row.get("label"),
         }
     )
+    if user_name:
+        row["user_name"] = user_name
     return row
 
 
@@ -5632,8 +6629,6 @@ async def _fetch_checkin_status_snapshot(
         "checkin_enable": status.get("enable"),
         "checkin": status,
         "account_credits": merged.get("account_credits"),
-        "work_credits": merged.get("work_credits"),
-        "total_credits": merged.get("total_credits"),
         "checkin_updated_at": auth.get_account_record(account_id).get(
             "checkin_status_updated_at",
             auth.get_account_record(account_id).get(
@@ -5807,7 +6802,7 @@ def _checkin_mark_accepted(account_id: str, snapshot: dict, *, pending: bool) ->
         checkin["verification_pending"] = True
     else:
         checkin.pop("verification_pending", None)
-    for key in ("account_credits", "work_credits", "total_credits"):
+    for key in ("account_credits",):
         value = snapshot.get(key)
         if value is not None:
             checkin[key] = value
@@ -6048,11 +7043,10 @@ async def api_checkin_claim_credits():
             full = await _fetch_full_credits(token)
             row.update(full)
             parsed = full.get("account_credits") or {}
-            # Prefer total credits for the "credit-priority" sort key so work
-            # and general entitlements both count toward account priority.
-            total_parsed = full.get("total_credits") or {}
-            credits_sort = total_parsed.get("remaining") or total_parsed.get("total_limit") or parsed.get("remaining") or parsed.get("total_limit") or 0
-            if total_parsed.get("unlimited") or parsed.get("unlimited"):
+            # Every pack lives in the merged 通用积分 pool, so the single
+            # account_credits value drives the credit-priority ordering.
+            credits_sort = parsed.get("remaining") or parsed.get("total_limit") or 0
+            if parsed.get("unlimited"):
                 credits_sort = 999999999
             fresh_checkin = dict(rec.get("checkin") or {})
             fresh_checkin.update({key: value for key, value in full.items() if value is not None})
@@ -6182,13 +7176,25 @@ async def api_settings(request: Request):
         return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
     web_base_url = (body.get("web_base_url") or "").strip()
     relay_port = body.get("relay_port") or body.get("port") or 0
+    upstream_mode = (body.get("upstream_mode") or "").strip().lower()
+    if upstream_mode and upstream_mode not in _VALID_UPSTREAM_MODES:
+        return JSONResponse(
+            {"success": False, "error": f"Unsupported upstream mode: {upstream_mode}"},
+            status_code=400,
+        )
     try:
         relay_port = int(relay_port)
     except (TypeError, ValueError):
         relay_port = 0
-    if not web_base_url and not relay_port:
+    if not web_base_url and not relay_port and not upstream_mode:
         return JSONResponse({"success": False, "error": "nothing to update"}, status_code=400)
-    auth.set_relay_settings(web_base_url=web_base_url, port=relay_port)
+    auth.set_relay_settings(web_base_url=web_base_url, port=relay_port, upstream_mode=upstream_mode)
+    if upstream_mode:
+        # Synchronise the running module so _current_upstream_mode() reflects
+        # the new preset immediately without a container restart.
+        global UPSTREAM_MODE
+        UPSTREAM_MODE = upstream_mode
+        os.environ["UPSTREAM_MODE"] = upstream_mode
     return JSONResponse({"success": True, "note": "端口变更需重启容器生效"})
 
 

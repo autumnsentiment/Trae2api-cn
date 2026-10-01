@@ -145,6 +145,35 @@ class ExtractionTests(unittest.TestCase):
             delta[0]["function"]["arguments"], '{"filePath":"README.md"}'
         )
 
+    def test_extract_top_level_tool_call_info_preserves_id_and_parameters(self):
+        calls = cli_client.extract_tool_calls(
+            {
+                "id": "event_1",
+                "tool_call_info": {
+                    "tool_call_id": "call_patch_1",
+                    "name": "apply_patch",
+                    "params": {
+                        "patch": "*** Begin Patch\n*** Update File: README.md"
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["id"], "call_patch_1")
+        self.assertEqual(calls[0]["function"]["name"], "apply_patch")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"])["patch"],
+            "*** Begin Patch\n*** Update File: README.md",
+        )
+
+    def test_finish_tool_call_info_is_not_exposed_as_client_tool(self):
+        calls = cli_client.extract_tool_calls(
+            {"tool_call_info": {"name": "finish", "params": {"summary": "done"}}}
+        )
+
+        self.assertEqual(calls, [])
+
     def test_echoed_history_marker_is_not_executable(self):
         content = (
             'Previous client tool request(s):\n'
@@ -273,6 +302,66 @@ class ExtractionTests(unittest.TestCase):
                 "role": "tool",
                 "tool_call_id": "call-1",
                 "content": '{"status":"failed","error":"PowerShell failed"}',
+            },
+        ]
+
+        self.assertEqual(cli_client.completed_tool_signatures(messages), set())
+
+    def test_renderer_successful_result_protects_download_call(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_download_1",
+                        "name": "download_file",
+                        "parameters": {"url": "https://example.com/a.zip", "path": "a.zip"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_download_1",
+                        "value": [{"type": "text", "value": "downloaded"}],
+                        "isError": False,
+                    }
+                ],
+            },
+        ]
+
+        protected = cli_client.completed_tool_signatures(messages)
+        self.assertIn(
+            'download_file\x00{"path":"a.zip","url":"https://example.com/a.zip"}',
+            protected,
+        )
+
+    def test_renderer_failed_write_result_does_not_protect_call(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_write_1",
+                        "name": "write_file",
+                        "parameters": {"path": "README.md", "content": "new"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_write_1",
+                        "value": [{"type": "text", "value": "access denied"}],
+                        "isError": True,
+                    }
+                ],
             },
         ]
 
@@ -769,3 +858,22 @@ class SubprocessStreamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlaceholderToolIdTests(unittest.TestCase):
+    def test_placeholder_id_gets_synthetic_unique_id(self):
+        first = cli_client.normalize_tool_call(
+            {"id": "<unique-id>", "name": "read", "arguments": {"path": "a"}}
+        )
+        second = cli_client.normalize_tool_call(
+            {"id": "<unique-id>", "name": "read", "arguments": {"path": "b"}}
+        )
+        self.assertNotEqual(first["id"], "<unique-id>")
+        self.assertTrue(first["id"].startswith("call_"))
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_real_id_is_kept(self):
+        call = cli_client.normalize_tool_call(
+            {"id": "call_abc123", "name": "read", "arguments": {}}
+        )
+        self.assertEqual(call["id"], "call_abc123")

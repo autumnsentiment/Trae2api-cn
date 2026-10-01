@@ -180,7 +180,7 @@ class CheckinResultTests(unittest.TestCase):
         with patch("src.main.time.time", return_value=now):
             self.assertFalse(main_module._checkin_cache_is_today(legacy_record))
 
-    def test_bulk_credit_refresh_reports_when_both_upstreams_fail(self):
+    def test_bulk_credit_refresh_reports_when_upstream_fails(self):
         raw_accounts = [("account-1", {"token": "test-token"})]
         with (
             patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
@@ -189,16 +189,12 @@ class CheckinResultTests(unittest.TestCase):
                 "src.main.trae_client.fetch_account_credits",
                 new=AsyncMock(side_effect=RuntimeError("general failed")),
             ),
-            patch(
-                "src.main.trae_client.fetch_account_total_credits",
-                new=AsyncMock(side_effect=RuntimeError("total failed")),
-            ),
         ):
             response = asyncio.run(main_module.api_checkin_credits_accounts())
 
         body = json.loads(response.body)
         self.assertTrue(body["success"])
-        self.assertIn("credits query failed", body["accounts"][0]["error"])
+        self.assertIn("general failed", body["accounts"][0]["error"])
 
     def test_bulk_credits_static_route_is_not_captured_as_account_id(self):
         with patch("src.main.auth.get_accounts_raw", return_value=[]):
@@ -882,6 +878,17 @@ class UsageRecordTests(unittest.TestCase):
 
         self.assertEqual(tracker.usage["credits_consumed"], 0)
 
+    def test_usage_tracker_rebinds_to_the_successful_fallback_turn(self):
+        tracker = object.__new__(main_module._UsageTracker)
+        tracker.usage_turn_id = ""
+
+        tracker.bind_usage_turn("agent-empty-turn")
+        tracker.bind_usage_turn("ignored-without-replace")
+        self.assertEqual(tracker.usage_turn_id, "agent-empty-turn")
+
+        tracker.bind_usage_turn("work-success-turn", replace=True)
+        self.assertEqual(tracker.usage_turn_id, "work-success-turn")
+
     def test_token_only_tracker_uses_bound_jwt_account_not_active_account(self):
         original_history = main_module._USAGE_HISTORY
         original_path = main_module._USAGE_RECORDS_PATH
@@ -1487,6 +1494,14 @@ class UsageRecordTests(unittest.TestCase):
         self.assertIn("requestJSON", html)
         self.assertIn("消耗积分", html)
         self.assertIn("join('\\n')", html)
+        self.assertIn(r"raw.split(/[\n,]+/)", html)
+        # A single backslash in the Python f-string would become a literal
+        # newline inside the JavaScript regex and disable the whole console
+        # script at parse time. Keep this regression assertion separate from
+        # the positive escaped-form check above.
+        self.assertNotIn("raw.split(/[\n,", html)
+        self.assertIn("usageRecordsFromPayload", html)
+        self.assertIn("if(manualForm) manualForm.addEventListener", html)
         self.assertNotIn("失败：\n'+", html)
         self.assertIn("[hidden] { display:none !important; }", html)
         self.assertIn("setAccountCheckinBusy(id,true)", html)
@@ -1515,6 +1530,9 @@ class UsageRecordTests(unittest.TestCase):
 class _FakeUsageTracker:
     def __init__(self):
         self.statuses = []
+        self.saw_usage = False
+        self.model = "test-model"
+        self.updates = []
 
     async def begin(self):
         pass
@@ -1522,8 +1540,81 @@ class _FakeUsageTracker:
     async def finish(self, status):
         self.statuses.append(status)
 
+    def update(self, usage):
+        self.saw_usage = True
+        self.updates.append(dict(usage))
+
 
 class UsageStreamTerminalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inner_and_outer_usage_frames_write_one_request_record(self):
+        original_history = main_module._USAGE_HISTORY
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = []
+
+        async def scenario(path):
+            tracker = main_module._UsageTracker(
+                "test-model", "/v1/chat/completions", True, {"_account_id": "default"}
+            )
+            tracker.request_id = "req-inner-outer-once"
+            usage_frame = (
+                'data: {"choices":[],"usage":{"input_tokens":2,'
+                '"output_tokens":3,"total_tokens":5}}\n\n'
+            )
+
+            async def source():
+                # Simulate the inner translator tracking the frame before the
+                # outer public-stream wrapper sees the same emitted chunk.
+                main_module._track_usage_from_chunk(usage_frame, tracker.model)
+                yield usage_frame
+
+            with patch.object(main_module, "_USAGE_RECORDS_PATH", path):
+                chunks = [
+                    chunk async for chunk in main_module._tracked_stream(source(), tracker)
+                ]
+            return chunks
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "usage_records.json"
+            try:
+                chunks = await scenario(path)
+                self.assertEqual(len(chunks), 1)
+                matching = [
+                    item
+                    for item in main_module._USAGE_HISTORY
+                    if item.get("request_id") == "req-inner-outer-once"
+                ]
+                self.assertEqual(len(matching), 1)
+                self.assertEqual(matching[0]["total_tokens"], 5)
+            finally:
+                main_module._USAGE_HISTORY = original_history
+                main_module._USAGE_RECORDS_PATH = original_path
+
+    async def test_clean_eof_without_terminal_or_usage_records_cancelled(self):
+        tracker = _FakeUsageTracker()
+        chunks = []
+
+        async def source():
+            yield 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+
+        async for chunk in main_module._tracked_stream(source(), tracker):
+            chunks.append(chunk)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("partial", chunks[0])
+        self.assertEqual(tracker.statuses, ["cancelled"])
+
+    async def test_clean_eof_after_usage_records_completed(self):
+        tracker = _FakeUsageTracker()
+
+        async def source():
+            tracker.saw_usage = True
+            yield 'data: {"choices":[],"usage":{"total_tokens":12}}\n\n'
+
+        async for _chunk in main_module._tracked_stream(source(), tracker):
+            pass
+
+        self.assertEqual(tracker.statuses, ["completed"])
+
     async def test_cancel_after_done_records_completed(self):
         tracker = _FakeUsageTracker()
         gate = asyncio.Event()
@@ -1571,6 +1662,50 @@ class UsageStreamTerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("content", got[0])
         self.assertEqual(tracker.statuses, ["cancelled"])
 
+    async def test_cancel_after_chat_finish_frame_records_completed(self):
+        tracker = _FakeUsageTracker()
+        started = asyncio.Event()
+
+        async def source():
+            yield (
+                'data: {"choices":[{"index":0,"delta":{},'
+                '"finish_reason":"tool_calls"}]}\n\n'
+            )
+            started.set()
+            await asyncio.Event().wait()
+
+        async def consume():
+            async for _chunk in main_module._tracked_stream(source(), tracker):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(tracker.statuses, ["completed"])
+
+    async def test_cancel_after_final_usage_frame_records_completed(self):
+        tracker = _FakeUsageTracker()
+        tracker.saw_usage = True
+        started = asyncio.Event()
+
+        async def source():
+            yield 'data: {"choices":[],"usage":{"total_tokens":12}}\n\n'
+            started.set()
+            await asyncio.Event().wait()
+
+        async def consume():
+            async for _chunk in main_module._tracked_stream(source(), tracker):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(tracker.statuses, ["completed"])
+
     async def test_close_after_done_records_completed(self):
         tracker = _FakeUsageTracker()
 
@@ -1607,6 +1742,62 @@ class UsageStreamTerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("response.completed", got[0])
         self.assertEqual(tracker.statuses, ["completed"])
 
+    async def test_responses_failed_event_records_error(self):
+        tracker = _FakeUsageTracker()
+        started = asyncio.Event()
+
+        async def source():
+            yield 'event: response.failed\ndata: {"type":"response.failed"}\n\n'
+            started.set()
+            await asyncio.Event().wait()
+
+        async def consume():
+            async for _chunk in main_module._tracked_stream(source(), tracker):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(tracker.statuses, ["error"])
+
+    async def test_traework_done_error_status_records_error(self):
+        tracker = _FakeUsageTracker()
+
+        async def source():
+            yield (
+                'event: done\n'
+                'data: {"status":"error","error":{"code":"empty_response"}}\n\n'
+            )
+
+        async for _chunk in main_module._tracked_stream(source(), tracker):
+            pass
+
+        self.assertEqual(tracker.statuses, ["error"])
+
+    async def test_traework_output_finish_and_token_usage_are_terminal_and_billable(self):
+        tracker = _FakeUsageTracker()
+
+        async def source():
+            yield (
+                'event: output\n'
+                'data: {"response":"done","finish_reason":"stop"}\n\n'
+            )
+            yield (
+                'event: token_usage\n'
+                'data: {"input_tokens":7,"output_tokens":3,"total_tokens":10}\n\n'
+            )
+
+        chunks = [
+            chunk
+            async for chunk in main_module._tracked_stream(source(), tracker)
+        ]
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(tracker.statuses, ["completed"])
+        self.assertEqual(tracker.updates[0]["total_tokens"], 10)
+
 
 class SessionLeaseTests(unittest.TestCase):
     def setUp(self):
@@ -1641,6 +1832,46 @@ class SessionLeaseTests(unittest.TestCase):
         repaired = normalized[1]
         self.assertEqual(repaired["tool_call_id"], "mcp__node_repl__js:92")
         self.assertTrue(repaired["is_error"])
+
+    def test_renderer_tool_messages_activate_tool_protocol(self):
+        cases = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_download_1",
+                        "name": "download_file",
+                        "parameters": {
+                            "url": "https://example.com/a.zip",
+                            "path": "a.zip",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_write_1",
+                        "value": [{"type": "text", "value": "wrote README.md"}],
+                        "isError": False,
+                    }
+                ],
+            },
+        ]
+
+        for message in cases:
+            with self.subTest(block_type=message["content"][0]["type"]):
+                self.assertTrue(main_module._tool_protocol_requested({}, [message]))
+
+    def test_plain_user_content_does_not_activate_tool_protocol(self):
+        self.assertFalse(
+            main_module._tool_protocol_requested(
+                {}, [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+            )
+        )
 
     def test_continuation_reuses_initial_account_and_token_snapshot(self):
         messages = [{"role": "user", "content": "inspect the workspace"}]
@@ -2976,6 +3207,44 @@ class MainCliSmokeTests(unittest.TestCase):
             [call["name"] for call in body["tool_calls"]], ["relay_probe"]
         )
 
+    def test_model_test_forwards_reasoning_effort_and_thinking(self):
+        seen = {}
+
+        async def fake_dispatch(messages, model, stream, options):
+            seen.update(options)
+            options["_upstream_trace"]["reasoning_effort_applied"] = "light"
+            return JSONResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "391", "reasoning_content": "17*23"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"completion_tokens_details": {"reasoning_tokens": 7}},
+                }
+            )
+
+        with patch("src.main._dispatch_chat", new=fake_dispatch):
+            body = self.client.post(
+                "/api/model-test",
+                json={"model": "glm-5.3", "reasoning_effort": "low", "thinking": True},
+                headers=AUTH_HEADERS,
+            ).json()
+        self.assertEqual(seen["reasoning_effort"], "low")
+        self.assertEqual(seen["thinking"], {"type": "enabled"})
+        self.assertEqual(body["requested_reasoning_effort"], "low")
+        self.assertEqual(body["reasoning_effort_applied"], "light")
+        self.assertEqual(body["reasoning"], "17*23")
+        self.assertEqual(body["usage"]["reasoning_tokens"], 7)
+
+        bad = self.client.post(
+            "/api/model-test",
+            json={"model": "glm-5.3", "reasoning_effort": "ultra"},
+            headers=AUTH_HEADERS,
+        )
+        self.assertEqual(bad.status_code, 400)
+
     def test_model_test_endpoint_surfaces_failures(self):
         empty = JSONResponse(
             {
@@ -3031,6 +3300,46 @@ class MainCliSmokeTests(unittest.TestCase):
             ).status_code,
             400,
         )
+
+    def test_model_test_requires_auth_outside_management_networks(self):
+        async def call_from(host, authorization=""):
+            headers = []
+            if authorization:
+                headers.append((b"authorization", authorization.encode("ascii")))
+            request = main_module.Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/model-test",
+                    "raw_path": b"/api/model-test",
+                    "query_string": b"",
+                    "headers": headers,
+                    "client": (host, 12345),
+                    "server": ("relay", 8000),
+                    "scheme": "http",
+                    "http_version": "1.1",
+                }
+            )
+            downstream = AsyncMock(return_value=JSONResponse({"ok": True}))
+            response = await main_module.auth_middleware(request, downstream)
+            return response, downstream
+
+        with patch.object(main_module, "API_KEYS", ["smoke-key"]):
+            public_response, public_downstream = asyncio.run(call_from("8.8.8.8"))
+            self.assertEqual(public_response.status_code, 401)
+            public_downstream.assert_not_awaited()
+
+            private_response, private_downstream = asyncio.run(
+                call_from("192.168.5.10")
+            )
+            self.assertEqual(private_response.status_code, 200)
+            private_downstream.assert_awaited_once()
+
+            keyed_response, keyed_downstream = asyncio.run(
+                call_from("8.8.8.8", "Bearer smoke-key")
+            )
+            self.assertEqual(keyed_response.status_code, 200)
+            keyed_downstream.assert_awaited_once()
 
     def test_dashboard_exposes_model_connectivity_panel(self):
         html = main_module._web_login_html()

@@ -296,7 +296,7 @@ class RawClientBuildTests(unittest.TestCase):
 
         expected = {
             "auto": ("glm-5.2", "glm-5.2", "GLM-5.2"),
-            "glm-5.2": ("glm-5.2", "glm-5.2", "GLM-5.2"),
+            "glm-5.2": ("glm-5.2", "glm-5__v2", "GLM-5.2"),
             "glm-5.3": ("glm-5.3", "glm-5.3", "GLM-5.3"),
             "coding": ("glm-5.1", "glm-5__v2", "GLM-5.1"),
             "deepseek-v4-pro": (
@@ -385,6 +385,69 @@ class RawClientBuildTests(unittest.TestCase):
         self.assertIn("call_abc", tool_texts[0])
         self.assertIn("Downloaded 4096 bytes", tool_texts[0])
 
+    def test_renderer_user_tool_result_keeps_call_identity_and_failure(self):
+        messages = [
+            {"role": "user", "content": "Patch README.md"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_patch_1",
+                        "name": "apply_patch",
+                        "parameters": {"patch": "*** Begin Patch"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_patch_1",
+                        "value": [{"type": "text", "value": "file not found"}],
+                        "isError": True,
+                    }
+                ],
+            },
+        ]
+
+        body = raw_client.build_raw_chat_body(messages, "auto")
+        result_text = next(
+            block["text"]
+            for message in body["messages"]
+            if message["role"] == "user"
+            for block in message.get("content", [])
+            if "Client tool result" in block.get("text", "")
+        )
+
+        self.assertIn("call_patch_1", result_text)
+        self.assertIn("apply_patch", result_text)
+        self.assertIn("status=failed", result_text)
+        self.assertIn("file not found", result_text)
+
+    def test_renderer_user_tool_result_activates_runtime_protocol(self):
+        body = raw_client.build_raw_chat_body(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "toolCallId": "call_write_1",
+                            "value": [{"type": "text", "value": "wrote file"}],
+                            "isError": False,
+                        }
+                    ],
+                }
+            ],
+            "auto",
+        )
+
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertIn("external Trae-compatible terminal client application", body["messages"][0]["content"][0]["text"])
+        self.assertIn("status=succeeded", body["messages"][1]["content"][0]["text"])
+
     def test_build_body_does_not_synthesize_missing_native_tool_result(self):
         body = raw_client.build_raw_chat_body(
             [
@@ -448,7 +511,7 @@ class RawClientBuildTests(unittest.TestCase):
     def test_model_aliases_use_shared_trae_mapping(self):
         self.assertEqual(
             raw_client.resolve_raw_model("claude-sonnet-4").raw_model_name,
-            "glm-5.2",
+            "glm-5__v2",
         )
         self.assertEqual(
             raw_client.resolve_raw_model("gpt-4o").raw_model_name,
@@ -1365,3 +1428,20 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoFabricatedWorkspaceTests(unittest.TestCase):
+    def test_missing_workspace_is_not_invented(self):
+        with patch.dict(os.environ, {"TRAE_CLIENT_WORKSPACE_PATH": ""}):
+            context = raw_client.build_client_context(
+                {}, request_headers={"X-Stainless-OS": "Windows"}
+            )
+        self.assertNotIn("workspace_path", context)
+        self.assertEqual(context["terminal_context"][0]["cwd"], ".")
+
+    def test_runtime_prompt_example_has_no_placeholder_id(self):
+        prompt = raw_client.build_runtime_system_prompt(
+            [{"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}],
+            {},
+        )
+        self.assertNotIn("<unique-id>", prompt)

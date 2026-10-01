@@ -761,6 +761,30 @@ def _record_valid(record: dict) -> bool:
     return _record_to_state(record).is_valid()
 
 
+def _looks_like_cloudide_token(token: str) -> bool:
+    """Return whether a token has the shape used by Cloud-IDE-JWT.
+
+    The desktop/web login flow can also leave a short opaque OAuth/session
+    value in its account store.  That value may carry a far-future expiry but
+    cannot authenticate the model gateways.  Keep the generic ``is_valid``
+    semantics for callers/tests that only need expiry bookkeeping, while
+    using this stricter predicate when choosing a model account.
+    """
+    value = str(token or '').strip()
+    parts = value.split('.')
+    return len(value) >= 128 and len(parts) == 3 and all(parts)
+
+
+def _record_model_valid(record: dict) -> bool:
+    """Return whether an account is suitable for model-gateway requests."""
+    if not _record_valid(record):
+        return False
+    source = str(record.get('source') or '').strip().lower()
+    if source == 'cli':
+        return True
+    return _looks_like_cloudide_token(record.get('token') or '')
+
+
 def _save_accounts() -> None:
     try:
         ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -795,26 +819,50 @@ def _bootstrap_account_store() -> None:
         return
 
     current = _auth
-    if current.token:
+    # An auto-discovered credential is authoritative only when it is both
+    # unexpired and shaped like a Cloud-IDE-JWT.  A stale/opaque desktop
+    # session must not overwrite a healthy persisted account (the old code
+    # always promoted ``current`` and caused every endpoint to use uid-1).
+    current_model_valid = bool(current.token) and (
+        current.source == 'cli' or (
+            current.is_valid() and _looks_like_cloudide_token(current.token)
+        )
+    )
+    if current_model_valid:
         aid = current.user_id or current.token[:24]
         old = _accounts.get(aid, {})
         _accounts[aid] = _merge_state_record(current, old)
         _active_account = aid
-    if current.token:
+    if current.token and not current_model_valid:
+        logger.warning(
+            'auth: ignoring non-model auto credential during account bootstrap '
+            '(source=%s user=%s)',
+            current.source,
+            current.user_id or 'unknown',
+        )
+    if current_model_valid:
         # Store the valid env/authorize token in memory even if persistence failed.
         pass
-    elif _active_account and _active_account in _accounts:
-        # Always load the selected account; treat as usable as long as it has a token.
-        _switch_record(_accounts[_active_account])
     else:
-        # Prefer a valid account, but fall back to any account with a token so a
-        # fresh deploy with an expired-at field still becomes usable.
-        for aid, rec in _accounts.items():
-            if _record_valid(rec):
-                _active_account = aid
-                _switch_record(rec)
-                break
+        # Prefer a model-usable account.  Do not blindly load the persisted
+        # active row: it may be an opaque OAuth value or an expired JWT.
+        selected = ''
+        if _active_account and _active_account in _accounts and _record_model_valid(
+            _accounts[_active_account]
+        ):
+            selected = _active_account
+        if not selected:
+            for aid, rec in _accounts.items():
+                if _record_model_valid(rec):
+                    selected = aid
+                    break
+        if selected:
+            _active_account = selected
+            _switch_record(_accounts[selected])
         else:
+            # Preserve the old fallback only when no model-shaped credential
+            # exists at all.  This keeps management/UI startup usable while
+            # making the eventual upstream error explicit.
             for aid, rec in _accounts.items():
                 if rec.get('token'):
                     _active_account = aid
@@ -912,6 +960,28 @@ def merge_account_credits(account_id: str, data: dict) -> dict:
         return dict(checkin)
 
 
+def sync_account_label_from_credits(account_id: str, user_name: str) -> str:
+    """Fill the account label with the upstream 用户名 when none was chosen.
+
+    A manually assigned label is never overwritten; only empty labels or
+    labels that still mirror the raw account/user id get the synced name.
+    """
+    name = (user_name or '').strip()
+    if not name:
+        return ''
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return ''
+        existing = (rec.get('label') or '').strip()
+        user_id = (rec.get('user_id') or '').strip()
+        if existing and existing not in (account_id, user_id):
+            return existing
+        rec['label'] = name
+        _save_accounts()
+        return name
+
+
 def merge_account_retry(account_id: str, data: dict) -> dict:
     """Persist 9074 retry bookkeeping without touching checkin timestamps.
 
@@ -957,8 +1027,6 @@ def list_accounts() -> list[dict]:
                 ),
                 'credits_updated_at': rec.get('credits_updated_at', 0),
                 'account_credits': checkin.get('account_credits'),
-                'work_credits': checkin.get('work_credits'),
-                'total_credits': checkin.get('total_credits'),
             })
         return result
 
@@ -1129,15 +1197,21 @@ def get_settings() -> dict:
     with _STORE_LOCK:
         return {
             'web_base_url': _settings.get('web_base_url', ''),
+            'upstream_mode': _settings.get('upstream_mode', ''),
             'relay_port': _settings.get('relay_port', 0),
             'poll_enabled': _poll_enabled,
         }
 
 
-def set_relay_settings(web_base_url: str = '', port: int = 0) -> None:
+def set_relay_settings(web_base_url: str = '', port: int = 0, upstream_mode: str = '') -> None:
     with _STORE_LOCK:
         if web_base_url:
             _settings['web_base_url'] = web_base_url
+            # Update the running process so the change takes effect without a restart.
+            os.environ['TRAE_WEB_BASE_URL'] = web_base_url
+        if upstream_mode:
+            _settings['upstream_mode'] = upstream_mode
+            os.environ['UPSTREAM_MODE'] = upstream_mode
         if port and port > 0:
             _settings['relay_port'] = port
         _save_accounts()
@@ -1151,17 +1225,21 @@ def set_relay_settings(web_base_url: str = '', port: int = 0) -> None:
             key = ''
             if stripped and not stripped.startswith('#') and '=' in stripped:
                 key = stripped.split('=', 1)[0].strip()
-            if key in ('TRAE_WEB_BASE_URL', 'RELAY_PORT'):
+            if key in ('TRAE_WEB_BASE_URL', 'RELAY_PORT', 'UPSTREAM_MODE'):
                 if key not in seen:
                     seen.add(key)
                     if key == 'TRAE_WEB_BASE_URL' and web_base_url:
                         out.append(f'TRAE_WEB_BASE_URL={web_base_url}')
+                    elif key == 'UPSTREAM_MODE' and upstream_mode:
+                        out.append(f'UPSTREAM_MODE={upstream_mode}')
                     elif key == 'RELAY_PORT' and port and port > 0:
                         out.append(f'RELAY_PORT={port}')
             else:
                 out.append(line)
         if 'TRAE_WEB_BASE_URL' not in seen and web_base_url:
             out.append(f'TRAE_WEB_BASE_URL={web_base_url}')
+        if 'UPSTREAM_MODE' not in seen and upstream_mode:
+            out.append(f'UPSTREAM_MODE={upstream_mode}')
         if 'RELAY_PORT' not in seen and port and port > 0:
             out.append(f'RELAY_PORT={port}')
         ENV_PATH.write_text('\n'.join(out) + '\n', 'utf-8')

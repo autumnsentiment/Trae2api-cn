@@ -1,5 +1,8 @@
 import asyncio
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from src import auth
@@ -7,6 +10,61 @@ from src.auth import AuthState, _merge_state_record
 
 
 class AuthStateMergeTests(unittest.TestCase):
+    def test_opaque_session_value_is_not_model_valid(self):
+        record = {
+            "source": "web-login",
+            "token": "opaque-session",
+            "expired_at": "2099-01-01T00:00:00Z",
+        }
+
+        self.assertTrue(auth._record_valid(record))
+        self.assertFalse(auth._record_model_valid(record))
+
+    def test_bootstrap_does_not_promote_opaque_active_account(self):
+        valid_token = "header." + ("p" * 140) + ".signature"
+        valid_record = {
+            "user_id": "jwt-account",
+            "source": "auto",
+            "edition": "solo",
+            "token": valid_token,
+            "expired_at": "2099-01-01T00:00:00Z",
+            "provider_specific": {},
+        }
+        persisted = {
+            "accounts": {
+                "uid-1": {
+                    "user_id": "uid-1",
+                    "source": "web-login",
+                    "token": "opaque-session",
+                    "expired_at": "2099-01-01T00:00:00Z",
+                },
+                "jwt-account": valid_record,
+            },
+            "active": "uid-1",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            accounts_path = Path(tmp) / "accounts.json"
+            accounts_path.write_text(json.dumps(persisted), encoding="utf-8")
+            current = AuthState(
+                source="web-login",
+                token="opaque-session",
+                user_id="uid-1",
+                expired_at="2099-01-01T00:00:00Z",
+            )
+            with (
+                patch.object(auth, "ACCOUNTS_PATH", accounts_path),
+                patch.object(auth, "_auth", current),
+                patch.object(auth, "_accounts", {}),
+                patch.object(auth, "_active_account", ""),
+                patch.object(auth, "_poll_enabled", False),
+                patch.object(auth, "_settings", {}),
+                patch.object(auth, "_polling_mode", "round-robin"),
+                patch.object(auth, "_rotation_cursor", 0),
+            ):
+                auth._bootstrap_account_store()
+                self.assertEqual(auth.get_active_account_id(), "jwt-account")
+                self.assertEqual(auth.get_token(), valid_token)
+
     def test_merge_state_record_preserves_cached_account_metadata(self):
         previous = {
             "user_id": "account-1",

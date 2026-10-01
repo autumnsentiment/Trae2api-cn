@@ -27,7 +27,11 @@ from typing import Any, AsyncIterator, Mapping, Optional
 import httpx
 
 from . import auth, raw_client
-from .cli_client import renderer_block_text, sanitize_assistant_history_messages
+from .cli_client import (
+    renderer_block_text,
+    sanitize_assistant_history_messages,
+    tool_result_is_failed,
+)
 from .model_limits import clamp_max_completion_tokens
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,27 @@ IDE_ENDPOINTS = [
     "/api/ide/v1/chat",
     "/api/agent/v3/create_agent_task",
 ]
+DEFAULT_MODEL_GATEWAY = "https://trae-api-cn.mchost.guru"
+# Legacy Work ``create_agent_task`` is served from the Work gateway.  The
+# native Work Lite ``workflow/start`` path remains on trae-api-cn.mchost.guru;
+# keeping this host separate prevents an IDE request from being sent to the
+# OAuth/API host and mirrors the captured TraeWork client routing.
+WORK_AGENT_HOST = os.environ.get("TRAE_WORK_AGENT_HOST", "https://api5-normal.mchost.guru").rstrip("/")
+WORK_AGENT_APP_ID = os.environ.get("TRAE_WORK_APP_ID", "931506")
+# create_agent_task is sent with the chat application id in TraeWork's native
+# client; 931506 is the Work function/app id used by the config probe itself.
+WORK_AGENT_APP_ID_CHAT = os.environ.get("TRAE_WORK_APP_ID_CHAT", IDE_APP_ID)
+WORK_AGENT_VERSION = os.environ.get("TRAE_WORK_IDE_VERSION", "0.1.63")
+WORK_AGENT_VERSION_CODE = os.environ.get("TRAE_WORK_IDE_VERSION_CODE", "20260901")
+# SOLO/llm_utils_chat uses a different client version family from the legacy
+# IDE payload builder.  Keep it independently configurable so old desktop
+# request values do not make the gateway reject otherwise valid parameters.
+SOLO_GATEWAY_VERSION = os.environ.get("TRAE_SOLO_GATEWAY_VERSION", "0.1.52")
+SOLO_GATEWAY_VERSION_CODE = os.environ.get(
+    "TRAE_SOLO_GATEWAY_VERSION_CODE", "20260811"
+)
+SOLO_DEVICE_BRAND = os.environ.get("TRAE_SOLO_DEVICE_BRAND", "83DG")
+SOLO_OS_VERSION = os.environ.get("TRAE_SOLO_OS_VERSION", "Windows 11 Pro")
 
 # 外部模型名 -> Trae CN 内部模型名（基于最新 Trae CN 模型映射）
 MODEL_ALIASES = {
@@ -92,9 +117,11 @@ MODEL_ALIASES = {
     "kimi-k3": "kimi-k3",
     "kimi-k2.7-code": "kimi-k2.7-code",
     "kimi-k2": "kimi-k2",
+    "kimi-k2.5": "kimi-k2.5",
     "qwen-3.7-plus": "qwen-3.7-plus",
     "qwen-3.6-plus": "qwen-3.6-plus",
     "qwen3.8-max": "qwen3.8-max",
+    "qwen-3.5": "qwen-3.5",
     "qwen3-coder": "qwen3-coder",
     "minimax-m3": "minimax-m3",
     "minimax-m2.7": "minimax-m2.7",
@@ -167,16 +194,30 @@ def _tool_protocol_requested(
     ):
         return True
     return any(
-        isinstance(message, dict)
-        and (
-            message.get("role") == "tool"
-            or (
-                message.get("role") == "assistant"
-                and isinstance(message.get("tool_calls"), list)
-                and bool(message["tool_calls"])
-            )
-        )
+        isinstance(message, dict) and _message_contains_tool_protocol(message)
         for message in (messages or [])
+    )
+
+
+def _message_contains_tool_protocol(message: Mapping[str, Any]) -> bool:
+    """Detect OpenAI and TraeWork renderer tool blocks in message history."""
+
+    role = str(message.get("role") or "").strip().lower()
+    if role in {"tool", "function"}:
+        return True
+    if role == "assistant" and (
+        (isinstance(message.get("tool_calls"), list) and bool(message["tool_calls"]))
+        or isinstance(message.get("function_call"), Mapping)
+    ):
+        return True
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, Mapping)
+        and str(block.get("type") or "").strip().lower()
+        in {"tool_use", "tool_call", "function_call", "tool_result"}
+        for block in content
     )
 
 
@@ -337,6 +378,32 @@ def build_headers(
         "Connection": "keep-alive",
         "User-Agent": "",
     }
+
+
+def _model_gateway_base(*candidates: Any) -> str:
+    """Choose the model gateway, keeping OAuth/auth hosts out of model calls.
+
+    Trae stores ``api.trae.cn``/``api.trae.com.cn`` as account or OAuth hosts
+    in some login records.  Those hosts intentionally do not expose the IDE
+    model routes.  Explicit non-Trae hosts remain usable for a custom gateway.
+    """
+
+    configured = str(os.environ.get("TRAE_MODEL_API_HOST") or "").strip()
+    values = [configured, *(str(item or "").strip() for item in candidates)]
+    for value in values:
+        if not value:
+            continue
+        value = value.rstrip("/")
+        lowered = value.lower()
+        if any(host in lowered for host in (
+            "api.trae.cn",
+            "api.trae.com.cn",
+            "trae-api.com.cn",
+            "oauth",
+        )) and "mchost.guru" not in lowered and "trae-api-" not in lowered:
+            continue
+        return value
+    return DEFAULT_MODEL_GATEWAY
 
 
 # Cache of checkin device ids per account. The upstream checkin API is
@@ -805,6 +872,7 @@ def flatten_query(messages: list[dict]) -> str:
                     content_value = candidate
                     break
         content = _content_to_text(content_value)
+        renderer_results = raw_client._renderer_tool_result_blocks(content_value)
         role = m.get("role", "user")
         if role == "system":
             parts.append(f"[System]\n{content}")
@@ -820,10 +888,19 @@ def flatten_query(messages: list[dict]) -> str:
                 assistant_parts.append(tool_history)
             if assistant_parts:
                 parts.append("[Assistant]\n" + "\n\n".join(assistant_parts))
+        elif renderer_results:
+            result_context = raw_client._renderer_tool_result_context(
+                content_value,
+                raw_client._tool_call_name_map(messages),
+            )
+            parts.append(f"[Client Tool Result]\n{result_context}")
         elif role == "tool":
             tool_id = m.get("tool_call_id") or m.get("toolCallId") or "unknown"
             tool_name = m.get("name") or "tool"
-            parts.append(f"[Client Tool Result: {tool_id} {tool_name}]\n{content}")
+            status = "failed" if tool_result_is_failed(m) else "succeeded"
+            parts.append(
+                f"[Client Tool Result: {tool_id} {tool_name} status={status}]\n{content}"
+            )
         else:
             parts.append(content)
     text = "\n\n".join(parts)
@@ -837,6 +914,7 @@ def build_web_content(messages: list[dict]) -> list[dict]:
     agent understands the full conversation context including previous tool usage.
     """
     items: list[dict] = []
+    tool_names = raw_client._tool_call_name_map(messages)
     for m in sanitize_assistant_history_messages(messages):
         role = m.get("role", "user")
         content = m.get("content", "")
@@ -847,6 +925,7 @@ def build_web_content(messages: list[dict]) -> list[dict]:
                     content = candidate
                     break
         tool_calls = m.get("tool_calls")
+        renderer_results = raw_client._renderer_tool_result_blocks(content)
         if role == "assistant" and not tool_calls:
             # Renderer histories carry calls as tool_use content blocks.
             renderer_calls = raw_client._renderer_tool_use_blocks(content)
@@ -881,15 +960,28 @@ def build_web_content(messages: list[dict]) -> list[dict]:
                     f"\nArguments: {func.get('arguments', '{}')}"
                 )
                 items.append({"type": "text", "data": {"content": tc_text}})
-        elif role == "tool":
-            tc_id = m.get("tool_call_id") or m.get("toolCallId") or ""
-            tool_name = m.get("name") or "tool"
+        elif renderer_results:
             items.append(
                 {
                     "type": "text",
                     "data": {
                         "content": (
-                            f"\n[Client Tool Result: {tc_id} {tool_name}]\n"
+                            "\n[Client Tool Result]\n"
+                            + raw_client._renderer_tool_result_context(content, tool_names)
+                        )
+                    },
+                }
+            )
+        elif role == "tool":
+            tc_id = m.get("tool_call_id") or m.get("toolCallId") or ""
+            tool_name = m.get("name") or "tool"
+            status = "failed" if tool_result_is_failed(m) else "succeeded"
+            items.append(
+                {
+                    "type": "text",
+                    "data": {
+                        "content": (
+                            f"\n[Client Tool Result: {tc_id} {tool_name} status={status}]\n"
                             f"{_content_to_text(content)}"
                         )
                     },
@@ -1395,11 +1487,17 @@ def build_llm_chat_body(
     max_tokens: Optional[int] = None,
     options: Optional[dict] = None,
 ) -> dict:
-    """构造 /api/agent/v3/llm_utils_chat 与 create_agent_task 的请求体。"""
-    if _tool_protocol_requested(options, messages):
-        raise ValueError("Trae IDE agent endpoints cannot proxy caller-owned tool policy")
+    """构造 Trae SOLO ``llm_utils_chat`` 的原生请求体.
+
+    The upstream endpoint is not an OpenAI-compatible ``inline_chat`` route.
+    TraeWork rewrites the request to ``solo_work_lite`` and pins the selected
+    model through ``config_name``.  It also keeps the transport streaming;
+    non-stream callers aggregate the SSE response in the relay.
+    """
+    options = options or {}
     converted = convert_openai_messages(messages, options)
     session_id = _requested_session_id(options) or str(uuid.uuid4())
+    config_name = convert_model_name(model) or model or "glm-5.2"
     body = {
         "messages": [
             {
@@ -1408,15 +1506,111 @@ def build_llm_chat_body(
             }
             for m in converted
         ],
-        "model": model,
-        "function": "inline_chat",
-        "stream": stream,
+        "config_name": config_name,
+        "model": config_name,
+        "function": "solo_work_lite",
+        "stream": True,
         "request_id": session_id,
         "session_id": session_id,
     }
     max_tokens = clamp_max_completion_tokens(max_tokens, model)
     if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
         body["max_tokens"] = int(max_tokens)
+    tools = options.get("tools") or options.get("_inherited_tools")
+    if isinstance(tools, list) and tools:
+        native_tools = raw_client._native_tool_definitions(tools)
+        if native_tools:
+            body["tools"] = native_tools
+        choice = options.get("tool_choice")
+        if isinstance(choice, Mapping):
+            function = choice.get("function")
+            selected = function if isinstance(function, Mapping) else choice
+            name = selected.get("name") if isinstance(selected, Mapping) else ""
+            choice = str(name or "auto")
+        if choice is not None and choice != "none":
+            body["tool_choice"] = choice
+        if options.get("parallel_tool_calls") is not None:
+            body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+    return body
+
+
+def build_work_agent_body(
+    messages: list[dict],
+    model: str,
+    stream: bool,
+    options: Optional[dict] = None,
+) -> dict:
+    """Build the legacy Work ``create_agent_task`` envelope.
+
+    Work does not use the plaintext ``llm_utils_chat`` body.  The public
+    client still owns tools, so the schemas are represented both in the
+    runtime system message (for compatibility with older Work builds) and in
+    the native ``tools`` field when supplied.
+    """
+
+    options = options or {}
+    converted = convert_openai_messages(messages, options)
+    session_id = _requested_session_id(options) or str(uuid.uuid4())
+    conversation_id = str(
+        options.get("conversation_id")
+        or options.get("conversationId")
+        or session_id
+    )
+    prompt = ""
+    for item in reversed(converted):
+        if str(item.get("role") or "") == "user":
+            prompt = _content_to_text(item.get("content"))
+            if prompt:
+                break
+    config_name = convert_model_name(model) or model or "glm-5.2"
+    raw_model = config_name if config_name.endswith("__dev") else config_name + "__dev"
+    query = json.dumps(
+        [{"type": "text", "data": {"content": prompt}}],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    user_messages = [
+        {
+            "role": str(item.get("role") or "user"),
+            "content": _content_to_text(item.get("content")),
+        }
+        for item in converted
+        if _content_to_text(item.get("content"))
+    ]
+    body: dict[str, Any] = {
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "user_id": str(options.get("_auth_user_id") or options.get("_account_id") or auth.get_user_id() or ""),
+        "device_id": str(options.get("device_id") or ""),
+        "agent_type": "solo_work_lite",
+        "model_name": raw_model,
+        "config_name": config_name.removesuffix("__dev"),
+        "ide_version": WORK_AGENT_VERSION,
+        "version_code": int(WORK_AGENT_VERSION_CODE or "20260901"),
+        "mode_type": 1,
+        "plugin_channel": "stable",
+        "history_id_list": [],
+        "user_input": {
+            "id": str(uuid.uuid4()),
+            "query": query,
+            "messages": user_messages or [{"role": "user", "content": prompt}],
+        },
+    }
+    tools = options.get("tools") or options.get("_inherited_tools")
+    if isinstance(tools, list) and tools:
+        body["tools"] = raw_client._native_tool_definitions(tools)
+        if options.get("tool_choice") is not None:
+            choice = options["tool_choice"]
+            if isinstance(choice, Mapping):
+                function = choice.get("function")
+                selected = function if isinstance(function, Mapping) else choice
+                choice = str((selected.get("name") if isinstance(selected, Mapping) else "") or "auto")
+            if choice != "none":
+                body["tool_choice"] = choice
+        if options.get("parallel_tool_calls") is not None:
+            body["parallel_tool_calls"] = options["parallel_tool_calls"]
+    if not stream:
+        body["stream"] = False
     return body
 
 
@@ -1427,8 +1621,6 @@ async def build_trae_ide_request(
     options: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """构造与 trae2api 一致的 /api/ide/v1/chat 请求体。"""
-    if _tool_protocol_requested(options, messages):
-        raise ValueError("Trae IDE chat cannot safely proxy caller-owned tool policy")
     converted = convert_openai_messages(messages, options)
     session_id = _requested_session_id(options) or generate_session_id_from_messages(
         messages
@@ -1530,9 +1722,11 @@ def convert_openai_messages(
     prepared_messages = sanitize_assistant_history_messages(
         _messages_with_client_runtime(messages, options)
     )
+    tool_names = raw_client._tool_call_name_map(messages)
     for m in prepared_messages:
         role = m.get("role", "user")
         content = m.get("content", "")
+        renderer_results = raw_client._renderer_tool_result_blocks(content)
         if isinstance(content, list):
             parts = []
             for block in content:
@@ -1542,18 +1736,31 @@ def convert_openai_messages(
                     elif block.get("text"):
                         parts.append(block["text"])
             content = "\n".join(parts)
+            if renderer_results:
+                content = raw_client._renderer_tool_result_context(
+                    m.get("content"), tool_names
+                )
+                # Renderer results are already fully correlated above. Treat
+                # them as inert user history so an outer ``role=tool`` wrapper
+                # does not prepend a second, less precise result label.
+                role = "user"
         elif content is None:
             content = ""
         elif not isinstance(content, str):
             content = str(content)
         if role == "assistant":
             tool_history = raw_client._serialize_tool_calls(m.get("tool_calls"))
+            if not tool_history:
+                tool_history = raw_client._serialize_tool_calls(
+                    raw_client._renderer_tool_use_blocks(m.get("content"))
+                )
             if tool_history:
                 content = "\n\n".join(part for part in (content, tool_history) if part)
         elif role == "tool":
             tool_id = m.get("tool_call_id") or "unknown"
             tool_name = m.get("name") or "tool"
-            content = f"Client tool result [{tool_id}] {tool_name}:\n{content}"
+            status = "failed" if tool_result_is_failed(m) else "succeeded"
+            content = f"Client tool result [{tool_id}] {tool_name} status={status}:\n{content}"
             role = "user"
         elif role == "developer":
             role = "system"
@@ -1568,11 +1775,6 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
 
     返回 IdeChatResponse 包装对象，调用方消费完流式内容后需调用 .close()。
     """
-    if _tool_protocol_requested(options, messages):
-        raise RuntimeError(
-            "Trae IDE endpoints cannot safely proxy caller-owned tool policy"
-        )
-
     from . import auth as auth_module
 
     # A relay session captures its credential before dispatch.  Keep that
@@ -1605,26 +1807,64 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
         or auth.get_user_id()
         or ""
     ).strip()
-    base = str(
-        options.get("_auth_host")
-        or bound_record.get("host")
-        or os.environ.get("TRAE_API_HOST", "")
-        or auth.get_auth().host
-        or "https://trae-api-cn.mchost.guru"
+    base = _model_gateway_base(
+        options.get("_auth_host"),
+        bound_record.get("host"),
+        os.environ.get("TRAE_API_HOST", ""),
+        getattr(auth.get_auth(), "host", ""),
     )
-    base = base.rstrip("/")
 
     model_name = convert_model_name(model)
     max_tokens = options.get("maxTokens") or options.get("max_tokens")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     errors: list[str] = []
 
-    for endpoint in IDE_ENDPOINTS:
+    requested_endpoint = str(options.get("_ide_endpoint") or "").strip()
+    if requested_endpoint and requested_endpoint not in IDE_ENDPOINTS:
+        raise ValueError(f"Unsupported IDE endpoint: {requested_endpoint}")
+    endpoints = [requested_endpoint] if requested_endpoint else IDE_ENDPOINTS
+    for endpoint in endpoints:
+        endpoint_headers = build_headers(
+            token_override=bound_token,
+            user_id_override=bound_user_id,
+        )
+        # Match TraeWork's SOLO headers for llm_utils_chat/ide-v1.  The
+        # account OAuth host and the old IDE version headers are accepted by
+        # some endpoints but produce a generic "param is invalid" response on
+        # the current gateway.
+        endpoint_headers.update(
+            {
+                "x-app-version": "default",
+                "x-app-version-code": SOLO_GATEWAY_VERSION_CODE,
+                "x-ide-version": SOLO_GATEWAY_VERSION,
+                "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
+                "x-ide-version-type": "stable",
+                "x-device-brand": SOLO_DEVICE_BRAND,
+                "x-os-version": SOLO_OS_VERSION,
+                "request-traffic-type": "prod",
+                "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
+            }
+        )
+        if endpoint == "/api/agent/v3/create_agent_task":
+            endpoint_headers.update(
+                {
+                    "x-app-id": WORK_AGENT_APP_ID_CHAT,
+                    "x-device-type": "macos",
+                    "x-device-platform": "darwin",
+                    "x-platform": "darwin",
+                    "x-os": "darwin",
+                    "x-ostype": "darwin",
+                    "x-system": "darwin",
+                    "x-ide-version": WORK_AGENT_VERSION,
+                    "x-ide-version-code": WORK_AGENT_VERSION_CODE,
+                    "x-app-version-code": WORK_AGENT_VERSION_CODE,
+                    "x-version-code": WORK_AGENT_VERSION_CODE,
+                    "request-traffic-type": "prod",
+                    "User-Agent": f"Trae/{WORK_AGENT_VERSION}",
+                }
+            )
         client = httpx.Client(
-            headers=build_headers(
-                token_override=bound_token,
-                user_id_override=bound_user_id,
-            ),
+            headers=endpoint_headers,
             timeout=timeout,
             http2=False,
         )
@@ -1636,6 +1876,8 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                     max_tokens,
                     options,
                 )
+            elif endpoint == "/api/agent/v3/create_agent_task":
+                trae_req = build_work_agent_body(messages, model_name, stream, options)
             else:
                 trae_req = build_llm_chat_body(
                     messages,
@@ -1644,8 +1886,9 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                     max_tokens,
                     options,
                 )
-            logger.info("trae-client: POST %s%s model=%s", base, endpoint, model_name)
-            request = client.build_request("POST", base + endpoint, json=trae_req)
+            request_base = WORK_AGENT_HOST if endpoint == "/api/agent/v3/create_agent_task" else base
+            logger.info("trae-client: POST %s%s model=%s tools=%s", request_base, endpoint, model_name, _tool_protocol_requested(options, messages))
+            request = client.build_request("POST", request_base + endpoint, json=trae_req)
             resp = await asyncio.to_thread(client.send, request, stream=True)
             if resp.status_code == 200:
                 return IdeChatResponse(response=resp, client=client)

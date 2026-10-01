@@ -1098,6 +1098,23 @@ def _stable_tool_id(name: str, arguments: str, index: int = 0) -> str:
     return f"call_{digest}"
 
 
+_PLACEHOLDER_TOOL_IDS = {
+    "id", "unique-id", "unique_id", "call_id", "tool_call_id", "<id>",
+    "{id}", "xxx", "...", "string", "null", "none", "undefined",
+}
+
+
+def _is_placeholder_tool_id(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text.startswith("<") and text.endswith(">"):
+        return True
+    if text.startswith("{") and text.endswith("}"):
+        return True
+    return text.lower() in _PLACEHOLDER_TOOL_IDS
+
+
 def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Optional[dict]:
     """Normalize Trae/native/text tool-call shapes to an OpenAI call object.
 
@@ -1125,6 +1142,10 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         raw_id = _string_or_empty(function.get("id")) or _string_or_empty(
             function.get("toolCallId")
         )
+    if _is_placeholder_tool_id(raw_id):
+        # Models sometimes copy the prompt example verbatim (``<unique-id>``,
+        # ``call_1``-style templates). Such ids collide across turns.
+        raw_id = ""
     name = (
         _string_or_empty(function.get("name"))
         or _string_or_empty(raw.get("name"))
@@ -1387,6 +1408,36 @@ def completed_tool_signatures(messages: Any) -> set[str]:
         return set()
     call_signatures: dict[str, str] = {}
     tool_indexes: dict[str, int] = {}
+
+    def renderer_blocks(message: Mapping[str, Any], block_type: str) -> list[Mapping[str, Any]]:
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+        return [
+            block
+            for block in content
+            if isinstance(block, Mapping)
+            and str(block.get("type") or "").strip().lower() == block_type
+        ]
+
+    def renderer_call_id(block: Mapping[str, Any]) -> str:
+        return _string_or_empty(
+            block.get("toolCallId")
+            or block.get("tool_call_id")
+            or block.get("call_id")
+            or block.get("id")
+        )
+
+    def renderer_result_only(message: Mapping[str, Any]) -> bool:
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        blocks = [block for block in content if isinstance(block, Mapping)]
+        return bool(blocks) and all(
+            str(block.get("type") or "").strip().lower() == "tool_result"
+            for block in blocks
+        )
+
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
@@ -1399,7 +1450,22 @@ def completed_tool_signatures(messages: Any) -> set[str]:
                         signature = tool_call_signature(call)
                         if signature:
                             call_signatures[str(call["id"])] = signature
-        elif message.get("role") in {"tool", "function"}:
+            function_call = message.get("function_call")
+            if isinstance(function_call, Mapping):
+                call = normalize_tool_call(function_call, index=index)
+                if call and call.get("id"):
+                    signature = tool_call_signature(call)
+                    if signature:
+                        call_signatures[str(call["id"])] = signature
+            # TraeWork renderer history uses assistant content blocks instead
+            # of an OpenAI ``tool_calls`` array.
+            for block in renderer_blocks(message, "tool_use"):
+                call = normalize_tool_call(block, index=index)
+                if call and call.get("id"):
+                    signature = tool_call_signature(call)
+                    if signature:
+                        call_signatures[str(call["id"])] = signature
+        if message.get("role") in {"tool", "function"}:
             call_id = _string_or_empty(
                 message.get("tool_call_id")
                 or message.get("toolCallId")
@@ -1407,6 +1473,13 @@ def completed_tool_signatures(messages: Any) -> set[str]:
             )
             if call_id and call_id in call_signatures and not tool_result_is_failed(message):
                 tool_indexes[call_id] = index
+        # Renderer results are usually ``role=user`` content blocks. Treat
+        # them as execution results, not as a fresh user turn.
+        for block in renderer_blocks(message, "tool_result"):
+            call_id = renderer_call_id(block)
+            if call_id and call_id in call_signatures:
+                if not tool_result_is_failed({"content": [block]}):
+                    tool_indexes[call_id] = index
 
     protected: set[str] = set()
     for call_id, result_index in tool_indexes.items():
@@ -1416,6 +1489,7 @@ def completed_tool_signatures(messages: Any) -> set[str]:
         if any(
             isinstance(message, dict)
             and message.get("role") == "user"
+            and not renderer_result_only(message)
             for message in messages[result_index + 1 :]
         ):
             continue
@@ -1619,7 +1693,9 @@ def _rekeyed_tool_call_id(call: Mapping[str, Any], taken: Mapping[str, Any]) -> 
 
 def _iter_native_tool_calls(result: dict) -> list[dict]:
     candidates: list[Any] = []
-    for key in ("tool_calls", "tool_call", "function_call"):
+    for key in (
+        "tool_calls", "tool_call", "function_call", "tool_call_info", "toolCallInfo"
+    ):
         value = result.get(key)
         if isinstance(value, list):
             candidates.extend(value)
@@ -1627,7 +1703,10 @@ def _iter_native_tool_calls(result: dict) -> list[dict]:
             candidates.append(value)
     message = result.get("message")
     if isinstance(message, dict):
-        for key in ("tool_calls", "tool_call", "function_call"):
+        for key in (
+            "tool_calls", "tool_call", "function_call", "tool_call_info",
+            "toolCallInfo",
+        ):
             value = message.get(key)
             if isinstance(value, list):
                 candidates.extend(value)

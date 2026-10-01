@@ -122,6 +122,7 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(request["headers"]["Authorization"], "Cloud-IDE-JWT jwt-token")
         body = request["json"]
         self.assertEqual(body["initial_message"]["agent_type"], "solo_agent_remote")
+        self.assertEqual(body["initial_message"]["agent_id"], "solo_agent_remote")
         self.assertEqual(body["initial_message"]["model_selection_strategy"], "auto")
         self.assertIn("hello", body["initial_message"]["query"])
 
@@ -152,6 +153,7 @@ class RemoteClientTests(unittest.TestCase):
         (_session, (_url, request)) = asyncio.run(run())
         initial = request["json"]["initial_message"]
         self.assertEqual(initial["agent_type"], "solo_work_remote")
+        self.assertEqual(initial["agent_id"], "solo_work_remote")
         self.assertEqual(initial["model_selection_strategy"], "manual")
 
     def test_work_model_lookup_uses_work_tier(self):
@@ -179,6 +181,120 @@ class RemoteClientTests(unittest.TestCase):
 
         resolve = asyncio.run(run())
         self.assertEqual(resolve.await_args.kwargs["agent_type"], "solo_work_remote")
+
+    def test_tier_aware_model_resolver_receives_default_agent_type(self):
+        async def run():
+            client = _Client()
+            captured = {}
+
+            async def resolve(
+                model_name,
+                *,
+                token_override="",
+                user_id_override="",
+                provider_specific=None,
+                agent_type="",
+            ):
+                captured.update(
+                    model_name=model_name,
+                    token=token_override,
+                    user_id=user_id_override,
+                    provider_specific=provider_specific,
+                    agent_type=agent_type,
+                )
+                return {
+                    "name": model_name,
+                    "config_name": model_name,
+                    "model_name": model_name,
+                    "config_source": 1,
+                }
+
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=resolve,
+            ):
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={"_account_id": "account-1", "provider_specific": {}},
+                )
+            return captured
+
+        captured = asyncio.run(run())
+        self.assertEqual(captured["agent_type"], "solo_agent_remote")
+        self.assertEqual(captured["model_name"], "glm-5.3")
+
+    def test_legacy_model_resolver_without_agent_type_remains_supported(self):
+        async def run():
+            client = _Client()
+            captured = {}
+
+            async def resolve(
+                model_name,
+                *,
+                token_override="",
+                user_id_override="",
+                provider_specific=None,
+            ):
+                captured.update(
+                    model_name=model_name,
+                    token=token_override,
+                    user_id=user_id_override,
+                    provider_specific=provider_specific,
+                )
+                return {
+                    "name": model_name,
+                    "config_name": model_name,
+                    "model_name": model_name,
+                    "config_source": 1,
+                }
+
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=resolve,
+            ):
+                result = await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={"_account_id": "account-1", "provider_specific": {}},
+                )
+            return result, captured
+
+        result, captured = asyncio.run(run())
+        self.assertEqual(result, ("s1", "m1"))
+        self.assertEqual(captured["model_name"], "glm-5.3")
+
+    def test_mismatched_model_config_is_rejected_before_session_create(self):
+        async def run():
+            client = _Client()
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=AsyncMock(
+                    return_value={
+                        "name": "kimi-k2.6",
+                        "config_name": "kimi-k2.6",
+                        "model_name": "kimi-k2.6",
+                    }
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "model binding mismatch"):
+                    await trae_remote_client.create_session(
+                        client,
+                        "jwt-token",
+                        "glm-5.3",
+                        [{"role": "user", "content": "hello"}],
+                    )
+            return client
+
+        client = asyncio.run(run())
+        self.assertEqual(client.posts, [])
 
     def test_manual_model_sends_account_bound_custom_model(self):
         async def run():
@@ -410,6 +526,163 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(headers["X-Preferenced-Language"], "zh-CN")
         self.assertEqual(headers["x-user-region"], "CN")
 
+    def test_work_billing_overlay_is_opt_in_and_injects_wire_fields(self):
+        async def run():
+            client = _Client()
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=AsyncMock(
+                    return_value={
+                        "name": "glm-5.3",
+                        "config_name": "glm-5.3",
+                        "model_name": "glm-5.3",
+                        "config_source": 1,
+                    }
+                ),
+            ):
+                result = await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={
+                        "_account_id": "1523296676357308",
+                        "_auth_token": "jwt-token",
+                        "provider_specific": {},
+                        "_remote_agent_type": "solo_work_remote",
+                        "_trae_mode": "work",
+                        "_work_billing_overlay": True,
+                    },
+                )
+            return result, client.posts[0]
+
+        (session, (url, request)) = asyncio.run(run())
+        self.assertEqual(session, ("s1", "m1"))
+        self.assertTrue(url.endswith("/chat_sessions"))
+        headers = request["headers"]
+        self.assertEqual(headers["X-Trae-Client-Type"], "lite")
+        self.assertEqual(headers["request-traffic-type"], "prod")
+        self.assertEqual(headers["x-trae-work"], "1")
+        self.assertEqual(headers["x-bridge-transport"], "aha")
+        body = request["json"]
+        self.assertEqual(body["origin"], "lite")
+        self.assertEqual(body["product_code"], "SOLO_Lite")
+        self.assertEqual(body["billing_source"], "work")
+        initial = body["initial_message"]
+        self.assertEqual(initial["entitlement_id"], "335006824194")
+        self.assertEqual(initial["available_endpoint"], 1)
+        self.assertEqual(initial["billing_source"], "work")
+        self.assertEqual(initial["product_code"], "SOLO_Lite")
+        self.assertEqual(
+            initial["model_auto_selection"],
+            {
+                "strategy": "manual",
+                "fallback_to_advance_model": None,
+                "entitlement_id": "335006824194",
+            },
+        )
+        common = json.loads(initial["common_params"])
+        self.assertEqual(common["entitlement_id"], "335006824194")
+        self.assertEqual(common["available_endpoint"], 1)
+        self.assertEqual(common["billing_source"], "work")
+        self.assertEqual(common["product_code"], "SOLO_Lite")
+
+    def test_work_billing_overlay_disabled_by_default(self):
+        async def run():
+            client = _Client()
+            with (
+                patch.dict(
+                    trae_remote_client.os.environ,
+                    {"TRAE_REMOTE_WORK_BILLING": "0"},
+                ),
+                patch.object(
+                    trae_remote_client.trae_client,
+                    "resolve_model_config",
+                    new=AsyncMock(
+                        return_value={
+                            "name": "glm-5.3",
+                            "config_name": "glm-5.3",
+                            "model_name": "glm-5.3",
+                            "config_source": 1,
+                        }
+                    ),
+                ),
+            ):
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={
+                        "_account_id": "1329782626198720",
+                        "_auth_token": "jwt-token",
+                        "provider_specific": {},
+                        "_remote_agent_type": "solo_work_remote",
+                        "_trae_mode": "work",
+                    },
+                )
+            return client.posts[0]
+
+        (_url, request) = asyncio.run(run())
+        headers = request["headers"]
+        self.assertEqual(headers["X-Trae-Client-Type"], "web")
+        self.assertNotIn("x-trae-work", headers)
+        body = request["json"]
+        self.assertEqual(body["origin"], "web")
+        initial = body["initial_message"]
+        self.assertNotIn("entitlement_id", initial)
+        self.assertNotIn("available_endpoint", initial)
+        self.assertNotIn("billing_source", initial)
+        self.assertNotIn("model_auto_selection", initial)
+
+    def test_work_billing_env_header_enables_lite_without_body_overlay(self):
+        async def run():
+            client = _Client()
+            with (
+                patch.dict(
+                    trae_remote_client.os.environ,
+                    {"TRAE_REMOTE_WORK_BILLING": "1"},
+                ),
+                patch.object(
+                    trae_remote_client.trae_client,
+                    "resolve_model_config",
+                    new=AsyncMock(
+                        return_value={
+                            "name": "glm-5.3",
+                            "config_name": "glm-5.3",
+                            "model_name": "glm-5.3",
+                            "config_source": 1,
+                        }
+                    ),
+                ),
+            ):
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={
+                        "_account_id": "1523296676357308",
+                        "_auth_token": "jwt-token",
+                        "provider_specific": {},
+                        "_remote_agent_type": "solo_work_remote",
+                        "_trae_mode": "work",
+                    },
+                )
+            return client.posts[0]
+
+        (_url, request) = asyncio.run(run())
+        self.assertEqual(request["headers"]["X-Trae-Client-Type"], "lite")
+        self.assertNotIn("x-trae-work", request["headers"])
+        body = request["json"]
+        self.assertEqual(body["origin"], "web")
+        initial = body["initial_message"]
+        self.assertNotIn("entitlement_id", initial)
+        self.assertNotIn("available_endpoint", initial)
+        self.assertNotIn("billing_source", initial)
+        self.assertNotIn("model_auto_selection", initial)
+
     def test_stream_events_handles_split_sse_frames(self):
         async def run():
             client = _Client()
@@ -477,6 +750,22 @@ class RemoteClientTests(unittest.TestCase):
         self.assertTrue(raised.exception.retryable)
         self.assertFalse(raised.exception.observed_model_event)
 
+    def test_stream_events_eof_after_model_event_without_done_is_incomplete(self):
+        async def run():
+            client = _Client()
+            client.stream = lambda *_args, **_kwargs: _StreamResponseWithEvents([
+                b'event: plan_item\ndata: {"id":"p1","thought":"partial"}\n\n',
+            ])
+            return [
+                item
+                async for item in trae_remote_client.stream_events(
+                    client, "jwt-token", "s1", "m1"
+                )
+            ]
+
+        with self.assertRaises(trae_remote_client.RemoteStreamIncomplete):
+            asyncio.run(run())
+
     def test_stream_events_does_not_retry_read_timeout_after_first_event(self):
         async def run():
             client = _Client()
@@ -494,6 +783,114 @@ class RemoteClientTests(unittest.TestCase):
             asyncio.run(run())
         self.assertFalse(raised.exception.retryable)
         self.assertTrue(raised.exception.observed_model_event)
+
+    def test_stream_events_treats_early_error_as_retryable_setup_failure(self):
+        async def upstream():
+            yield "heartbeat", {}
+            yield "error", {"code": 2001, "message": "app config record not found"}
+
+        async def run():
+            with patch.object(
+                trae_remote_client,
+                "_stream_events_unbounded",
+                return_value=upstream(),
+            ):
+                return [
+                    item
+                    async for item in trae_remote_client.stream_events(
+                        _Client(), "jwt-token", "s1", "m1"
+                    )
+                ]
+
+        with self.assertRaises(trae_remote_client.RemoteFirstEventError) as raised:
+            asyncio.run(run())
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(raised.exception.observed_model_event)
+        self.assertIn("record not found", str(raised.exception))
+
+    def test_heartbeat_does_not_consume_first_model_event_timeout(self):
+        async def upstream():
+            yield "heartbeat", {}
+            await asyncio.sleep(60)
+
+        async def run():
+            with (
+                patch.object(
+                    trae_remote_client,
+                    "_stream_events_unbounded",
+                    return_value=upstream(),
+                ),
+                patch.dict(
+                    trae_remote_client.os.environ,
+                    {"TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS": "0.01"},
+                ),
+            ):
+                return [
+                    item
+                    async for item in trae_remote_client.stream_events(
+                        _Client(), "jwt-token", "s1", "m1"
+                    )
+                ]
+
+        with self.assertRaises(trae_remote_client.RemoteFirstEventTimeout):
+            asyncio.run(run())
+
+    def test_remote_stream_without_done_does_not_emit_public_done(self):
+        async def run():
+            async def events(*_args, **_kwargs):
+                yield "plan_item", {"id": "p1", "thought": "partial"}
+                raise trae_remote_client.RemoteStreamIncomplete(
+                    "Trae remote event stream ended without a done event"
+                )
+
+            async def fake_create(client, token, model, msgs, *, options=None):
+                return ("session-1", "message-1")
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "jwt-token", "provider_specific": {}},
+                ),
+                patch.object(
+                    main_module.trae_client,
+                    "acquire_web_slot",
+                    new=AsyncMock(),
+                ),
+                patch.object(
+                    main_module.trae_client,
+                    "release_web_slot",
+                ),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "create_session",
+                    new=fake_create,
+                ),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "stream_events",
+                    side_effect=lambda *_args, **_kwargs: events(),
+                ),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "stop_session",
+                    new=AsyncMock(),
+                ),
+            ):
+                response = await main_module.run_remote_session(
+                    [{"role": "user", "content": "hello"}],
+                    "glm-5.3",
+                    True,
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "jwt-token",
+                    },
+                )
+                chunks = [chunk async for chunk in response.body_iterator]
+            return chunks
+
+        with self.assertRaises(trae_remote_client.RemoteStreamIncomplete):
+            asyncio.run(run())
 
     def test_stream_work_first_event_timeout_rotates_account(self):
         async def run():
@@ -755,7 +1152,7 @@ class RemoteClientTests(unittest.TestCase):
         self.assertIn(anchor, bounded)
         self.assertEqual(bounded[-1]["content"], "继续")
 
-    def test_remote_caller_tools_use_work_executor(self):
+    def test_remote_caller_tools_default_to_work_executor(self):
         async def empty_events():
             if False:
                 yield None
@@ -804,6 +1201,60 @@ class RemoteClientTests(unittest.TestCase):
         captured = asyncio.run(run())
         self.assertEqual(captured["_remote_agent_type"], "solo_work_remote")
         self.assertEqual(captured["_session_variant"], "caller-tools-work")
+
+    def test_remote_caller_tools_can_explicitly_use_agent_executor(self):
+        async def empty_events():
+            if False:
+                yield None
+
+        async def run():
+            captured = {}
+
+            async def fake_create(client, token, model, msgs, *, options=None):
+                captured.update(dict(options or {}))
+                return ("work-session", "work-message")
+
+            with (
+                patch.dict(
+                    main_module.os.environ,
+                    {"TRAE_REMOTE_CALLER_TOOLS_USE_WORK": "0"},
+                ),
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "jwt-token", "provider_specific": {}},
+                ),
+                patch.object(main_module.trae_client, "acquire_web_slot", new=AsyncMock()),
+                patch.object(main_module.trae_client, "release_web_slot"),
+                patch.object(main_module.trae_remote_client, "create_session", new=fake_create),
+                patch.object(main_module.trae_remote_client, "stream_events", return_value=empty_events()),
+                patch.object(main_module.trae_remote_client, "stop_session", new=AsyncMock()),
+                patch.object(main_module, "collect_nonstream_web", new=AsyncMock(return_value={"choices": []})),
+                patch.object(main_module, "_track_usage_from_result", return_value=None),
+            ):
+                await main_module.run_remote_session(
+                    [{"role": "user", "content": "download the file"}],
+                    "glm-5.3",
+                    False,
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "jwt-token",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "download_file",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                    },
+                )
+            return captured
+
+        captured = asyncio.run(run())
+        self.assertNotIn("_remote_agent_type", captured)
+        self.assertNotIn("_session_variant", captured)
 
     def test_remote_slot_is_released_once_when_nonstream_translation_fails(self):
         async def empty_events():
@@ -956,6 +1407,70 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(len(create_calls), 2)
         self.assertEqual(create_calls[1]["_remote_agent_type"], "solo_work_remote")
+
+    def test_nonstream_fallback_rebinds_usage_to_work_message(self):
+        async def empty_events():
+            if False:
+                yield None
+
+        async def run():
+            tracker = main_module._UsageTracker(
+                "glm-5.3",
+                "/v1/chat/completions",
+                False,
+                {"_account_id": "account-1", "_auth_token": "jwt-token"},
+            )
+            create_count = 0
+
+            async def fake_create(client, token, model, msgs, *, options=None):
+                nonlocal create_count
+                create_count += 1
+                return (
+                    f"session-{create_count}",
+                    "agent-empty-message" if create_count == 1 else "work-success-message",
+                )
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "jwt-token", "provider_specific": {}},
+                ),
+                patch.object(main_module.trae_client, "acquire_web_slot", new=AsyncMock()),
+                patch.object(main_module.trae_client, "release_web_slot"),
+                patch.object(main_module.trae_remote_client, "create_session", new=fake_create),
+                patch.object(
+                    main_module.trae_remote_client,
+                    "stream_events",
+                    side_effect=lambda *args, **kwargs: empty_events(),
+                ),
+                patch.object(main_module.trae_remote_client, "stop_session", new=AsyncMock()),
+                patch.object(
+                    main_module,
+                    "collect_nonstream_web",
+                    new=AsyncMock(
+                        side_effect=[
+                            main_module.EmptyUpstreamResponse("empty", retryable=True),
+                            {"choices": [{"message": {"content": "ok"}}]},
+                        ]
+                    ),
+                ),
+                patch.object(main_module, "_track_usage_from_result", return_value=None),
+                patch.object(main_module, "_USAGE_TRACKER", main_module.ContextVar("test_usage_tracker")),
+            ):
+                context_token = main_module._USAGE_TRACKER.set(tracker)
+                try:
+                    await main_module.run_remote_session(
+                        [{"role": "user", "content": "hello"}],
+                        "glm-5.3",
+                        False,
+                        {"_account_id": "account-1", "_auth_token": "jwt-token"},
+                    )
+                finally:
+                    main_module._USAGE_TRACKER.reset(context_token)
+            return tracker.usage_turn_id
+
+        self.assertEqual(asyncio.run(run()), "work-success-message")
 
     def test_explicit_work_does_not_fallback_to_itself(self):
         async def run():
@@ -1115,6 +1630,99 @@ class RemoteClientTests(unittest.TestCase):
                 patch.object(main_module, "run_remote_session", new=fake_remote),
             ):
                 with self.assertRaisesRegex(RuntimeError, "All remote accounts busy"):
+                    await main_module._run_remote_with_retry(
+                        [{"role": "user", "content": "hello"}],
+                        "glm-5.3",
+                        False,
+                        {"_account_id": "account-a", "_auth_token": "token-a"},
+                    )
+                return rotate
+
+        rotate = asyncio.run(run())
+        self.assertEqual(calls, ["account-a", "account-b"])
+        rotate.assert_called_once()
+
+    def test_remote_retry_rotates_when_model_is_not_bound(self):
+        calls = []
+
+        async def fake_remote(_messages, _model, _stream, options):
+            calls.append(str((options or {}).get("_account_id") or ""))
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Trae remote model is not available for the bound account: glm-5.3"
+                )
+            return "ok"
+
+        async def run():
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_polling_status",
+                    return_value={"enabled": True},
+                ),
+                patch.object(
+                    main_module.auth,
+                    "list_accounts",
+                    return_value=[
+                        {"id": "account-a", "is_valid": True},
+                        {"id": "account-b", "is_valid": True},
+                    ],
+                ),
+                patch.object(main_module.auth, "next_polling_account") as rotate,
+                patch.object(
+                    main_module.auth,
+                    "get_active_account_snapshot",
+                    return_value=("account-b", {"token": "token-b"}),
+                ),
+                patch.object(main_module, "run_remote_session", new=fake_remote),
+            ):
+                return await main_module._run_remote_with_retry(
+                    [{"role": "user", "content": "hello"}],
+                    "glm-5.3",
+                    False,
+                    {"_account_id": "account-a", "_auth_token": "token-a"},
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, ["account-a", "account-b"])
+
+    def test_remote_retry_preserves_model_unavailable_after_all_accounts(self):
+        calls = []
+
+        async def fake_remote(_messages, _model, _stream, options):
+            calls.append(str((options or {}).get("_account_id") or ""))
+            raise RuntimeError(
+                "Trae remote model is not available for the bound account: glm-5.3"
+            )
+
+        async def run():
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_polling_status",
+                    return_value={"enabled": True},
+                ),
+                patch.object(
+                    main_module.auth,
+                    "list_accounts",
+                    return_value=[
+                        {"id": "account-a", "is_valid": True},
+                        {"id": "account-b", "is_valid": True},
+                    ],
+                ),
+                patch.object(main_module.auth, "next_polling_account") as rotate,
+                patch.object(
+                    main_module.auth,
+                    "get_active_account_snapshot",
+                    return_value=("account-b", {"token": "token-b"}),
+                ),
+                patch.object(main_module, "run_remote_session", new=fake_remote),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "remote model is not available for the bound account",
+                ):
                     await main_module._run_remote_with_retry(
                         [{"role": "user", "content": "hello"}],
                         "glm-5.3",
@@ -1393,3 +2001,101 @@ class RemoteClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _StreamResponseWithEvents:
+    status_code = 200
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
+class RemoteReasoningEffortTests(unittest.TestCase):
+    def test_reasoning_effort_reaches_custom_model(self):
+        async def run():
+            client = _Client()
+            custom = {
+                "name": "glm-5.3",
+                "config_name": "glm-5.3",
+                "model_name": "glm-5.3",
+                "config_source": 1,
+                "reasoning_effort_config": {
+                    "support_thinking": True,
+                    "options": ["light", "high"],
+                    "default_level": "high",
+                },
+            }
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=AsyncMock(return_value=custom),
+            ):
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={"reasoning_effort": "low"},
+                )
+            return client.posts[0]
+
+        _url, request = asyncio.run(run())
+        model = request["json"]["initial_message"]["custom_model"]
+        self.assertEqual(model["reasoning_effort"], "light")
+
+    def test_work_tier_borrows_agent_tier_effort_config(self):
+        work_model = {
+            "name": "glm-5.3",
+            "config_name": "glm-5.3",
+            "model_name": "glm-5.3",
+            "config_source": 1,
+        }
+        agent_model = dict(
+            work_model,
+            reasoning_effort_config={
+                "support_thinking": True,
+                "options": ["light", "high", "extra_high"],
+            },
+        )
+
+        async def resolver(_name, **kwargs):
+            if kwargs.get("agent_type") == "solo_agent_remote":
+                return agent_model
+            return work_model
+
+        async def run():
+            client = _Client()
+            trace = {}
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=resolver,
+            ):
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={
+                        "reasoning_effort": "xhigh",
+                        "_remote_agent_type": "solo_work_remote",
+                        "_upstream_trace": trace,
+                    },
+                )
+            return client.posts[0], trace
+
+        (_url, request), trace = asyncio.run(run())
+        message = request["json"]["initial_message"]
+        self.assertEqual(message["agent_type"], "solo_work_remote")
+        self.assertEqual(message["custom_model"]["reasoning_effort"], "extra_high")
+        self.assertEqual(trace["reasoning_effort_applied"], "extra_high")

@@ -27,6 +27,46 @@ from .cli_client import (
 from .model_limits import clamp_max_completion_tokens
 
 
+def thinking_requested(value: Any = None) -> bool:
+    """Return whether the caller explicitly requested visible thinking.
+
+    Trae exposes reasoning internally even when the public request does not
+    ask for it.  Keep that trace private by default.  Only the explicit
+    ``thinking`` option (boolean or the common ``{type/enabled}`` forms)
+    enables a compact reasoning channel; ``reasoning_effort`` alone controls
+    generation quality and must not accidentally leak the full chain.
+    """
+
+    if isinstance(value, Mapping):
+        # The function is also called with an options/body mapping.  TraeWork
+        # and Anthropic-compatible clients commonly encode the presentation
+        # switch as ``{"type":"enabled"}`` or ``{"enabled":true}``.
+        if "thinking" in value:
+            return thinking_requested(value.get("thinking"))
+        if "include_reasoning" in value:
+            return thinking_requested(value.get("include_reasoning"))
+        if "enabled" in value:
+            return thinking_requested(value.get("enabled"))
+        if "enable" in value:
+            return thinking_requested(value.get("enable"))
+        mode = value.get("type", value.get("mode"))
+        if isinstance(mode, str):
+            return mode.strip().lower() in {
+                "1", "true", "yes", "on", "enabled", "enable",
+                "thinking", "reasoning", "summary", "summarized",
+            }
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "1", "true", "yes", "on", "enabled", "enable", "summary",
+        }
+    return False
+
+
 class ResponsesRequestError(ValueError):
     def __init__(self, message: str, param: Optional[str] = None):
         super().__init__(message)
@@ -245,6 +285,120 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, Mapping):
         return _json_text(content)
     return str(content)
+
+
+def _compact_reasoning_summary(value: Any, *, max_chars: int = 800, max_lines: int = 6) -> str:
+    """Bound client-visible reasoning before it enters a Responses object."""
+
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw in value.splitlines():
+        line = " ".join(raw.strip().split())
+        if not line:
+            continue
+        fingerprint = line.casefold()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[: max_lines - 1] + [lines[-1]]
+    summary = "\n".join(lines)
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 3].rstrip() + "..."
+    return summary
+
+
+def _reasoning_text(value: Any) -> str:
+    """Normalize the common scalar/list reasoning representations."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return _content_to_text(value)
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "summary", "value"):
+            nested = value.get(key)
+            if isinstance(nested, (str, list, tuple)):
+                return _reasoning_text(nested)
+    return ""
+
+
+_REASONING_BLOCK_TYPES = frozenset(
+    {
+        "reasoning",
+        "thinking",
+        "reasoning_text",
+        "reasoning_content",
+        "thinking_text",
+    }
+)
+
+
+def _split_reasoning_content(value: Any) -> tuple[str, str]:
+    """Separate reasoning blocks/tags from ordinary assistant content."""
+
+    if isinstance(value, str):
+        matches = list(
+            re.finditer(
+                r"<(?P<tag>think|thinking)\b[^>]*>(?P<body>[\s\S]*?)</(?P=tag)>",
+                value,
+                flags=re.IGNORECASE,
+            )
+        )
+        if not matches:
+            return "", value
+        reasoning = "\n".join(
+            match.group("body")
+            for match in matches
+            if match.group("body")
+        )
+        visible = re.sub(
+            r"<(?P<tag>think|thinking)\b[^>]*>[\s\S]*?</(?P=tag)>",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+        return reasoning, visible
+    if isinstance(value, Mapping):
+        block_type = str(value.get("type") or "").strip().lower()
+        if block_type in _REASONING_BLOCK_TYPES:
+            return _reasoning_text(value), ""
+        if "text" in value and isinstance(value.get("text"), (str, list, tuple)):
+            return _split_reasoning_content(value.get("text"))
+        if "content" in value and isinstance(
+            value.get("content"), (str, list, tuple, Mapping)
+        ):
+            return _split_reasoning_content(value.get("content"))
+        return "", _content_to_text(value)
+    if isinstance(value, (list, tuple)):
+        reasoning_parts: list[str] = []
+        visible_parts: list[str] = []
+        for part in value:
+            reasoning, visible = _split_reasoning_content(part)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+            if visible:
+                visible_parts.append(visible)
+        return "\n".join(reasoning_parts), "".join(visible_parts)
+    return "", _content_to_text(value)
+
+
+def _reasoning_output_item(summary: str, *, status: str = "completed") -> dict[str, Any]:
+    """Build the standard Responses reasoning output item."""
+
+    return {
+        "id": make_id("rs"),
+        "type": "reasoning",
+        "status": status,
+        "summary": (
+            [{"type": "summary_text", "text": summary}]
+            if summary
+            else []
+        ),
+    }
 
 
 def _unique_chat_name(base: str, used: set[str]) -> str:
@@ -599,6 +753,13 @@ def _append_message_item(messages: list[dict[str, Any]], item: Mapping[str, Any]
         message = {"role": role, "content": text}
         if role == "assistant" and item.get("phase"):
             message["phase"] = item.get("phase")
+        if role == "assistant":
+            reasoning = _reasoning_text(
+                item.get("reasoning_content", item.get("reasoning"))
+            )
+            reasoning = _compact_reasoning_summary(reasoning)
+            if reasoning:
+                message["reasoning_content"] = reasoning
         # Responses clients may replay a Chat-shaped assistant message with
         # its tool_calls embedded rather than as separate function_call items.
         # Preserve the calls so the continuation can correlate call_id before
@@ -611,6 +772,11 @@ def _append_message_item(messages: list[dict[str, Any]], item: Mapping[str, Any]
 def _message_fingerprint(message: Mapping[str, Any]) -> str:
     normalized = dict(message)
     normalized.pop("phase", None)
+    # Reasoning is a presentation-only, bounded side channel.  A client may
+    # replay the visible transcript without that optional field; it must still
+    # overlap-deduplicate against the cached assistant turn.
+    normalized.pop("reasoning_content", None)
+    normalized.pop("reasoning", None)
     return json.dumps(
         normalized,
         ensure_ascii=False,
@@ -954,8 +1120,8 @@ def normalize_request(
                     current_messages.append(
                         {
                             "role": "assistant",
-                            "content": summary,
-                            "phase": "commentary",
+                            "content": None,
+                            "reasoning_content": _compact_reasoning_summary(summary),
                         }
                     )
                 continue
@@ -1008,6 +1174,8 @@ def normalize_request(
         "frequency_penalty",
         "seed",
         "reasoning_effort",
+        "thinking",
+        "include_reasoning",
         "stream_options",
         "response_format",
         "service_tier",
@@ -1020,6 +1188,14 @@ def normalize_request(
     reasoning = body.get("reasoning")
     if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
         options.setdefault("reasoning_effort", reasoning.get("effort"))
+    # Preserve the complete reasoning presentation request for the Chat core.
+    # ``thinking`` is intentionally separate from ``reasoning_effort``: the
+    # latter may be used only to tune generation, while the former opts into a
+    # compact reasoning output item.
+    if "thinking" in body:
+        options["thinking"] = copy.deepcopy(body.get("thinking"))
+    if "include_reasoning" in body:
+        options["include_reasoning"] = copy.deepcopy(body.get("include_reasoning"))
     for key in (
         "client_context",
         "clientContext",
@@ -1159,12 +1335,20 @@ def _assistant_message_from_output(
     output: list[dict[str, Any]], context: ResponsesContext
 ) -> Optional[dict[str, Any]]:
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
 
     for item in output:
         if not isinstance(item, Mapping):
             continue
         item_type = str(item.get("type") or "")
+        if item_type == "reasoning":
+            summary = item.get("summary")
+            summary_text = _reasoning_text(summary)
+            summary_text = _compact_reasoning_summary(summary_text)
+            if summary_text:
+                reasoning_parts.append(summary_text)
+            continue
         if item_type == "message":
             text = _content_to_text(item.get("content"))
             if text:
@@ -1223,12 +1407,17 @@ def _assistant_message_from_output(
             }
         )
 
-    if not text_parts and not tool_calls:
+    reasoning_summary = _compact_reasoning_summary("\n".join(reasoning_parts))
+    if not text_parts and not tool_calls and not reasoning_summary:
         return None
     message: dict[str, Any] = {
         "role": "assistant",
         "content": "\n".join(text_parts) if text_parts else None,
     }
+    if reasoning_summary:
+        # Keep only the bounded public summary in continuation history.  The
+        # full upstream chain is intentionally never replayed to the model.
+        message["reasoning_content"] = reasoning_summary
     if tool_calls:
         message["tool_calls"] = tool_calls
     return message
@@ -1325,7 +1514,26 @@ def completion_to_response(
     tool_calls = message.get("tool_calls")
     tool_calls = tool_calls if isinstance(tool_calls, list) else []
     output: list[dict[str, Any]] = []
-    content = _content_to_text(message.get("content"))
+    embedded_reasoning, visible_content = _split_reasoning_content(
+        message.get("content")
+    )
+    reasoning_summary = _compact_reasoning_summary(
+        "\n".join(
+            part
+            for part in (
+                _reasoning_text(
+                    message.get("reasoning_content")
+                    or message.get("reasoning")
+                    or ""
+                ),
+                embedded_reasoning,
+            )
+            if part
+        )
+    )
+    if thinking_requested(context.request) and reasoning_summary:
+        output.append(_reasoning_output_item(reasoning_summary))
+    content = _content_to_text(visible_content)
     if content:
         output.append(
             {
@@ -1510,6 +1718,80 @@ async def _translate_chat_stream(
     saw_terminal = False
     text_filter = ProtocolTextFilter()
     text_deltas = _StreamDeltaReconciler()
+    reasoning_raw = ""
+    reasoning_item: Optional[dict[str, Any]] = None
+    reasoning_index = -1
+    reasoning_deltas = _StreamDeltaReconciler(suppress_short_replay=True)
+
+    def consume_reasoning(value: Any) -> None:
+        nonlocal reasoning_raw
+        raw = _reasoning_text(value)
+        if not raw:
+            return
+        delta = reasoning_deltas.feed(raw)
+        if delta:
+            reasoning_raw += delta
+
+    def ensure_reasoning_item() -> list[str]:
+        """Reserve a reasoning output slot without exposing raw trace text."""
+
+        nonlocal sequence, reasoning_item, reasoning_index
+        if not thinking_requested(context.request) or reasoning_item is not None:
+            return []
+        reasoning_index = len(outputs)
+        reasoning_item = {
+            "id": make_id("rs"),
+            "type": "reasoning",
+            "status": "in_progress",
+            "summary": [],
+        }
+        outputs.append(reasoning_item)
+        events = [
+            _sse_event(
+                "response.output_item.added",
+                sequence,
+                output_index=reasoning_index,
+                item={**reasoning_item},
+            )
+        ]
+        sequence += 1
+        return events
+
+    def append_reasoning_events(summary: str) -> list[str]:
+        nonlocal sequence, reasoning_item, reasoning_index
+        if not thinking_requested(context.request) or not summary:
+            return []
+        events: list[str] = []
+        if reasoning_item is None:
+            events.extend(ensure_reasoning_item())
+        if not reasoning_item["summary"]:
+            reasoning_item["summary"].append(
+                {"type": "summary_text", "text": ""}
+            )
+            events.append(
+                _sse_event(
+                    "response.reasoning_summary_part.added",
+                    sequence,
+                    item_id=reasoning_item["id"],
+                    output_index=reasoning_index,
+                    summary_index=0,
+                    part=reasoning_item["summary"][0],
+                )
+            )
+            sequence += 1
+        reasoning_item["summary"][0]["text"] += summary
+        events.append(
+            _sse_event(
+                "response.reasoning_summary_text.delta",
+                sequence,
+                item_id=reasoning_item["id"],
+                output_index=reasoning_index,
+                summary_index=0,
+                delta=summary,
+            )
+        )
+        sequence += 1
+        return events
 
     def append_text_events(content: str) -> list[str]:
         nonlocal sequence, text_item, text_index
@@ -1599,6 +1881,17 @@ async def _translate_chat_stream(
             terminal = False
             if chunk.get("usage") is not None:
                 usage = _usage(chunk.get("usage"))
+            # Older Chat adapters put reasoning beside ``choices`` rather
+            # than inside ``choices[*].delta``.  Accept both layouts.
+            for reasoning_key in (
+                "reasoning_content",
+                "reasoningContent",
+                "reasoning",
+                "thinking",
+            ):
+                if chunk.get(reasoning_key) not in (None, "", [], {}):
+                    consume_reasoning(chunk.get(reasoning_key))
+                    break
             if chunk.get("error"):
                 error = chunk.get("error")
                 error = error if isinstance(error, Mapping) else {"message": str(error)}
@@ -1629,8 +1922,37 @@ async def _translate_chat_stream(
                     finish_reason = str(choice.get("finish_reason"))
                 delta = choice.get("delta")
                 if not isinstance(delta, Mapping):
+                    # A few Trae adapters emit a final Chat-shaped
+                    # ``message`` object instead of a ``delta`` frame.  Feed
+                    # it through the same reconcilers so reasoning and text
+                    # remain separated without requiring a provider-specific
+                    # branch.
+                    delta = choice.get("message")
+                if not isinstance(delta, Mapping):
                     continue
-                content = _content_to_text(delta.get("content"))
+                raw_reasoning = ""
+                for reasoning_key in (
+                    "reasoning_content",
+                    "reasoningContent",
+                    "reasoning",
+                    "thinking",
+                ):
+                    candidate = _reasoning_text(delta.get(reasoning_key))
+                    if candidate:
+                        raw_reasoning = candidate
+                        break
+                if raw_reasoning:
+                    consume_reasoning(raw_reasoning)
+                    for event in ensure_reasoning_item():
+                        yield event
+                embedded_reasoning, visible_content = _split_reasoning_content(
+                    delta.get("content")
+                )
+                if embedded_reasoning:
+                    consume_reasoning(embedded_reasoning)
+                    for event in ensure_reasoning_item():
+                        yield event
+                content = _content_to_text(visible_content)
                 content = text_filter.feed(text_deltas.feed(content))
                 for event in append_text_events(content):
                     yield event
@@ -1772,6 +2094,46 @@ async def _translate_chat_stream(
             ),
         )
         return
+
+    reasoning_summary = (
+        _compact_reasoning_summary(reasoning_raw)
+        if thinking_requested(context.request)
+        else ""
+    )
+    if reasoning_summary:
+        # Reasoning is presentation-only.  Collect the upstream trace while
+        # the stream is running, then emit one bounded summary at completion so
+        # cumulative snapshots cannot flood the client or re-expand history.
+        for event in append_reasoning_events(reasoning_summary):
+            yield event
+        if reasoning_item is not None:
+            reasoning_item["status"] = "completed"
+            summary_part = reasoning_item["summary"][0]
+            yield _sse_event(
+                "response.reasoning_summary_text.done",
+                sequence,
+                item_id=reasoning_item["id"],
+                output_index=reasoning_index,
+                summary_index=0,
+                text=summary_part["text"],
+            )
+            sequence += 1
+            yield _sse_event(
+                "response.reasoning_summary_part.done",
+                sequence,
+                item_id=reasoning_item["id"],
+                output_index=reasoning_index,
+                summary_index=0,
+                part=summary_part,
+            )
+            sequence += 1
+            yield _sse_event(
+                "response.output_item.done",
+                sequence,
+                output_index=reasoning_index,
+                item=reasoning_item,
+            )
+            sequence += 1
 
     has_tools = any(state.get("item") for state in tool_states.values())
     if text_item is not None:

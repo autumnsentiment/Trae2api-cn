@@ -668,6 +668,81 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
             self.assertIn("Downloaded 4096 bytes", blob)
             self.assertNotIn("None", blob)
 
+    def test_renderer_user_tool_result_preserves_status_and_call_id(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_download_1",
+                        "name": "download_file",
+                        "parameters": {
+                            "url": "https://example.com/a.zip",
+                            "path": "a.zip",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_download_1",
+                        "value": [{"type": "text", "value": "download denied"}],
+                        "isError": True,
+                    }
+                ],
+            },
+        ]
+
+        flattened = trae_client.flatten_query(messages)
+        structured = json.dumps(
+            trae_client.build_web_content(messages), ensure_ascii=False
+        )
+        converted = trae_client.convert_openai_messages(messages)
+
+        for blob in (flattened, structured, json.dumps(converted, ensure_ascii=False)):
+            self.assertIn("call_download_1", blob)
+            self.assertIn("download_file", blob)
+            self.assertIn("status=failed", blob)
+            self.assertIn("download denied", blob)
+
+        converted_blob = json.dumps(converted, ensure_ascii=False)
+        self.assertEqual(converted_blob.count("Client tool result [call_download_1]"), 1)
+
+    def test_renderer_tool_history_marks_remote_tool_protocol_requested(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "toolCallId": "call_write_1",
+                        "name": "write_file",
+                        "parameters": {"path": "README.md", "content": "ok"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "toolCallId": "call_write_1",
+                        "value": [{"type": "text", "value": "wrote"}],
+                        "isError": False,
+                    }
+                ],
+            },
+        ]
+
+        self.assertTrue(trae_client._tool_protocol_requested({}, messages))
+        prepared = trae_client._messages_with_client_runtime(messages, {})
+        self.assertEqual(prepared[0]["role"], "system")
+        self.assertIn("external client", prepared[0]["content"])
+
 
 class IdeRequestContextTests(unittest.TestCase):
     def test_runtime_prompt_uses_inherited_response_tools(self):
@@ -867,7 +942,7 @@ class IdeRequestContextTests(unittest.TestCase):
         )
         self.assertNotEqual(first, second)
 
-    def test_web_and_ide_helpers_fail_fast_for_tool_policy(self):
+    def test_web_rejects_but_ide_encodes_tool_policy_in_messages(self):
         options = {"tools": [], "tool_choice": "none"}
 
         with self.assertRaisesRegex(RuntimeError, "web remote"):
@@ -880,17 +955,16 @@ class IdeRequestContextTests(unittest.TestCase):
                 )
             )
 
-        with self.assertRaisesRegex(RuntimeError, "IDE endpoints"):
-            asyncio.run(
-                trae_client.send_chat_request(
-                    [{"role": "user", "content": "hello"}],
-                    "auto",
-                    False,
-                    options,
-                )
-            )
+        body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "auto",
+            False,
+            options=options,
+        )
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertIn("Tool choice is none", body["messages"][0]["content"][0]["text"])
 
-    def test_web_and_ide_helpers_fail_fast_for_tool_history(self):
+    def test_web_rejects_but_ide_preserves_tool_history(self):
         messages = [
             {
                 "role": "assistant",
@@ -913,8 +987,64 @@ class IdeRequestContextTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "web remote"):
             asyncio.run(trae_client.create_web_session(None, "auto", messages))
-        with self.assertRaisesRegex(RuntimeError, "IDE endpoints"):
-            asyncio.run(trae_client.send_chat_request(messages, "auto", False))
+        body = trae_client.build_llm_chat_body(messages, "auto", False)
+        joined = "\n".join(
+            block["text"]
+            for message in body["messages"]
+            for block in message.get("content", [])
+            if isinstance(block, dict) and block.get("text")
+        )
+        self.assertIn('"id":"call_1"', joined)
+        self.assertIn("Client tool history", joined)
+        self.assertIn("Client tool result [call_1] read_file", joined)
+
+    def test_model_gateway_does_not_reuse_oauth_host(self):
+        with patch.dict("os.environ", {"TRAE_MODEL_API_HOST": ""}, clear=False):
+            self.assertEqual(
+                trae_client._model_gateway_base("https://api.trae.com.cn"),
+                "https://trae-api-cn.mchost.guru",
+            )
+            self.assertEqual(
+                trae_client._model_gateway_base("https://custom.example"),
+                "https://custom.example",
+            )
+
+    def test_work_agent_body_carries_native_tools(self):
+        options = {
+            "_auth_user_id": "uid-1",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+        body = trae_client.build_work_agent_body(
+            [{"role": "user", "content": "Read README.md"}],
+            "glm-5.3",
+            True,
+            options,
+        )
+        self.assertEqual(body["agent_type"], "solo_work_lite")
+        self.assertEqual(body["config_name"], "glm-5.3")
+        self.assertEqual(body["model_name"], "glm-5.3__dev")
+        self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
+        self.assertIsInstance(body["tools"][0]["function"]["parameters"], str)
+        self.assertFalse(body["parallel_tool_calls"])
+
+    def test_work_agent_host_defaults_to_work_gateway(self):
+        self.assertEqual(
+            trae_client.WORK_AGENT_HOST,
+            "https://api5-normal.mchost.guru",
+        )
 
 
 class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):

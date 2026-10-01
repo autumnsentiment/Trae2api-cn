@@ -21,7 +21,11 @@ from typing import Any, Callable, Mapping, Optional
 import httpx
 
 from . import auth
-from .cli_client import renderer_block_text, strip_tool_call_blocks
+from .cli_client import (
+    renderer_block_text,
+    strip_tool_call_blocks,
+    tool_result_is_failed,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -144,7 +148,9 @@ _KNOWN_MODELS = {
     # These names are the exact raw ids used by TraeWork's bundled client.
     "auto": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
     "coding": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
-    "glm-5.2": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
+    # The raw transport uses the shared GLM v2 model id even though the
+    # public config is glm-5.2 (captured TraeWork Extra/body contract).
+    "glm-5.2": RawModel("glm-5.2", "glm-5__v2", "GLM-5.2"),
     # glm-5.3 is resolved against the account model list when available.
     "glm-5.3": RawModel("glm-5.3", "glm-5.3", "GLM-5.3"),
     "glm-5.1": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
@@ -303,7 +309,7 @@ async def resolve_raw_model_for_request(
                 known = _KNOWN_MODELS.get(mapped.lower())
         except Exception:
             pass
-    if known is not None and normalized != "glm-5.3":
+    if known is not None:
         # These models have exact offline raw ids (for example glm-5.1 maps to
         # glm-5__v2).  The account model list often omits raw_model_name for
         # them and can otherwise make the raw upstream fall back to the
@@ -540,8 +546,9 @@ def build_client_context(
         or os.environ.get("TRAE_CLIENT_SYSTEM_TYPE")
         or "Windows"
     )
-    default_workspace = r"C:\workspace" if "windows" in system_type.lower() else "/workspace"
-    context["workspace_path"] = str(
+    # Never fabricate a workspace path: an invented absolute root makes the
+    # model rewrite the caller's relative paths (``r.txt`` -> ``C:\workspace\r.txt``).
+    workspace_path = str(
         context.get("workspace_path")
         or context.get("workspacePath")
         or _mapping_value(
@@ -553,8 +560,12 @@ def build_client_context(
             "projectPath",
         )
         or os.environ.get("TRAE_CLIENT_WORKSPACE_PATH")
-        or default_workspace
+        or ""
     )
+    if workspace_path:
+        context["workspace_path"] = workspace_path
+    else:
+        context.pop("workspace_path", None)
     context["system_type"] = system_type
     terminal_context = context.get("terminal_context", context.get("terminalContext"))
     if terminal_context is None:
@@ -563,7 +574,7 @@ def build_client_context(
         terminal_context = [
             {
                 "shell": "PowerShell" if "windows" in system_type.lower() else "bash",
-                "cwd": context["workspace_path"],
+                "cwd": workspace_path or ".",
                 "source": "request-inferred",
             }
         ]
@@ -820,16 +831,18 @@ def build_runtime_system_prompt(
         context["tool_discovery"] = discovery
     lines = [
         "You are Trae Code connected to the user's local application.",
-        "The external client application that started this conversation provides the client tools below.",
+        "The external Trae-compatible terminal client application that started this conversation provides the client tools below.",
         "Caller client context (JSON):",
         json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str),
         "Discover the local environment through the available client tools when the request requires it.",
         "If a tool can answer the question, call it proactively and wait for the external client result.",
-        "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, or saved unless a matching client tool result in the conversation confirms success.",
+        "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, patched, or saved unless a later matching client tool result with the same call id confirms success.",
+        "A tool request, emitted tool-call block, plan, or assistant narration is not execution proof. If the matching client result reports failure, state the failure or request a corrective client tool; never report the operation as completed.",
         "Never repeat a completed tool call; do not describe that server's Linux filesystem as the caller workspace.",
-        "To use one, emit exactly one JSON block as your entire response and include no other text:",
-        '<opencode_tool_call>{"id":"<unique-id>","name":"tool_name","input":{}}</opencode_tool_call>',
-        'Replace "<unique-id>" with a new identifier for every call; never reuse an id across calls.',
+        "Client tools are NOT native/server functions: never invoke them through function calling or any built-in tool, and never fall back to server tools (LS, Glob, Read, terminal) to reach the caller's files. The only way to call a client tool is the text block below; a native call reports 'not available' because the tool lives on the client.",
+        "To use tools, emit only one or more JSON blocks and include no prose or final answer in that turn:",
+        '<opencode_tool_call>{"name":"tool_name","input":{}}</opencode_tool_call>',
+        'Do not invent an id field; the client assigns call ids. Keep file paths exactly as the user or tool result gave them.',
         "Fill input according to the selected tool schema and wait for the client result before continuing.",
     ]
     if tool_defs and not native_tools:
@@ -854,7 +867,7 @@ def build_runtime_system_prompt(
             [
                 schema_label,
                 tool_payload,
-                "To call a tool, emit exactly one block per call in this format and no final answer in the same turn: <opencode_tool_call>{\"id\":\"<unique-id>\",\"name\":\"tool_name\",\"input\":{}}</opencode_tool_call>. Replace \"<unique-id>\" with a distinct identifier per call and fill input according to the selected tool schema.",
+                "To call a tool, emit one block per call in this format and no prose or final answer in the same turn: <opencode_tool_call>{\"name\":\"tool_name\",\"input\":{}}</opencode_tool_call>. Omit the id field (the client assigns it), use an exact declared tool name, and fill input according to that tool's schema.",
             "After the client returns a tool result, continue from that result until the user's request is complete.",
             ]
         )
@@ -900,6 +913,16 @@ def _raw_history_message_size(message: Mapping[str, Any]) -> int:
     if tool_payload:
         text += json.dumps(
             tool_payload, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+    renderer_calls = _renderer_tool_use_blocks(message.get("content"))
+    if renderer_calls:
+        text += json.dumps(
+            renderer_calls, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+    renderer_results = _renderer_tool_result_blocks(message.get("content"))
+    if renderer_results:
+        text += json.dumps(
+            renderer_results, ensure_ascii=False, separators=(",", ":"), default=str
         )
     return len(text)
 
@@ -957,14 +980,12 @@ def _compact_raw_history(
 
     # Do not begin a retained continuation with an orphaned tool result when
     # the matching assistant call is the immediately preceding message.
-    if candidates and str(valid[candidates[0]].get("role") or "") == "tool":
+    if candidates and _message_has_tool_results(valid[candidates[0]]):
         first_position = non_system_indexes.index(candidates[0])
         if first_position:
             previous = non_system_indexes[first_position - 1]
             previous_message = valid[previous]
-            if str(previous_message.get("role") or "") == "assistant" and (
-                previous_message.get("tool_calls") or previous_message.get("function_call")
-            ):
+            if _message_has_assistant_tool_calls(previous_message):
                 candidates.insert(0, previous)
 
     keep = set(system_indexes) | set(candidates)
@@ -1028,6 +1049,125 @@ def _renderer_tool_use_blocks(content: Any) -> list[dict[str, Any]]:
             }
         )
     return calls
+
+
+def _renderer_tool_result_blocks(content: Any) -> list[dict[str, Any]]:
+    """Collect renderer ``tool_result`` blocks without losing call identity."""
+
+    if not isinstance(content, list):
+        return []
+    results: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        if str(block.get("type") or "").strip().lower() != "tool_result":
+            continue
+        call_id = str(
+            block.get("toolCallId")
+            or block.get("tool_call_id")
+            or block.get("call_id")
+            or block.get("id")
+            or "unknown"
+        )
+        results.append(
+            {
+                "id": call_id,
+                "name": str(block.get("name") or ""),
+                "content": renderer_block_text(block),
+                "failed": tool_result_is_failed({"content": [block]}),
+            }
+        )
+    return results
+
+
+def _message_has_assistant_tool_calls(message: Mapping[str, Any]) -> bool:
+    return bool(
+        str(message.get("role") or "") == "assistant"
+        and (
+            message.get("tool_calls")
+            or message.get("function_call")
+            or _renderer_tool_use_blocks(message.get("content"))
+        )
+    )
+
+
+def _message_has_tool_results(message: Mapping[str, Any]) -> bool:
+    return bool(
+        str(message.get("role") or "") in {"tool", "function"}
+        or _renderer_tool_result_blocks(message.get("content"))
+    )
+
+
+def _tool_call_name_map(messages: Any) -> dict[str, str]:
+    """Map call ids to tool names across OpenAI and renderer histories."""
+
+    names: dict[str, str] = {}
+    if not isinstance(messages, list):
+        return names
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        calls: list[Any] = []
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            calls.extend(tool_calls)
+        function_call = message.get("function_call")
+        if isinstance(function_call, Mapping):
+            calls.append(function_call)
+        calls.extend(_renderer_tool_use_blocks(message.get("content")))
+        for call in calls:
+            if not isinstance(call, Mapping):
+                continue
+            function = call.get("function")
+            function = function if isinstance(function, Mapping) else call
+            call_id = str(
+                call.get("id")
+                or call.get("tool_call_id")
+                or call.get("toolCallId")
+                or ""
+            ).strip()
+            name = str(function.get("name") or call.get("name") or "").strip()
+            if call_id and name:
+                names[call_id] = name
+    return names
+
+
+def _renderer_tool_result_context(
+    content: Any, tool_names: Optional[Mapping[str, str]] = None
+) -> str:
+    """Serialize renderer results as inert, correlated conversation history."""
+
+    if not isinstance(content, list):
+        return ""
+    tool_names = tool_names or {}
+    parts: list[str] = []
+    found_result = False
+    for block in content:
+        if not isinstance(block, Mapping):
+            text = _content_to_text([block])
+            if text:
+                parts.append(text)
+            continue
+        if str(block.get("type") or "").strip().lower() != "tool_result":
+            text = _content_to_text([block])
+            if text:
+                parts.append(text)
+            continue
+        found_result = True
+        call_id = str(
+            block.get("toolCallId")
+            or block.get("tool_call_id")
+            or block.get("call_id")
+            or block.get("id")
+            or "unknown"
+        )
+        tool_name = str(block.get("name") or tool_names.get(call_id) or "tool")
+        status = "failed" if tool_result_is_failed({"content": [block]}) else "succeeded"
+        result_text = renderer_block_text(block) or "[empty tool result]"
+        parts.append(
+            f"Client tool result [{call_id}] {tool_name} status={status}:\n{result_text}"
+        )
+    return "\n\n".join(parts) if found_result else ""
 
 
 def _serialize_tool_call_context(tool_calls: Any) -> str:
@@ -1194,10 +1334,13 @@ def build_raw_messages(
                 message.get("role") == "tool"
                 or message.get("tool_calls")
                 or message.get("function_call")
+                or _renderer_tool_use_blocks(message.get("content"))
+                or _renderer_tool_result_blocks(message.get("content"))
             )
             for message in messages
         )
     )
+    tool_names = _tool_call_name_map(messages)
     result: list[dict[str, Any]] = []
     if has_tool_protocol or "client_context" in options or "clientContext" in options:
         runtime_prompt = build_runtime_system_prompt(
@@ -1234,20 +1377,28 @@ def build_raw_messages(
                     content = candidate
                     break
         text = _content_to_text(content)
+        renderer_results = _renderer_tool_result_blocks(content)
         # ZCode may replay a truncated relay history preamble as assistant
         # text.  Forwarding that residue to Trae makes the model echo it again
         # on every continuation.  Only sanitize assistant history; user and
         # tool-result content remains authoritative and untouched.
         if role == "assistant" and text:
             text = strip_tool_call_blocks(text)
-        if role == "developer":
+        if renderer_results:
+            # TraeWork serializes tool results as user content blocks. Preserve
+            # the call id and failure state instead of flattening them to an
+            # indistinguishable user sentence.
+            text = _renderer_tool_result_context(content, tool_names)
+            role = "user"
+        elif role == "developer":
             role = "system"
         elif role == "tool":
             call_id = str(
                 message.get("tool_call_id") or message.get("toolCallId") or "unknown"
             )
             tool_name = str(message.get("name") or "tool")
-            text = f"Client tool result [{call_id}] {tool_name}:\n{text}"
+            status = "failed" if tool_result_is_failed(message) else "succeeded"
+            text = f"Client tool result [{call_id}] {tool_name} status={status}:\n{text}"
             role = "user"
         elif role not in ("system", "user", "assistant"):
             role = "user"
