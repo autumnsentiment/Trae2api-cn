@@ -1176,6 +1176,8 @@ def normalize_request(
         "reasoning_effort",
         "thinking",
         "include_reasoning",
+        "trae_max_mode",
+        "max_mode",
         "stream_options",
         "response_format",
         "service_tier",

@@ -121,7 +121,7 @@ docker compose up -d --build
 | `TRAE_REMOTE_MAX_MESSAGES` | `500` | remote 会话保留的非系统历史消息上限 |
 | `TRAE_REMOTE_MAX_HISTORY_CHARS` | `480000` | remote 历史文本字符上限（压缩阶段） |
 | `TRAE_REMOTE_QUERY_MAX_CHARS` | `480000` | remote 扁平化 query 的硬上限；上游超过约 500K 字符会静默结束事件流，超限时从最早的非系统消息开始裁剪 |
-| `TRAE_REMOTE_MAX_MODE` | `0` | remote 会话启用 1M Max 模式；对账号配置 `max_mode=true` 的模型注入 `strategy=max` 与 1M/936K/64K 参数，并使用独立的 max 会话 ID |
+| `TRAE_REMOTE_MAX_MODE` | `0` | 默认值，控制台「1M 上下文」开关保存后以控制台为准（写入 `data/accounts.json`，重启后保留）；remote 会话启用 1M Max 模式；对账号配置 `max_mode=true` 的模型注入 `strategy=max` 与 1M/936K/64K 参数，并使用独立的 max 会话 ID |
 | `TRAE_REMOTE_MAX_MODELS` | 空 | Max 模型白名单，逗号分隔；留空表示所有 `max_mode=true` 模型生效 |
 | `TRAE_REMOTE_MAX_MODE_TYPE` | `1` | 服务端 `get_model_selection_modes` 的模式枚举；`1` 已实测生效 |
 | `TRAE_REMOTE_AGENT_FIRST` | `1` | remote 是否默认锁定 Agent 执行器；关闭后普通请求直接使用 Work |
@@ -236,6 +236,12 @@ raw 模式不会向上游发送其不接受的 OpenAI 顶层工具字段，也�
 
 工具调用属于不可信模型输出。客户端应校验工具名 allowlist 和 JSON schema，并对路径、命令、权限、超时及输出大小做限制。提示词、`client_context`、工具 schema 和工具结果都会发送给 relay/Trae 上游，敏感内容仍需在调用端裁剪。
 
+## 1M 上下文（Max 模式）
+
+在控制台「轮询与设置 → 1M 上下文（Max 模式）」打开开关即可，新会话立即生效，无需重启。「生效模型」留空表示账号中所有标记 `max_mode` 的模型；点「检测支持的模型」可列出当前账号支持 Max 的模型并一键加入。单次请求也可带 `"trae_max_mode": true` 临时开启。
+
+Max 只作用于 Remote 端点的 Agent 会话。带调用端工具的请求默认走 Work（`TRAE_REMOTE_CALLER_TOOLS_USE_WORK=1`），不会使用 Max；IDE Agent / Work Agent / IDE Raw 端点也不使用 Max。模型测试页勾选「1M Max」可确认是否实际生效。
+
 ## 思考内容与思考强度
 
 思考内容默认不对外输出。请求带 `thinking: {"type": "enabled"}`（或 `include_reasoning: true`）时，Chat 返回 `reasoning_content`，Responses 返回独立的 reasoning 事件，正文 `content` 中不会出现思考文本。思考内容默认被压缩为关键结论，设置 `TRAE_VERBOSE_REASONING=1` 可恢复完整输出。
@@ -280,8 +286,8 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 
 - **账号与签到**：上方是授权登录（网页授权、本机助手下载、手动填写凭证），下方是整宽账号列表（账号、用户 ID、状态、有效期、通用积分、签到状态，单账号签到 / 切换 / 删除，以及查询签到状态、查询全部积分、一键轮询签到）
 - **消费记录**：按请求显示模型、tokens、单次积分和状态
-- **轮询与设置**：多账号轮询开关、顺序 / 积分优先模式、上游端点预设与自定义 URL、Relay 端口、模型列表刷新
-- **模型测试**：批量测试模型连通性，可选文本 / 工具探针、思考强度、thinking 输出，并可指定端点（测试期间禁止跨端点回落）
+- **轮询与设置**：多账号轮询开关、顺序 / 积分优先模式、上游端点预设与自定义 URL、Relay 端口、1M 上下文（Max 模式）开关与生效模型（可一键检测账号支持 Max 的模型）
+- **模型测试**：批量测试模型连通性，可选文本 / 工具探针、思考强度、thinking 输出和 1M Max，并可指定端点（测试期间禁止跨端点回落）
 
 ## 使用注意事项
 

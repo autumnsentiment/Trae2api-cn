@@ -841,6 +841,14 @@ async def create_session(
         max_custom_model = _max_mode_custom_model(custom_model)
         initial_message["custom_model"] = max_custom_model
         initial_message.update(_max_mode_fields(max_custom_model, options))
+    max_trace = (options or {}).get("_upstream_trace")
+    if isinstance(max_trace, dict):
+        # The last created session wins, so a Work fallback reports "off".
+        max_trace["max_mode_applied"] = bool(max_requested)
+        if max_requested:
+            max_trace["max_context_tokens"] = initial_message.get("context_window_size")
+        else:
+            max_trace.pop("max_context_tokens", None)
     if isinstance(initial_message.get("custom_model"), Mapping):
         effort_model, effort_level = apply_reasoning_effort(
             initial_message["custom_model"], options

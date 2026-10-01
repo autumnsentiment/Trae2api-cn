@@ -982,6 +982,46 @@ def sync_account_label_from_credits(account_id: str, user_name: str) -> str:
         return name
 
 
+def sync_account_screen_name(
+    account_id: str, screen_name: str, upstream_user_id: str = ""
+) -> tuple[str, bool]:
+    """Sync the upstream ScreenName into the account label.
+
+    The label follows the upstream name only while it is still auto-managed:
+    empty, equal to the raw account/user id, or equal to the previously synced
+    ``provider_specific.screenName``. A manually edited label is kept. Returns
+    ``(effective_label, changed)``.
+    """
+    name = (screen_name or '').strip()
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return '', False
+        existing = (rec.get('label') or '').strip()
+        user_id = str(rec.get('user_id') or '').strip()
+        upstream = str(upstream_user_id or '').strip()
+        if not name or (upstream and user_id and upstream != user_id):
+            return existing or user_id or account_id, False
+        provider = rec.get('provider_specific')
+        if not isinstance(provider, dict):
+            provider = {}
+        previous = str(provider.get('screenName') or '').strip()
+        changed = False
+        if previous != name:
+            provider['screenName'] = name
+            rec['provider_specific'] = provider
+            changed = True
+        if existing != name and (
+            not existing or existing in (account_id, user_id, previous)
+        ):
+            rec['label'] = name
+            existing = name
+            changed = True
+        if changed:
+            _save_accounts()
+        return existing or user_id or account_id, changed
+
+
 def merge_account_retry(account_id: str, data: dict) -> dict:
     """Persist 9074 retry bookkeeping without touching checkin timestamps.
 
@@ -1245,6 +1285,93 @@ def set_relay_settings(web_base_url: str = '', port: int = 0, upstream_mode: str
         ENV_PATH.write_text('\n'.join(out) + '\n', 'utf-8')
     except Exception as e:
         logger.warning('auth: could not save relay settings: %s', e)
+
+
+_MAX_MODE_ENV = 'TRAE_REMOTE_MAX_MODE'
+_MAX_MODELS_ENV = 'TRAE_REMOTE_MAX_MODELS'
+
+
+def _normalize_max_models(models) -> str:
+    if isinstance(models, (list, tuple, set)):
+        items = list(models)
+    else:
+        items = str(models or '').replace('\n', ',').split(',')
+    out: list[str] = []
+    for item in items:
+        value = str(item or '').strip()
+        if value and value.lower() not in {v.lower() for v in out}:
+            out.append(value)
+    return ','.join(out)
+
+
+def _write_env_values(values: dict) -> None:
+    """Update or append KEY=value lines in .env without touching other keys."""
+    try:
+        lines = ENV_PATH.read_text('utf-8').splitlines() if ENV_PATH.exists() else []
+        out, seen = [], set()
+        for line in lines:
+            stripped = line.strip()
+            key = ''
+            if stripped and not stripped.startswith('#') and '=' in stripped:
+                key = stripped.split('=', 1)[0].strip()
+            if key in values:
+                if key not in seen:
+                    seen.add(key)
+                    out.append(f'{key}={values[key]}')
+                continue
+            out.append(line)
+        for key, value in values.items():
+            if key not in seen:
+                out.append(f'{key}={value}')
+        ENV_PATH.write_text('\n'.join(out) + '\n', 'utf-8')
+    except Exception as e:
+        logger.warning('auth: could not save env values: %s', e)
+
+
+def get_max_mode_settings() -> dict:
+    """Return the effective 1M max-mode switch; the console value wins over env."""
+    with _STORE_LOCK:
+        saved = _settings.get('max_mode')
+    if isinstance(saved, dict):
+        return {
+            'enabled': bool(saved.get('enabled')),
+            'models': _normalize_max_models(saved.get('models')),
+            'source': 'console',
+        }
+    enabled = os.environ.get(_MAX_MODE_ENV, '').strip().lower() in ('1', 'true', 'yes', 'on')
+    return {
+        'enabled': enabled,
+        'models': _normalize_max_models(os.environ.get(_MAX_MODELS_ENV, '')),
+        'source': 'env',
+    }
+
+
+def apply_max_mode_settings() -> None:
+    """Push the persisted console switch into the process environment.
+
+    The remote client reads these variables per request, so the change applies
+    to the next session without a restart.  Container env_file values are only
+    a default: a saved console choice survives ``docker restart``.
+    """
+    with _STORE_LOCK:
+        saved = _settings.get('max_mode')
+    if not isinstance(saved, dict):
+        return
+    os.environ[_MAX_MODE_ENV] = '1' if saved.get('enabled') else '0'
+    os.environ[_MAX_MODELS_ENV] = _normalize_max_models(saved.get('models'))
+
+
+def set_max_mode_settings(enabled: bool, models='') -> dict:
+    normalized = _normalize_max_models(models)
+    with _STORE_LOCK:
+        _settings['max_mode'] = {'enabled': bool(enabled), 'models': normalized}
+        _save_accounts()
+    apply_max_mode_settings()
+    _write_env_values({
+        _MAX_MODE_ENV: '1' if enabled else '0',
+        _MAX_MODELS_ENV: normalized,
+    })
+    return get_max_mode_settings()
 
 
 

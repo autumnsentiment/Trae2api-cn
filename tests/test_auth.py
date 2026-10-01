@@ -205,3 +205,49 @@ class RefreshTokenRaceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScreenNameSyncTests(unittest.TestCase):
+    def _run(self, record, name, upstream="u-1"):
+        accounts = {"acc": record}
+        with (
+            patch.object(auth, "_accounts", accounts),
+            patch.object(auth, "_save_accounts") as save,
+        ):
+            result = auth.sync_account_screen_name("acc", name, upstream)
+        return result, record, save
+
+    def test_auto_label_follows_new_screen_name(self):
+        rec = {"user_id": "u-1", "label": "old", "provider_specific": {"screenName": "old"}}
+        (label, changed), rec, save = self._run(rec, "new")
+        self.assertEqual((label, changed), ("new", True))
+        self.assertEqual(rec["label"], "new")
+        self.assertEqual(rec["provider_specific"]["screenName"], "new")
+        save.assert_called_once()
+
+    def test_id_like_or_empty_label_is_filled(self):
+        for label in ("", "u-1", "acc"):
+            rec = {"user_id": "u-1", "label": label}
+            (result, changed), rec, _ = self._run(rec, "name")
+            self.assertEqual(result, "name")
+            self.assertTrue(changed)
+
+    def test_manual_label_is_kept(self):
+        rec = {"user_id": "u-1", "label": "my-main", "provider_specific": {"screenName": "old"}}
+        (label, changed), rec, _ = self._run(rec, "new")
+        self.assertEqual(label, "my-main")
+        self.assertTrue(changed)  # screenName cache still refreshed
+        self.assertEqual(rec["label"], "my-main")
+        self.assertEqual(rec["provider_specific"]["screenName"], "new")
+
+    def test_mismatched_upstream_user_is_ignored(self):
+        rec = {"user_id": "u-1", "label": "old", "provider_specific": {"screenName": "old"}}
+        (label, changed), rec, save = self._run(rec, "other", upstream="u-2")
+        self.assertEqual((label, changed), ("old", False))
+        save.assert_not_called()
+
+    def test_unchanged_name_does_not_save(self):
+        rec = {"user_id": "u-1", "label": "same", "provider_specific": {"screenName": "same"}}
+        (_, changed), _, save = self._run(rec, "same")
+        self.assertFalse(changed)
+        save.assert_not_called()

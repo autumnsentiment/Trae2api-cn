@@ -196,6 +196,74 @@ class CheckinResultTests(unittest.TestCase):
         self.assertTrue(body["success"])
         self.assertIn("general failed", body["accounts"][0]["error"])
 
+    def test_status_refresh_syncs_upstream_user_name(self):
+        raw_accounts = [("account-1", {"token": "t", "user_id": "account-1", "label": "old"})]
+        sync = MagicMock(return_value=("new-name", True))
+        with (
+            patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
+            patch("src.main.auth.get_active_account_id", return_value="account-1"),
+            patch("src.main.auth.get_account_record", return_value=raw_accounts[0][1]),
+            patch(
+                "src.main._fetch_checkin_status_snapshot",
+                new=AsyncMock(return_value={"checked_in": True}),
+            ),
+            patch(
+                "src.main.trae_client.fetch_user_info",
+                new=AsyncMock(return_value={"ScreenName": "new-name", "UserID": "account-1"}),
+            ),
+            patch("src.main.auth.sync_account_screen_name", new=sync),
+        ):
+            response = asyncio.run(main_module.api_checkin_accounts())
+
+        row = json.loads(response.body)["accounts"][0]
+        sync.assert_called_once_with("account-1", "new-name", "account-1")
+        self.assertEqual(row["label"], "new-name")
+        self.assertTrue(row["label_synced"])
+        self.assertTrue(row["checked_in"])
+
+    def test_status_refresh_keeps_row_when_user_info_fails(self):
+        raw_accounts = [("account-1", {"token": "t", "user_id": "account-1", "label": "old"})]
+        with (
+            patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
+            patch("src.main.auth.get_active_account_id", return_value="account-1"),
+            patch("src.main.auth.get_account_record", return_value=raw_accounts[0][1]),
+            patch(
+                "src.main._fetch_checkin_status_snapshot",
+                new=AsyncMock(return_value={"checked_in": False}),
+            ),
+            patch(
+                "src.main.trae_client.fetch_user_info",
+                new=AsyncMock(side_effect=RuntimeError("Trae user info [500]: x")),
+            ),
+        ):
+            response = asyncio.run(main_module.api_checkin_accounts())
+
+        row = json.loads(response.body)["accounts"][0]
+        self.assertEqual(row["label"], "old")
+        self.assertNotIn("error", row)
+        self.assertIn("[500]", row["user_name_error"])
+
+    def test_credit_refresh_does_not_touch_user_name(self):
+        raw_accounts = [("account-1", {"token": "t", "user_id": "account-1", "label": "old"})]
+        user_info = AsyncMock()
+        with (
+            patch("src.main.auth.get_accounts_raw", return_value=raw_accounts),
+            patch("src.main.auth.get_active_account_id", return_value="account-1"),
+            patch("src.main.auth.get_account_record", return_value=raw_accounts[0][1]),
+            patch(
+                "src.main._fetch_full_credits",
+                new=AsyncMock(return_value={"user_name": "pay-name"}),
+            ),
+            patch("src.main.trae_client.fetch_user_info", new=user_info),
+            patch("src.main.auth.merge_account_credits", return_value={}),
+        ):
+            response = asyncio.run(main_module.api_checkin_credits_accounts())
+
+        row = json.loads(response.body)["accounts"][0]
+        user_info.assert_not_called()
+        self.assertEqual(row["label"], "old")
+        self.assertNotIn("user_name", row)
+
     def test_bulk_credits_static_route_is_not_captured_as_account_id(self):
         with patch("src.main.auth.get_accounts_raw", return_value=[]):
             with TestClient(app) as client:
@@ -1519,6 +1587,7 @@ class UsageRecordTests(unittest.TestCase):
         credits_start = html.index("async function creditsRefreshAll()", status_start)
         status_refresh = html[status_start:credits_start]
         self.assertIn("/api/checkin/accounts", status_refresh)
+        self.assertIn("'label-'+account.id", html)
         self.assertIn("updateAccountCheckinRow", status_refresh)
         credits_end = html.index("async function checkinAccount(id)", credits_start)
         credits_refresh = html[credits_start:credits_end]

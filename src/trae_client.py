@@ -642,6 +642,34 @@ async def fetch_account_credits(token: str = "", req_source: int = 1) -> dict:
             raise RuntimeError(f"Trae pay credits: {data.get('message') or data}")
         return data
 
+async def fetch_user_info(token: str = "") -> dict:
+    """Fetch the upstream profile (ScreenName/UserID) like the Trae client.
+
+    The client posts to ``/cloudide/api/v3/trae/GetUserInfo`` with the JWT in
+    ``x-cloudide-token``; ``Authorization: Cloud-IDE-JWT`` is rejected (401).
+    """
+    if not token:
+        token = auth.get_token()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
+    base = os.environ.get("TRAE_UG_API_HOST", TRAE_UG_API_HOST).rstrip("/")
+    url = f"{base}/cloudide/api/v3/trae/GetUserInfo"
+    headers = {"Content-Type": "application/json", "x-cloudide-token": token}
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, json={"ReqSource": "IDE"}, headers=headers)
+        text = resp.text
+        if resp.status_code != 200:
+            raise RuntimeError(f"Trae user info [{resp.status_code}]: {text[:300]}")
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Trae user info invalid json: {e}") from e
+    result = data.get("Result") if isinstance(data, dict) else None
+    if not isinstance(result, dict) or not result.get("UserID"):
+        raise RuntimeError("Trae user info: empty Result")
+    return result
+
+
 def _credit_decimal(value: Any) -> Decimal | None:
     """Parse an upstream credit value without losing fractional precision."""
     if value is None or isinstance(value, bool):

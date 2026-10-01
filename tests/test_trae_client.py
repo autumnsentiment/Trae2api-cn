@@ -1136,3 +1136,50 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UserInfoTests(unittest.TestCase):
+    def test_fetch_user_info_uses_cloudide_token_header(self):
+        calls = {}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                calls.update(url=url, json=json, headers=headers)
+                body = {"Result": {"UserID": "u-1", "ScreenName": "name"}}
+                return SimpleNamespace(status_code=200, text="{}", json=lambda: body)
+
+        with patch("src.trae_client.httpx.AsyncClient", FakeClient):
+            result = asyncio.run(trae_client.fetch_user_info("jwt-token"))
+
+        self.assertEqual(result["ScreenName"], "name")
+        self.assertTrue(calls["url"].endswith("/cloudide/api/v3/trae/GetUserInfo"))
+        self.assertEqual(calls["headers"]["x-cloudide-token"], "jwt-token")
+        self.assertNotIn("Authorization", calls["headers"])
+        self.assertEqual(calls["json"], {"ReqSource": "IDE"})
+
+    def test_fetch_user_info_rejects_empty_result(self):
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                return SimpleNamespace(status_code=200, text="{}", json=lambda: {"Result": {}})
+
+        with patch("src.trae_client.httpx.AsyncClient", FakeClient):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(trae_client.fetch_user_info("jwt-token"))

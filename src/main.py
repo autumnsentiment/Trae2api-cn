@@ -162,6 +162,9 @@ CHAT_OPTION_FIELDS = (
     # reasoning summary without leaking the full upstream trace.
     "thinking",
     "reasoning_effort",
+    # Per-request 1M max opt-in; the console switch is the global default.
+    "trae_max_mode",
+    "max_mode",
     "stream_options",
     "response_format",
     "service_tier",
@@ -314,6 +317,8 @@ PUBLIC_PATHS = {
     "/api/settings",
     "/api/polling",
     "/api/polling-mode",
+    "/api/max-mode",
+    "/api/max-mode/models",
     "/api/checkin/status",
     "/api/checkin/claim",
     "/api/checkin/accounts",
@@ -765,7 +770,7 @@ def _web_login_html() -> str:
         else:
             checkin_badge = '<span class="badge badge-none">未知</span>'
         rows += f"""<tr id="row-{html_mod.escape(aid)}" class="{active_row.strip()}" data-account-id="{html_mod.escape(aid)}">
-          <td><strong>{html_mod.escape(label)}</strong><small class="row-subtitle">{html_mod.escape(uid)}</small></td>
+          <td><strong id="label-{html_mod.escape(aid)}">{html_mod.escape(label)}</strong><small class="row-subtitle">{html_mod.escape(uid)}</small></td>
           <td><code>{html_mod.escape(uid)}</code></td>
           <td>{st} {act}</td>
           <td class="muted-cell">{html_mod.escape(expires)}</td>
@@ -844,6 +849,10 @@ def _web_login_html() -> str:
     poll_checked = 'checked' if polling.get("enabled") else ''
     poll_mode_rr = 'checked' if polling.get('mode', 'round-robin') == 'round-robin' else ''
     poll_mode_cp = 'checked' if polling.get('mode') == 'credit-priority' else ''
+    max_settings = auth.get_max_mode_settings()
+    max_checked = 'checked' if max_settings.get('enabled') else ''
+    max_models = html_mod.escape(max_settings.get('models') or '')
+    max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1031,6 +1040,10 @@ hr {{ border: none; border-top: 1px solid var(--border); margin: 16px 0; }}
 .card-hint a {{ color:var(--info); }}
 .check-row {{ display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }}
 .check-row .label {{ color:var(--faint); }}
+.max-models {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; font-size:12px; color:var(--muted); }}
+.max-models[hidden] {{ display:none; }}
+.model-chip {{ border:1px solid var(--border-strong); background:var(--panel); color:var(--text); border-radius:6px; padding:4px 8px; font-size:12px; cursor:pointer; font-family:inherit; }}
+.model-chip:hover {{ border-color:var(--accent); color:var(--accent); }}
 pre.code-out {{ margin-top:12px; padding:12px; background:var(--panel2); border:1px solid var(--border); border-radius:6px; font-size:12px; max-height:220px; overflow:auto; white-space:pre-wrap; color:#39415a; display:none; }}
 details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
 @media (max-width: 960px) {{
@@ -1194,6 +1207,26 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
 </div>
 <div id="settings-msg" class="msg"></div>
 </div>
+<div class="panel-card" id="max-mode-panel">
+  <div class="section-head">
+    <div class="section-title">1M 上下文（Max 模式）</div>
+    <span id="max-mode-state" class="section-meta">{max_state_text}</span>
+  </div>
+  <div class="check-row">
+    <input type="checkbox" id="max-mode-toggle" {max_checked}>
+    <label for="max-mode-toggle" style="cursor:pointer" title="只对 Remote 的 Agent 会话生效；带调用端工具的请求默认走 Work，不使用 Max">启用 Max 模式（Remote Agent 会话使用 1M 上下文）</label>
+  </div>
+  <div class="form-group" style="margin-top:10px">
+    <label for="max-mode-models">生效模型（逗号分隔，留空表示账号中所有支持 Max 的模型）</label>
+    <input id="max-mode-models" value="{max_models}" placeholder="glm-5.3, deepseek-v4-pro">
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-secondary" onclick="saveMaxMode()">保存</button>
+    <button class="btn btn-ghost" id="max-mode-detect-btn" onclick="detectMaxModels()">检测支持的模型</button>
+  </div>
+  <div id="max-mode-models-out" class="max-models" hidden></div>
+  <div id="max-mode-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
 </div>
 </div>
 <div class="tab-page" data-page="models">
@@ -1241,6 +1274,9 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
       </label>
       <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
         <input type="checkbox" id="conn-thinking"> 返回思考内容
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400" title="请求 1M Max 上下文，结果中显示是否实际生效">
+        <input type="checkbox" id="conn-max"> 1M Max
       </label>
       <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
         超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"
@@ -1531,6 +1567,8 @@ function updateAccountCheckinRow(account){{
   var code=payload&&payload.code!==undefined?'业务码 '+payload.code:'';
   var detail=account.error||code||'';
   setCheckinState(account.id,account.checked_in,detail,account.error);
+  var labelEl=document.getElementById('label-'+account.id);
+  if(labelEl&&account.label) labelEl.textContent=account.label;
   var row=document.getElementById('row-'+account.id);
   if(row) row.classList.toggle('row-failed',!!account.error||account.success===false);
 }}
@@ -1628,6 +1666,7 @@ async function runConnTest(){{
   var endpoint = document.getElementById('conn-endpoint').value || 'remote';
   var effort = document.getElementById('conn-effort').value || '';
   var thinking = document.getElementById('conn-thinking').checked;
+  var maxMode = document.getElementById('conn-max').checked;
   btn.disabled = true;
   table.style.display = 'table';
   tbody.innerHTML = '';
@@ -1652,7 +1691,7 @@ async function runConnTest(){{
     try{{
       var d = await postJSON('/api/model-test',
         {{model: job.model, mode: job.mode, timeout: timeout, endpoint: endpoint,
-          reasoning_effort: effort, thinking: thinking}}, (timeout + 20) * 1000);
+          reasoning_effort: effort, thinking: thinking, max_mode: maxMode}}, (timeout + 20) * 1000);
       timeCell.textContent = (d.elapsed_ms !== undefined ? d.elapsed_ms + ' ms' : '-');
       if(d.success){{
         passed++;
@@ -1672,6 +1711,9 @@ async function runConnTest(){{
         if(d.requested_reasoning_effort){{
           extra.push('强度=' + d.requested_reasoning_effort + ' -> '
             + (d.reasoning_effort_applied || ('未生效: ' + (d.reasoning_effort_note || '模型不支持'))));
+        }}
+        if(maxMode){{
+          extra.push('Max=' + (d.max_mode_applied ? '已生效 ' + formatContext(d.max_context_tokens) : '未生效'));
         }}
         if(d.usage && d.usage.reasoning_tokens !== undefined && d.usage.reasoning_tokens !== null){{
           extra.push('reasoning_tokens=' + d.usage.reasoning_tokens);
@@ -1753,6 +1795,52 @@ async function saveSettings(){{
   var d=await postJSON('/api/settings',{{web_base_url:web,relay_port:port,upstream_mode:mode}});
   if(d.success){{ showMsg('settings-msg',d.note||'设置已保存',true); setTimeout(function(){{ location.reload(); }},800); }}
   else showMsg('settings-msg',d.error||'保存失败',false);
+}}
+async function saveMaxMode(){{
+  var enabled=document.getElementById('max-mode-toggle').checked;
+  var models=document.getElementById('max-mode-models').value.trim();
+  var d=await postJSON('/api/max-mode',{{enabled:enabled,models:models}});
+  if(d.success){{
+    document.getElementById('max-mode-toggle').checked=!!d.enabled;
+    document.getElementById('max-mode-models').value=d.models||'';
+    document.getElementById('max-mode-state').textContent=d.enabled?'已开启':'已关闭';
+    showMsg('max-mode-msg',d.enabled?'Max 模式已开启，新会话生效':'Max 模式已关闭',true,3000);
+  }} else showMsg('max-mode-msg',d.error||'保存失败',false);
+}}
+function formatContext(n){{
+  if(!n) return '';
+  return n>=1000000 ? (Math.round(n/100000)/10)+'M' : Math.round(n/1000)+'K';
+}}
+function addMaxModel(name){{
+  var input=document.getElementById('max-mode-models');
+  var items=input.value.split(',').map(function(s){{ return s.trim(); }}).filter(Boolean);
+  var lower=items.map(function(s){{ return s.toLowerCase(); }});
+  if(lower.indexOf(name.toLowerCase())<0) items.push(name);
+  input.value=items.join(', ');
+}}
+async function detectMaxModels(){{
+  var btn=document.getElementById('max-mode-detect-btn');
+  var out=document.getElementById('max-mode-models-out');
+  btn.disabled=true;
+  try{{
+    var result=await requestJSON('/api/max-mode/models',{{method:'GET'}},45000);
+    var d=result.data;
+    if(!result.ok||!d||!d.success) throw new Error(apiError(d,result.status));
+    out.textContent='';
+    var list=d.models||[];
+    if(!list.length) out.textContent='当前账号没有支持 Max 的模型';
+    list.forEach(function(m){{
+      var chip=document.createElement('button');
+      chip.type='button';
+      chip.className='model-chip';
+      chip.textContent=m.name+(m.max_context?' · '+formatContext(m.max_context):'');
+      chip.title='加入生效模型';
+      chip.onclick=function(){{ addMaxModel(m.name); }};
+      out.appendChild(chip);
+    }});
+    out.hidden=false;
+  }}catch(e){{ showMsg('max-mode-msg',String(e),false,8000); }}
+  finally{{ btn.disabled=false; }}
 }}
 const ENDPOINT_PRESET_MAP = {endpoint_map_json};
 async function applyEndpointPreset(){{
@@ -5693,6 +5781,7 @@ async def handle_responses(req: Request):
 async def init_app():
     _load_usage_history()
     auth.init_auth()
+    auth.apply_max_mode_settings()
     logger.info(
         "Trae CN relay initialized (auth source=%s edition=%s cli=%s)",
         auth.get_auth().source,
@@ -6067,6 +6156,9 @@ async def api_model_test(req: Request):
         options["max_tokens"] = 4096
     if bool(body.get("thinking")):
         options["thinking"] = {"type": "enabled"}
+    max_mode_requested = bool(body.get("max_mode"))
+    if max_mode_requested:
+        options["trae_max_mode"] = True
     trace: dict[str, Any] = {}
     options["_upstream_mode"] = endpoint
     # Connectivity checks should exercise the same resilient route as a real
@@ -6159,6 +6251,7 @@ async def api_model_test(req: Request):
             "requested_reasoning_effort": effort or None,
             "reasoning_effort_applied": trace.get("reasoning_effort_applied") or None,
             "reasoning_effort_note": _effort_note(effort, trace),
+            "requested_max_mode": max_mode_requested,
             "reasoning": str(message.get("reasoning_content") or "")[:600] or None,
             "reply": content[:200],
             "tool_calls": [
@@ -6318,6 +6411,11 @@ async def api_checkin_accounts():
                 )
         except Exception as e:
             row["error"] = str(e)
+        # Username check rides on the status refresh, not on credits queries.
+        try:
+            row.update(await _sync_account_user_name(aid))
+        except Exception as e:
+            row["user_name_error"] = str(e)[:200]
         return row
 
     results = await asyncio.gather(
@@ -6524,20 +6622,39 @@ async def _fetch_credit_account_snapshot(
         else dict(record.get("checkin") or {})
     )
     row = _cached_checkin_account_snapshot(account_id, record)
-    user_name = full.get("user_name") or ""
-    if user_name:
-        auth.sync_account_label_from_credits(account_id, user_name)
-    row = _cached_checkin_account_snapshot(account_id, record)
     row.update(
         {
             "account_credits": merged.get("account_credits"),
             "checkin": merged,
-            "label": auth.get_account_record(account_id).get("label") or row.get("label"),
         }
     )
-    if user_name:
-        row["user_name"] = user_name
     return row
+
+
+async def _sync_account_user_name(account_id: str) -> dict:
+    """Fetch GetUserInfo once and sync the ScreenName into the account label."""
+    record = auth.get_account_record(account_id)
+    token = record.get("token") or ""
+    if not token:
+        raise KeyError("account not found or token missing")
+    try:
+        info = await trae_client.fetch_user_info(token)
+    except Exception as exc:
+        if _credits_auth_failed(exc) and await auth.refresh_account(account_id):
+            fresh = auth.get_account_record(account_id)
+            info = await trae_client.fetch_user_info(fresh.get("token") or "")
+        else:
+            raise
+    name = str(info.get("ScreenName") or "").strip()
+    label, changed = auth.sync_account_screen_name(
+        account_id, name, str(info.get("UserID") or "")
+    )
+    out = {"label_synced": changed}
+    if label:
+        out["label"] = label
+    if name:
+        out["user_name"] = name
+    return out
 
 
 async def _fetch_checkin_status_snapshot(
@@ -7196,6 +7313,88 @@ async def api_settings(request: Request):
         UPSTREAM_MODE = upstream_mode
         os.environ["UPSTREAM_MODE"] = upstream_mode
     return JSONResponse({"success": True, "note": "端口变更需重启容器生效"})
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+@app.get("/api/max-mode")
+async def api_get_max_mode():
+    return JSONResponse({"success": True, **auth.get_max_mode_settings()})
+
+
+@app.post("/api/max-mode")
+async def api_set_max_mode(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or "enabled" not in body:
+        return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
+    models = body.get("models", "")
+    if models is None:
+        models = ""
+    if not isinstance(models, (str, list)):
+        return JSONResponse(
+            {"success": False, "error": "models must be a string or list"}, status_code=400
+        )
+    settings = auth.set_max_mode_settings(_truthy(body.get("enabled")), models)
+    return JSONResponse({"success": True, **settings})
+
+
+def _max_context_of(config: Mapping[str, Any]) -> int:
+    size = config.get("context_window_size")
+    if isinstance(size, Mapping):
+        raw = size.get("max")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if raw:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+    tokens = config.get("context_window_tokens")
+    if isinstance(tokens, Mapping) and tokens.get("max"):
+        try:
+            return int(tokens.get("max"))
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+@app.get("/api/max-mode/models")
+async def api_max_mode_models():
+    """List Agent-tier models the active account marks with ``max_mode``."""
+
+    account_id, record = auth.get_active_account_snapshot()
+    token = str((record or {}).get("token") or "") or str(auth.get_token() or "")
+    if not token:
+        return JSONResponse({"success": False, "error": "没有可用账号"}, status_code=400)
+    provider = (record or {}).get("provider_specific") or (record or {}).get(
+        "providerSpecificData"
+    )
+    configs = await trae_client._fetch_web_model_configs(
+        token_override=token,
+        provider_specific=dict(provider) if isinstance(provider, Mapping) else None,
+        agent_type="solo_agent_remote",
+    )
+    models = [
+        {
+            "name": name,
+            "display_name": str(cfg.get("display_name") or name),
+            "max_context": _max_context_of(cfg),
+        }
+        for name, cfg in configs.items()
+        if isinstance(cfg, Mapping) and cfg.get("max_mode")
+    ]
+    if not configs:
+        return JSONResponse(
+            {"success": False, "error": "上游模型列表获取失败"}, status_code=502
+        )
+    return JSONResponse({"success": True, "account_id": account_id, "models": models})
 
 
 @app.get("/api/polling")
