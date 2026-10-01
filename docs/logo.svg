@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Trae2api-cn">
+  <title>Trae2api-cn</title>
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#0b100d" stroke="#22c55e" stroke-width="4"/>
+  <g fill="none" stroke="#22c55e" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M17 22h27"/>
+    <path d="M39 14l9 8-9 8"/>
+    <path d="M28 22v24"/>
+  </g>
+  <circle cx="28" cy="47" r="4.5" fill="#4ade80"/>
+</svg>

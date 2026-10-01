@@ -49,7 +49,7 @@ dotenv.load_dotenv()
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.responses import FileResponse
 
 from . import (
@@ -228,6 +228,46 @@ _USAGE_RECORDS_PATH = Path(
     os.environ.get("TRAE_USAGE_RECORDS_PATH", "")
     or (Path(__file__).resolve().parent.parent / "data" / "usage_records.json")
 )
+# Lifetime token totals bucketed by Asia/Shanghai day. The request history
+# above is capped, so the dashboard overview reads this file instead.
+_USAGE_STATS_PATH_OVERRIDE = os.environ.get("TRAE_USAGE_STATS_PATH", "")
+_USAGE_STATS: dict[str, Any] = {"days": {}}
+_USAGE_STATS_FIELDS = (
+    "requests",
+    "completed",
+    "failed",
+    "input_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "total_tokens",
+    "credits",
+)
+_USAGE_STATS_MAX_DAYS = 400
+_PROCESS_STARTED_AT = time.time()
+
+# Project logo: a "T" whose crossbar runs into a relay arrow, black tile with a
+# green rim to match the console theme. docs/logo.svg mirrors this markup.
+_LOGO_PATHS = (
+    '<rect x="3" y="3" width="58" height="58" rx="14" fill="#0b100d" '
+    'stroke="#22c55e" stroke-width="4"/>'
+    '<g fill="none" stroke="#22c55e" stroke-width="6" stroke-linecap="round" '
+    'stroke-linejoin="round"><path d="M17 22h27"/><path d="M39 14l9 8-9 8"/>'
+    '<path d="M28 22v24"/></g>'
+    '<circle cx="28" cy="47" r="4.5" fill="#4ade80"/>'
+)
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" '
+    'aria-label="Trae2api-cn"><title>Trae2api-cn</title>' + _LOGO_PATHS + "</svg>"
+)
+_LOGO_SVG_INLINE = (
+    '<svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">'
+    + _LOGO_PATHS
+    + "</svg>"
+)
+_FAVICON_LINKS = (
+    '<link rel="icon" type="image/svg+xml" href="/favicon.svg">'
+    '<link rel="apple-touch-icon" href="/favicon.svg">'
+)
 _USAGE_TRACKER: ContextVar[Any] = ContextVar("trae_usage_tracker", default=None)
 _USAGE_ENRICH_TASKS: set[asyncio.Task] = set()
 _USAGE_SNAPSHOT_TASKS: set[asyncio.Task] = set()
@@ -303,6 +343,8 @@ TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID") or "ono9krqynydwx5"
 LOCAL_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
 PUBLIC_PATHS = {
     "/healthz",
+    "/favicon.svg",
+    "/favicon.ico",
     "/v1/status",
     "/v1/models",
     "/models",
@@ -331,6 +373,7 @@ PUBLIC_PATHS = {
     "/api/checkin/work-credits",
     "/api/usage/last",
     "/api/usage/records",
+    "/api/overview",
     # TraeWork custom-model management probes cannot reliably attach the
     # relay API key before the model has been saved. Chat ingress remains
     # protected by the normal middleware; only connectivity is public.
@@ -681,6 +724,581 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
+APP_VERSION = "1.0.1"
+
+# Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
+_LUCIDE_ICONS = {
+    'zap': '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+    'users': '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    'receipt': '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 17.5v-11"/>',
+    'sliders-horizontal': '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
+    'activity': '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    'calendar-check': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="m9 16 2 2 4-4"/>',
+    'arrow-left-right': '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
+    'trash-2': '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+    'log-out': '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+    'log-in': '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+    'refresh-cw': '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+    'coins': '<circle cx="8" cy="8" r="6"/><path d="M18.09 10.37A6 6 0 1 1 10.34 18"/><path d="M7 6h1v4"/><path d="m16.71 13.88.7.71-2.82 2.82"/>',
+    'check-check': '<path d="M18 6 7 17l-5-5"/><path d="m22 10-7.5 7.5L13 16"/>',
+    'shield-check': '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+    'download': '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+    'external-link': '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+    'play': '<polygon points="6 3 20 12 6 21 6 3"/>',
+    'save': '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/>',
+    'search': '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    'list': '<line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/>',
+    'sun': '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+    'moon': '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+    'list-plus': '<path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/>',
+    'layout-dashboard': '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+    'database': '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
+    'arrow-down-to-line': '<path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/>',
+    'arrow-up-from-line': '<path d="m18 9-6-6-6 6"/><path d="M12 3v14"/><path d="M5 21h14"/>',
+    'sigma': '<path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2"/>',
+    'calendar': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>',
+    'server': '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+}
+
+
+def _icon(name: str) -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+        f'stroke-linejoin="round" aria-hidden="true">{_LUCIDE_ICONS[name]}</svg>'
+    )
+
+_CONSOLE_CSS = """
+:root, [data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f4f2;
+  --surface: #ffffff;
+  --surface-2: #f6f8f6;
+  --frame: #1a201d;
+  --line: #dde3df;
+  --line-strong: #bcc6c0;
+  --text: #111613;
+  --muted: #4f5b55;
+  --faint: #7d8983;
+  --accent: #15803d;
+  --accent-hover: #116a32;
+  --accent-soft: #e7f5ec;
+  --accent-line: #9fd5b2;
+  --on-accent: #ffffff;
+  --edge: #16a34a;
+  --ring: rgba(22,163,74,.22);
+  --row-hover: #f7faf8;
+  --row-active: #eef8f1;
+  --topbar: rgba(242,244,242,.92);
+  --shadow: 0 10px 28px rgba(10,20,14,.14);
+  --side-bg: #0e1311;
+  --side-line: #1f2a24;
+  --side-text: #e4ece7;
+  --side-muted: #8fa198;
+  --side-hover: #18211c;
+  --side-active: #13301f;
+  --side-accent: #4ade80;
+  --ok: #15803d;
+  --ok-soft: #e7f5ec;
+  --ok-line: #9fd5b2;
+  --warn: #a35200;
+  --warn-soft: #fdf1e1;
+  --warn-line: #efcf9f;
+  --danger: #c0262d;
+  --danger-soft: #fdebec;
+  --danger-line: #f0bcbf;
+  --knob: #ffffff;
+  --chart-in: #16a34a;
+  --chart-cache: #0b5e2e;
+  --chart-out: #2563eb;
+  --mono: "JetBrains Mono", "SF Mono", Consolas, "Courier New", monospace;
+  --radius: 8px;
+  --radius-sm: 6px;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #090c0b;
+  --surface: #101513;
+  --surface-2: #151c18;
+  --frame: #1f6b40;
+  --line: #222d27;
+  --line-strong: #33433a;
+  --text: #e3ece6;
+  --muted: #9aaca2;
+  --faint: #6c7d74;
+  --accent: #22c55e;
+  --accent-hover: #4ade80;
+  --accent-soft: #10251a;
+  --accent-line: #1f6b40;
+  --on-accent: #04130a;
+  --edge: #22c55e;
+  --ring: rgba(34,197,94,.28);
+  --row-hover: #131a16;
+  --row-active: #102419;
+  --topbar: rgba(9,12,11,.9);
+  --shadow: 0 12px 32px rgba(0,0,0,.55);
+  --side-bg: #060908;
+  --side-line: #1a2620;
+  --side-text: #e3ece6;
+  --side-muted: #7f938a;
+  --side-hover: #111a15;
+  --side-active: #0f2a1b;
+  --side-accent: #4ade80;
+  --ok: #4ade80;
+  --ok-soft: #0f2418;
+  --ok-line: #1f6b40;
+  --warn: #f5a524;
+  --warn-soft: #2a1d08;
+  --warn-line: #5c3f10;
+  --danger: #f87171;
+  --danger-soft: #2a1012;
+  --danger-line: #5e2428;
+  --knob: #e3ece6;
+  --chart-in: #22c55e;
+  --chart-cache: #137a3c;
+  --chart-out: #60a5fa;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+[hidden] { display:none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+  background: var(--bg); color: var(--text); min-height: 100vh;
+  font-size: 14px; line-height: 1.5; letter-spacing: 0;
+  transition: background .2s, color .2s;
+}
+code, .mono { font-family: var(--mono); font-size: 12px; }
+svg { width: 16px; height: 16px; flex-shrink: 0; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--edge); outline-offset: 2px; }
+::selection { background: var(--edge); color: var(--on-accent); }
+
+/* Shell: black sidebar with a green edge */
+.app { display: grid; grid-template-columns: 224px minmax(0, 1fr); min-height: 100vh; }
+.sidebar {
+  background: var(--side-bg); color: var(--side-text);
+  border-right: 2px solid var(--edge);
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+}
+.brand { display: flex; align-items: center; gap: 10px; padding: 16px 16px 14px; border-bottom: 1px solid var(--side-line); }
+.brand-mark {
+  width: 34px; height: 34px; flex-shrink: 0;
+  display: grid; place-items: center;
+}
+.brand-mark svg { width: 34px; height: 34px; display: block; }
+.brand-block { display: flex; flex-direction: column; min-width: 0; }
+.brand-block h1 { font-size: 15px; font-weight: 650; white-space: nowrap; color: var(--side-text); }
+.brand-sub { color: var(--side-muted); font-size: 11px; font-family: var(--mono); }
+.nav-list { display: flex; flex-direction: column; gap: 4px; padding: 12px 10px; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; height: 38px;
+  border: 1px solid transparent; background: transparent; color: var(--side-muted);
+  font: inherit; font-size: 13px; font-weight: 550; padding: 0 12px;
+  border-radius: var(--radius-sm); cursor: pointer; text-align: left; position: relative;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.nav-item:hover { background: var(--side-hover); color: var(--side-text); }
+.nav-item.active { background: var(--side-active); color: var(--side-accent); border-color: rgba(74,222,128,.45); }
+.nav-item.active::before {
+  content: ""; position: absolute; left: -11px; top: 7px; bottom: 7px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--side-accent);
+}
+.sidebar-foot { margin-top: auto; padding: 12px 16px 16px; border-top: 1px solid var(--side-line); font-size: 11px; color: var(--side-muted); display: flex; justify-content: space-between; gap: 8px; font-family: var(--mono); }
+
+.main { min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  position: sticky; top: 0; z-index: 5; background: var(--topbar);
+  backdrop-filter: blur(6px); border-bottom: 1px solid var(--frame);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap;
+  padding: 12px 28px;
+}
+.topbar h2 { font-size: 17px; font-weight: 650; display: flex; align-items: center; gap: 10px; }
+.topbar h2::before { content: ""; width: 4px; height: 18px; border-radius: 2px; background: var(--edge); }
+.topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.status-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px;
+  border: 1px solid var(--line-strong); background: var(--surface); border-radius: 999px;
+  font-size: 12px; color: var(--muted); white-space: nowrap; max-width: 260px;
+}
+.chip code { font-size: 11px; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+.chip-key { color: var(--faint); }
+.chip-user { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); overflow: hidden; text-overflow: ellipsis; }
+
+/* Night mode switch */
+.theme-switch {
+  display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 9px;
+  border: 1px solid var(--frame); border-radius: 999px; background: var(--surface); cursor: pointer;
+}
+.theme-icon { display: inline-grid; place-items: center; color: var(--faint); transition: color .15s; }
+.theme-icon svg { width: 14px; height: 14px; }
+[data-theme="light"] .theme-sun { color: #c27c00; }
+[data-theme="dark"] .theme-moon { color: var(--accent); }
+
+.content { padding: 22px 28px 48px; width: 100%; max-width: 1240px; }
+
+/* Pages and framed sections */
+.tab-page { display: none; }
+.tab-page.active { display: block; animation: page-in .24s cubic-bezier(.22,1,.36,1); }
+@keyframes page-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.panel-stack { display: flex; flex-direction: column; gap: 16px; }
+.panel-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.panel-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+.panel-card {
+  background: var(--surface); border: 1px solid var(--frame); border-radius: var(--radius);
+  box-shadow: inset 0 3px 0 var(--edge);
+  padding: 18px 18px 16px; min-width: 0;
+}
+.span-2 { grid-column: 1 / -1; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.section-head > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.section-title { font-size: 14px; font-weight: 650; color: var(--text); }
+.section-meta { color: var(--faint); font-size: 12px; }
+.section-desc { color: var(--muted); font-size: 12px; margin: -6px 0 12px; }
+.state-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; border-radius: 999px;
+  font-size: 12px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--line-strong); white-space: nowrap;
+}
+.state-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
+.state-pill.on { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }
+.state-pill.on::before { background: var(--ok); box-shadow: 0 0 0 3px var(--ring); }
+
+/* Overview stats */
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.stat {
+  background: var(--surface); border: 1px solid var(--frame); border-left: 4px solid var(--edge);
+  border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; min-width: 0;
+}
+.stat dt { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.stat dt svg { width: 14px; height: 14px; color: var(--accent); }
+.stat dd { font-size: 22px; font-weight: 650; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 34px; padding: 0 14px; border-radius: var(--radius-sm);
+  font: inherit; font-size: 13px; font-weight: 600; white-space: nowrap;
+  cursor: pointer; border: 1px solid transparent; text-decoration: none;
+  transition: background .12s, border-color .12s, color .12s, box-shadow .12s, transform .12s;
+}
+.btn-sm { height: 30px; padding: 0 11px; font-size: 12px; }
+.btn-primary { background: var(--accent); border-color: var(--frame); color: var(--on-accent); }
+.btn-primary:hover { background: var(--accent-hover); box-shadow: 0 0 0 3px var(--ring); }
+.btn-secondary { background: var(--surface); border-color: var(--frame); color: var(--text); }
+.btn-secondary:hover { background: var(--accent-soft); color: var(--accent); }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.btn-ghost:hover { background: var(--surface-2); color: var(--text); }
+.btn-danger { background: transparent; border-color: var(--danger-line); color: var(--danger); }
+.btn-danger:hover { background: var(--danger-soft); }
+.btn:disabled, .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
+.icon-btn {
+  width: 30px; height: 30px; display: inline-grid; place-items: center; flex-shrink: 0;
+  border-radius: var(--radius-sm); border: 1px solid var(--line-strong); background: var(--surface); color: var(--muted);
+  cursor: pointer; transition: background .12s, color .12s, border-color .12s, transform .12s;
+}
+.icon-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--edge); background: var(--accent-soft); }
+.icon-btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger-line); background: var(--danger-soft); }
+.btn-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.toolbar .spacer { flex: 1 1 auto; }
+.busy { opacity: .6; pointer-events: none; }
+
+/* Badges */
+.badge {
+  display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px;
+  font-size: 12px; font-weight: 550; white-space: nowrap; border: 1px solid transparent;
+}
+.badge-ok { background: var(--ok-soft); color: var(--ok); border-color: var(--ok-line); }
+.badge-expired { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-line); }
+.badge-none { background: var(--surface-2); color: var(--muted); border-color: var(--line-strong); }
+.badge-active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+
+/* Forms */
+.form-group { margin-bottom: 12px; min-width: 0; }
+.form-group:last-child { margin-bottom: 0; }
+.form-group > label, .field-label { display: block; font-size: 12px; font-weight: 550; color: var(--muted); margin-bottom: 5px; }
+.form-group input, .form-group textarea, .form-group select, .control {
+  width: 100%; height: 34px; padding: 0 10px; border-radius: var(--radius-sm); border: 1px solid var(--line-strong);
+  background: var(--surface-2); color: var(--text); font: inherit; font-size: 13px;
+}
+.form-group textarea { height: auto; min-height: 64px; padding: 8px 10px; resize: vertical; font-family: var(--mono); font-size: 12px; }
+.form-group input.mono-input { font-family: var(--mono); font-size: 12px; }
+.form-group input:focus, .form-group textarea:focus, .form-group select:focus, .control:focus {
+  outline: none; border-color: var(--edge); box-shadow: 0 0 0 3px var(--ring);
+}
+.form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.field-note { font-size: 12px; color: var(--faint); margin-top: 6px; }
+.required { color: var(--danger); }
+
+/* Switch */
+.switch-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
+.switch-row + .switch-row { border-top: 1px solid var(--line); }
+.switch-text { min-width: 0; }
+.switch-text strong { display: block; font-size: 13px; font-weight: 600; }
+.switch-text span { display: block; font-size: 12px; color: var(--muted); }
+.switch { position: relative; display: inline-flex; width: 36px; height: 20px; flex-shrink: 0; cursor: pointer; }
+.switch input { position: absolute; inset: 0; opacity: 0; cursor: pointer; margin: 0; z-index: 1; }
+.switch .track { width: 100%; height: 100%; border-radius: 999px; background: var(--line-strong); border: 1px solid var(--frame); transition: background .15s; }
+.switch .track::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--knob); box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform .15s;
+}
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(16px); background: var(--on-accent); }
+.switch input:focus-visible + .track { outline: 2px solid var(--edge); outline-offset: 2px; }
+
+/* Segmented control */
+.segmented { display: inline-flex; padding: 2px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--frame); }
+.segmented label { position: relative; cursor: pointer; }
+.segmented input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.segmented span { display: inline-flex; align-items: center; height: 28px; padding: 0 12px; border-radius: 5px; font-size: 12px; font-weight: 550; color: var(--muted); white-space: nowrap; }
+.segmented input:checked + span { background: var(--accent); color: var(--on-accent); }
+.segmented input:focus-visible + span { outline: 2px solid var(--edge); }
+
+/* Check chips */
+.option-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.inline-check {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface);
+  font-size: 12px; color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.inline-check:has(input:checked) { border-color: var(--edge); background: var(--accent-soft); color: var(--accent); }
+.inline-check input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; }
+.inline-field select, .inline-field input { height: 26px; padding: 0 6px; border: 1px solid var(--line-strong); border-radius: 5px; font: inherit; font-size: 12px; background: var(--surface-2); color: var(--text); }
+.inline-field input[type=number] { width: 70px; }
+
+/* Tables */
+.table-wrap { overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.acct-table, .usage-table, .conn-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.acct-table { min-width: 760px; }
+.acct-table th, .acct-table td, .usage-table th, .usage-table td, .conn-table th, .conn-table td {
+  text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: middle;
+}
+.acct-table tbody tr:last-child td, .usage-table tbody tr:last-child td, .conn-table tbody tr:last-child td { border-bottom: none; }
+.acct-table th, .usage-table th, .conn-table th {
+  font-size: 12px; font-weight: 600; color: var(--muted); background: var(--surface-2);
+  border-bottom: 1px solid var(--line-strong);
+  position: sticky; top: 0; z-index: 1; white-space: nowrap;
+}
+.acct-table tbody tr:hover, .usage-table tbody tr:hover { background: var(--row-hover); }
+.acct-table tbody tr.active-row { background: var(--row-active); box-shadow: inset 3px 0 var(--edge); }
+.acct-table tbody tr.row-failed { background: var(--danger-soft); }
+.acct-table tbody tr.checkin-row-busy { opacity: .7; }
+.acct-cell { min-width: 0; }
+.acct-cell strong { font-weight: 600; }
+.status-cell { white-space: nowrap; }
+.status-cell .badge + .badge { margin-left: 4px; }
+.numeric { text-align: right !important; font-variant-numeric: tabular-nums; }
+.credit-value { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.muted-cell { color: var(--faint); font-size: 12px; white-space: nowrap; font-family: var(--mono); }
+.row-subtitle { display: block; color: var(--faint); font-size: 11px; margin-top: 2px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions-col { width: 120px; }
+.row-actions { white-space: nowrap; }
+.row-actions .icon-btn + .icon-btn { margin-left: 4px; }
+.empty-state { padding: 28px 12px; text-align: center; color: var(--faint); font-size: 13px; border: 1px dashed var(--frame); border-radius: var(--radius); }
+.usage-records-container { max-height: calc(100vh - 220px); min-height: 160px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.usage-table { min-width: 720px; table-layout: fixed; }
+.usage-table th:nth-child(1) { width: 170px; }
+.usage-table th:nth-child(2) { width: 130px; }
+.usage-table th:nth-child(4) { width: 190px; }
+.usage-table th:nth-child(5) { width: 100px; }
+.usage-table th:nth-child(6) { width: 90px; }
+.usage-table td { overflow-wrap: anywhere; }
+.usage-table .usage-status { white-space: nowrap; }
+.usage-empty { padding: 28px 12px; color: var(--faint); text-align: center; font-size: 13px; }
+.conn-wrap { margin-top: 14px; overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.conn-table { min-width: 640px; font-size: 12px; }
+.conn-table td { vertical-align: top; }
+.conn-table td.conn-detail { color: var(--muted); overflow-wrap: anywhere; font-family: var(--mono); font-size: 11px; }
+.conn-table .conn-reasoning { margin-top: 4px; white-space: pre-wrap; font-family: inherit; }
+.conn-status { white-space: nowrap; }
+.conn-status.ok { color: var(--ok); font-weight: 600; }
+.conn-status.fail { color: var(--danger); font-weight: 600; }
+.conn-status.pending { color: var(--muted); }
+.conn-time { white-space: nowrap; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+/* Login & schedule */
+.login-steps { margin: 0 0 4px; padding-left: 18px; font-size: 12px; color: var(--muted); line-height: 1.8; }
+.login-steps code { background: var(--surface-2); border: 1px solid var(--line-strong); padding: 1px 5px; border-radius: 4px; font-size: 11px; color: var(--text); }
+.manual-add { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.manual-add summary { font-size: 13px; color: var(--muted); cursor: pointer; font-weight: 550; }
+.manual-add summary:hover { color: var(--accent); }
+.manual-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 12px; margin-top: 12px; }
+.manual-grid .span-all { grid-column: 1 / -1; }
+.manual-submit { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.manual-submit .msg { margin-top: 0; }
+.schedule-row { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
+.time-field { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.time-field input[type=time] { width: 112px; }
+.schedule-status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--edge); border-radius: var(--radius-sm); }
+.schedule-status div { min-width: 0; }
+.schedule-status dt { font-size: 11px; color: var(--faint); }
+.schedule-status dd { font-size: 13px; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.max-models { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.model-chip { border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); border-radius: var(--radius-sm); height: 28px; padding: 0 9px; font: inherit; font-family: var(--mono); font-size: 12px; cursor: pointer; }
+.model-chip:hover { border-color: var(--edge); color: var(--accent); background: var(--accent-soft); }
+pre.code-out { margin-top: 12px; padding: 12px; background: var(--side-bg); color: #b8f5cd; border: 1px solid var(--frame); border-radius: var(--radius-sm); font-family: var(--mono); font-size: 12px; max-height: 360px; overflow: auto; white-space: pre-wrap; display: none; }
+
+/* Feedback */
+.msg { margin-top: 12px; padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; display: none; line-height: 1.45; white-space: pre-wrap; }
+.msg-ok { background: var(--ok-soft); color: var(--ok); display: block; border: 1px solid var(--ok-line); }
+.msg-err { background: var(--danger-soft); color: var(--danger); display: block; border: 1px solid var(--danger-line); }
+.inline-msg { margin-top: 0; }
+.account-msgs .msg { margin-top: 10px; }
+.loading { margin-top: 12px; display: none; font-size: 13px; color: var(--muted); }
+.busy-indicator { display: none; color: var(--muted); font-size: 12px; align-items: center; gap: 6px; }
+.busy-indicator.visible { display: inline-flex; }
+.busy-indicator::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--line-strong); border-top-color: var(--edge); border-radius: 50%; animation: relay-spin .7s linear infinite; }
+@keyframes relay-spin { to { transform: rotate(360deg); } }
+.toast { position: fixed; top: 16px; right: 16px; z-index: 30; width: min(400px, calc(100vw - 32px)); padding: 12px 14px; border: 1px solid var(--frame); border-left: 4px solid var(--ok); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: var(--shadow); opacity: 0; transform: translateY(-8px); pointer-events: none; transition: opacity .18s, transform .18s; white-space: pre-wrap; line-height: 1.45; font-size: 13px; }
+.toast.visible { opacity: 1; transform: translateY(0); }
+.toast.error { border-left-color: var(--danger); }
+.toast-title { display: block; font-size: 12px; font-weight: 650; margin-bottom: 2px; color: var(--ok); }
+.toast.error .toast-title { color: var(--danger); }
+
+/* Overview */
+.stats.stats-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.stat dd.stat-sub { font-size: 11px; font-weight: 400; color: var(--faint); font-family: inherit; }
+.ov-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+.chart-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; min-height: 40px; padding: 8px 12px; margin-bottom: 12px; background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--edge); border-radius: var(--radius-sm); font-size: 12px; color: var(--muted); }
+.chart-readout strong { color: var(--text); font-family: var(--mono); font-weight: 650; }
+.readout-date { color: var(--text); font-weight: 650; font-family: var(--mono); min-width: 84px; }
+.readout-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.sw-in { background: var(--chart-in); } .sw-cache { background: var(--chart-cache); } .sw-out { background: var(--chart-out); }
+.chart-wrap { display: grid; grid-template-columns: 52px minmax(0, 1fr); column-gap: 8px; }
+.chart-y { display: flex; flex-direction: column; justify-content: space-between; height: 220px; font-size: 10px; color: var(--faint); font-family: var(--mono); text-align: right; }
+.chart-y span { line-height: 1; transform: translateY(-50%); }
+.chart-y span:last-child { transform: none; }
+.chart {
+  height: 220px; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 3px; align-items: end;
+  border-bottom: 1px solid var(--line-strong);
+  background-image: linear-gradient(to bottom, var(--line) 1px, transparent 1px); background-size: 100% 25%;
+}
+.bar-col { height: 100%; display: flex; justify-content: center; cursor: pointer; border-radius: 3px 3px 0 0; outline: none; transition: background .15s; }
+.bar-col:hover, .bar-col:focus-visible { background: var(--accent-soft); }
+.bar-col.sel { background: var(--row-active); box-shadow: inset 0 -2px var(--edge); }
+.bar-col:focus-visible { box-shadow: inset 0 0 0 2px var(--edge); }
+.bar-stack { width: min(70%, 22px); height: 100%; display: flex; flex-direction: column; justify-content: flex-end; }
+.bar-seg { display: block; width: 100%; height: 0; transition: height .55s var(--ease-out); }
+.seg-out { background: var(--chart-out); border-radius: 3px 3px 0 0; }
+.seg-in { background: var(--chart-in); }
+.seg-cache { background: var(--chart-cache); }
+.chart-axis { grid-column: 2; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 3px; margin-top: 6px; font-size: 10px; color: var(--faint); font-family: var(--mono); }
+.chart-axis span { text-align: center; white-space: nowrap; overflow: visible; }
+.chart-empty { grid-column: 2; padding: 6px 0 0; font-size: 12px; color: var(--faint); }
+.kv-list { display: flex; flex-direction: column; }
+.kv-list div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.kv-list div:last-child { border-bottom: none; }
+.kv-list dt { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.kv-list dd { font-size: 12px; font-family: var(--mono); color: var(--text); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.day-wrap { max-height: 440px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.day-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 12px; }
+.day-table th, .day-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.day-table th:first-child, .day-table td:first-child { text-align: left; }
+.day-table th { font-weight: 600; color: var(--muted); background: var(--surface-2); border-bottom: 1px solid var(--line-strong); position: sticky; top: 0; z-index: 1; }
+.day-table td { font-family: var(--mono); }
+.day-table tbody tr { cursor: pointer; transition: background .15s, box-shadow .25s var(--ease-out); }
+.day-table tbody tr:hover { background: var(--row-hover); }
+.day-table tbody tr.sel { background: var(--row-active); box-shadow: inset 3px 0 var(--edge); }
+.day-table tbody tr.zero td { color: var(--faint); }
+.day-table tfoot td { font-weight: 650; background: var(--surface-2); border-top: 1px solid var(--line-strong); border-bottom: none; position: sticky; bottom: 0; }
+.day-table .badge { margin-left: 6px; font-family: inherit; }
+@media (max-width: 1280px) { .stats.stats-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 1080px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 820px) {
+  .stats.stats-6 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chart, .chart-y { height: 180px; }
+  .chart-wrap { grid-template-columns: 40px minmax(0, 1fr); column-gap: 6px; }
+  .chart, .chart-axis { gap: 2px; }
+}
+
+/* Selection motion */
+:root { --ease-out: cubic-bezier(.22,1,.36,1); --ease-spring: cubic-bezier(.34,1.56,.64,1); }
+.nav-list { position: relative; }
+.nav-item { z-index: 1; }
+.nav-item svg { transition: transform .28s var(--ease-spring); }
+.nav-item:hover svg { transform: translateX(2px); }
+.nav-item.active svg { transform: scale(1.12); }
+.nav-indicator {
+  position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 0; opacity: 0; pointer-events: none;
+  border-radius: var(--radius-sm); background: var(--side-active); border: 1px solid rgba(74,222,128,.45);
+}
+.nav-indicator::before {
+  content: ""; position: absolute; left: -11px; top: 7px; bottom: 7px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--side-accent); box-shadow: 0 0 10px rgba(74,222,128,.55);
+}
+.nav-indicator.ready { transition: transform .34s var(--ease-out), width .34s var(--ease-out), height .34s var(--ease-out), opacity .2s; }
+.has-indicator .nav-item.active, .has-indicator .nav-item.active:hover { background: transparent; border-color: transparent; }
+.has-indicator .nav-item.active::before { display: none; }
+
+.segmented { position: relative; }
+.segmented label { z-index: 1; }
+.segmented span { transition: color .2s, transform .15s var(--ease-spring); }
+.segmented label:active span { transform: scale(.95); }
+.seg-thumb {
+  position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 0; opacity: 0; pointer-events: none;
+  border-radius: 5px; background: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,.25);
+}
+.seg-thumb.ready { transition: transform .32s var(--ease-out), width .32s var(--ease-out), opacity .2s; }
+.has-thumb input:checked + span { background: transparent; }
+
+.switch .track { transition: background .2s, box-shadow .2s; }
+.switch .track::after { transition: transform .3s var(--ease-spring), width .16s ease, background .2s; }
+.switch:active .track::after { width: 18px; }
+.switch input:checked:active + .track::after { transform: translateX(12px); }
+.switch input:checked + .track { box-shadow: 0 0 0 3px var(--ring); }
+
+.inline-check { transition: border-color .15s, background .15s, color .15s, transform .12s; }
+.inline-check:active { transform: scale(.97); }
+.inline-check:has(input:checked) { animation: sel-pop .32s var(--ease-spring); }
+@keyframes sel-pop { 0% { transform: scale(.95); } 60% { transform: scale(1.04); } 100% { transform: scale(1); } }
+
+.model-chip { transition: border-color .12s, color .12s, background .12s, transform .12s; }
+.btn:active:not(:disabled), .icon-btn:active:not(:disabled), .model-chip:active { transform: scale(.96); }
+
+.acct-table tbody tr { transition: background .2s, box-shadow .25s var(--ease-out); }
+.acct-table tbody tr.active-row { animation: row-select .6s var(--ease-out); }
+@keyframes row-select { 0% { background: var(--accent-soft); box-shadow: inset 0 0 var(--edge); } 100% { box-shadow: inset 3px 0 var(--edge); } }
+
+.theme-icon svg { transition: transform .45s var(--ease-spring); transform: scale(.85); }
+[data-theme="light"] .theme-sun svg { transform: rotate(180deg) scale(1.1); }
+[data-theme="dark"] .theme-moon svg { transform: rotate(-20deg) scale(1.1); }
+html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
+  transition: background-color .3s ease, border-color .3s ease, color .3s ease, box-shadow .3s ease, transform .3s var(--ease-spring) !important;
+}
+@media (max-width: 820px) {
+  .nav-indicator::before { left: 10px; right: 10px; top: auto; bottom: 3px; width: auto; height: 2px; border-radius: 2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media (max-width: 1080px) {
+  .panel-grid.cols-2 { grid-template-columns: minmax(0, 1fr); }
+  .manual-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 820px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: sticky; top: 0; z-index: 10; height: auto; flex-direction: row; align-items: center; border-right: none; border-bottom: 2px solid var(--edge); overflow: visible; }
+  .brand { padding: 10px 12px; border-bottom: none; }
+  .brand-block { display: none; }
+  .nav-list { flex-direction: row; overflow-x: auto; padding: 8px 8px 8px 0; flex: 1; scrollbar-width: none; }
+  .nav-item { width: auto; white-space: nowrap; height: 34px; padding: 0 10px; }
+  .nav-item.active::before { display: none; }
+  .sidebar-foot { display: none; }
+  .topbar { position: static; padding: 12px 14px; }
+  .content { padding: 14px 14px 36px; }
+  .panel-card { padding: 16px 14px 14px; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .stat dd { font-size: 18px; }
+  .manual-grid { grid-template-columns: minmax(0, 1fr); }
+  .schedule-status { grid-template-columns: minmax(0, 1fr); }
+  .toolbar .btn { flex: 1 1 140px; }
+  .toolbar .spacer { display: none; }
+}"""
+
+
 def _status_badge() -> str:
     s = auth.get_auth()
     if s.token and s.is_valid():
@@ -701,24 +1319,15 @@ def _web_login_html() -> str:
     settings = auth.get_settings()
     auto_route_on = _auto_route_enabled()
 
-    # 根据当前状态显示不同文案
+    # Header status chips; the active-user chip is updated in place by JS.
+    upstream_label = AUTO_ROUTE_MODE if auto_route_on else _current_upstream_mode()
     status_html = f"""
-    <div class="status-row">
-      <span class="label">状态</span>
+    <div class="status-chips">
       {_status_badge()}
-      <span id="active-user-id" class="user-id"{' hidden' if not state.user_id else ''}>{f'用户: {html_mod.escape(state.user_id)}' if state.user_id else ''}</span>
-    </div>
-    <div class="status-row">
-      <span class="label">源</span>
-      <code>{html_mod.escape(state.source)}</code>
-      <span class="label separator">上游</span>
-      <code>{html_mod.escape(AUTO_ROUTE_MODE if auto_route_on else _current_upstream_mode())}</code>
-    </div>
-    <div class="status-row">
-      <span class="label">轮询</span>
-      <code>{'开' if polling.get('enabled') else '关'}</code>
-      <span class="label separator">账号数</span>
-      <code>{polling.get('account_count', 0)}</code>
+      <span id="active-user-id" class="chip chip-user"{' hidden' if not state.user_id else ''}>{f'用户: {html_mod.escape(state.user_id)}' if state.user_id else ''}</span>
+      <span class="chip" title="凭据来源"><span class="chip-key">源</span><code>{html_mod.escape(state.source)}</code></span>
+      <span class="chip" title="当前上游模式"><span class="chip-key">上游</span><code>{html_mod.escape(upstream_label)}</code></span>
+      <span class="chip"><span class="chip-key">轮询</span><code>{'开' if polling.get('enabled') else '关'}</code></span>
     </div>"""
 
     # Consumption history is rendered in its own panel below the account list.
@@ -740,11 +1349,19 @@ def _web_login_html() -> str:
       <div id="usage-empty" class="usage-empty">暂无消费记录</div>
     </div>"""
 
+    ic = {name: _icon(name) for name in _LUCIDE_ICONS}
+
     # 账号列表
     rows = ""
+    stat_valid = 0
+    stat_checked = 0
+    stat_remaining = 0.0
+    stat_known = False
+    stat_unlimited = False
     for acc in accounts:
         if acc.get("is_valid"):
             st = '<span class="badge badge-ok">有效</span>'
+            stat_valid += 1
         else:
             st = '<span class="badge badge-expired">无效</span>'
         act = (
@@ -752,72 +1369,67 @@ def _web_login_html() -> str:
             if acc.get("is_active")
             else '<span class="badge badge-active" data-account-active hidden>当前</span>'
         )
-        active_row = " active-row" if acc.get("is_active") else ""
+        active_row = "active-row" if acc.get("is_active") else ""
         switch_disabled = " disabled" if acc.get("is_active") else ""
-        aid = acc.get("id") or ""
-        label = acc.get("label") or acc.get("user_id") or aid
-        uid = acc.get("user_id") or aid
-        expires = (acc.get("expires") or "")[:16]
+        aid = html_mod.escape(acc.get("id") or "")
+        label = html_mod.escape(acc.get("label") or acc.get("user_id") or acc.get("id") or "")
+        uid = html_mod.escape(acc.get("user_id") or acc.get("id") or "")
+        expires = html_mod.escape((acc.get("expires") or "")[:16])
         account_credits = acc.get("account_credits") or {}
         if account_credits.get("unlimited"):
             credits_text = "☆ 无限"
+            stat_unlimited = True
         elif account_credits.get("remaining") is not None:
-            credits_text = f"剩{float(account_credits['remaining']):.2f}/总{float(account_credits.get('total_limit') or 0):.2f}"
+            remaining = float(account_credits["remaining"])
+            credits_text = f"剩{remaining:.2f}/总{float(account_credits.get('total_limit') or 0):.2f}"
+            stat_remaining += remaining
+            stat_known = True
         else:
             credits_text = "-"
-        credits = acc.get("credits")
         checked_in = acc.get("checked_in")
         if checked_in is True:
             checkin_badge = '<span class="badge badge-ok">已签到</span>'
+            stat_checked += 1
         elif checked_in is False:
             checkin_badge = '<span class="badge badge-active">未签到</span>'
         else:
             checkin_badge = '<span class="badge badge-none">未知</span>'
-        rows += f"""<tr id="row-{html_mod.escape(aid)}" class="{active_row.strip()}" data-account-id="{html_mod.escape(aid)}">
-          <td><strong id="label-{html_mod.escape(aid)}">{html_mod.escape(label)}</strong><small class="row-subtitle">{html_mod.escape(uid)}</small></td>
-          <td><code>{html_mod.escape(uid)}</code></td>
-          <td>{st} {act}</td>
-          <td class="muted-cell">{html_mod.escape(expires)}</td>
-          <td><span id="general-credits-{html_mod.escape(aid)}" class="credit-value">{credits_text}</span></td>
-          <td><span id="checkin-{html_mod.escape(aid)}" class="checkin-state">{checkin_badge}</span><small id="checkin-detail-{html_mod.escape(aid)}" class="row-subtitle"></small></td>
+        valid_flag = "1" if acc.get("is_valid") else "0"
+        rows += f"""<tr id="row-{aid}" class="{active_row}" data-account-id="{aid}" data-valid="{valid_flag}">
+          <td><div class="acct-cell"><strong id="label-{aid}">{label}</strong><small class="row-subtitle mono">{uid}</small></div></td>
+          <td class="status-cell">{st}{act}</td>
+          <td class="muted-cell">{expires}</td>
+          <td class="numeric"><span id="general-credits-{aid}" class="credit-value">{credits_text}</span></td>
+          <td><span id="checkin-{aid}" class="checkin-state">{checkin_badge}</span><small id="checkin-detail-{aid}" class="row-subtitle"></small></td>
           <td class="row-actions">
-            <button class="btn btn-ghost btn-sm" data-action="checkin" onclick="checkinAccount('{html_mod.escape(aid)}')" title="签到">签到</button>
-            <button class="btn btn-ghost btn-sm" data-action="switch-account" onclick="switchAccount('{html_mod.escape(aid)}')" title="切换当前账号"{switch_disabled}>切换</button>
-            <button class="btn btn-danger btn-sm" onclick="removeAccount('{html_mod.escape(aid)}')" title="删除账号">删除</button>
+            <button class="icon-btn" data-action="checkin" onclick="checkinAccount('{aid}')" title="签到" aria-label="签到">{ic['calendar-check']}</button>
+            <button class="icon-btn" data-action="switch-account" onclick="switchAccount('{aid}')" title="切换为当前账号" aria-label="切换为当前账号"{switch_disabled}>{ic['arrow-left-right']}</button>
+            <button class="icon-btn danger" onclick="removeAccount('{aid}')" title="删除账号" aria-label="删除账号">{ic['trash-2']}</button>
           </td>
         </tr>"""
     if accounts:
-        accounts_html = f"""<div class="form-group">
-          <div class="section-head"><div><label>账号列表（{len(accounts)}）</label><span id="checkin-summary" class="section-meta">等待查询</span></div><span id="checkin-updated" class="section-meta"></span></div>
-          <div class="btn-group account-toolbar" aria-live="polite">
-            <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">查询签到状态</button>
-            <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">查询全部积分</button>
-            <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">一键轮询签到</button>
-            <span id="account-msg" class="msg inline-msg" role="status" aria-live="polite"></span>
-            <span id="checkin-msg" class="msg inline-msg" role="status" aria-live="polite"></span>
-            <span id="checkin-busy" class="busy-indicator" role="status" aria-live="polite">正在处理...</span>
-          </div>
+        accounts_html = f"""<div class="table-wrap">
           <table class="acct-table">
-            <thead><tr><th>账号</th><th>用户ID</th><th>状态</th><th>有效期</th><th>通用积分</th><th>签到状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>账号</th><th>状态</th><th>有效期</th><th class="numeric">通用积分</th><th>签到状态</th><th class="actions-col">操作</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </div>"""
     else:
-        # Keep the account actions in the DOM even before the first login.
-        # This gives the console a stable control surface and lets the same
-        # frontend code handle an account list that becomes populated after a
-        # login without requiring a page-specific script branch.
-        accounts_html = '''
-        <p class="card-hint">暂无账号，请先登录或手动添加。</p>
-        <div class="account-toolbar" hidden>
-          <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">查询签到状态</button>
-          <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">查询全部积分</button>
-          <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">一键轮询签到</button>
-        </div>'''
+        accounts_html = '<div class="empty-state">暂无账号，请先授权登录或手动添加。</div>'
+    # The toolbar stays in the DOM before the first login so the same script
+    # handles an account list that becomes populated later.
+    toolbar_hidden = "" if accounts else " hidden"
+    stat_total = len(accounts)
+    if stat_unlimited:
+        stat_credits = "无限"
+    elif stat_known:
+        stat_credits = f"{stat_remaining:.2f}"
+    else:
+        stat_credits = "-"
 
     logout_btn = ''
     if state.token:
-        logout_btn = '<button class="btn btn-ghost btn-sm" onclick="logout()">登出</button>'
+        logout_btn = f'<button class="icon-btn" onclick="logout()" title="登出" aria-label="登出">{ic["log-out"]}</button>'
 
     settings_web = settings.get("web_base_url") or WEB_BASE
     settings_port = settings.get("relay_port") or PORT
@@ -862,6 +1474,10 @@ def _web_login_html() -> str:
     auto_checkin = auth.get_auto_checkin_settings()
     auto_checkin_checked = 'checked' if auto_checkin.get('enabled') else ''
     auto_checkin_time = html_mod.escape(auto_checkin.get('time') or '08:30')
+    poll_pill = ' on' if polling.get('enabled') else ''
+    auto_route_pill = ' on' if auto_route_on else ''
+    max_pill = ' on' if max_settings.get('enabled') else ''
+    auto_checkin_pill = ' on' if auto_checkin.get('enabled') else ''
     auto_checkin_state_text = (
         f"每天 {auto_checkin_time} 自动签到" if auto_checkin.get('enabled') else '已关闭'
     )
@@ -871,247 +1487,20 @@ def _web_login_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Trae CN Relay 控制台</title>
+{_FAVICON_LINKS}
+<script>
+(function(){{
+  try {{
+    var t = localStorage.getItem('relay-theme');
+    if (t !== 'dark' && t !== 'light') t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', t);
+  }} catch (e) {{ document.documentElement.setAttribute('data-theme', 'light'); }}
+}})();
+</script>
 <style>
-:root {{
-  --bg: #eef0f4;
-  --panel: #ffffff;
-  --panel2: #f6f7fa;
-  --border: #e3e6ec;
-  --border-strong: #c9cfdb;
-  --text: #1d2331;
-  --muted: #5b6474;
-  --faint: #8b93a5;
-  --accent: #0d8a5f;
-  --accent-strong: #0a7451;
-  --accent-soft: #e2f3eb;
-  --accent-border: #bfe3d3;
-  --info: #2563eb;
-  --info-soft: #e9effd;
-  --info-border: #c8d8f8;
-  --warn: #b45309;
-  --warn-soft: #fdf1e2;
-  --warn-border: #f3dcb8;
-  --danger: #dc2626;
-  --danger-soft: #fdecec;
-  --danger-border: #f3c6c6;
-  --sidebar-bg: #181b25;
-  --sidebar-hover: #232838;
-  --sidebar-active: #272d40;
-  --sidebar-text: #a7aebf;
-  --sidebar-border: #262b3a;
-}}
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-  background: var(--bg); color: var(--text); min-height: 100vh;
-  font-size: 14px; line-height: 1.5;
-}}
-.app {{ display: flex; min-height: 100vh; }}
-.sidebar {{
-  width: 232px; flex-shrink: 0; background: var(--sidebar-bg); color: var(--sidebar-text);
-  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
-  overflow-y: auto;
-}}
-.brand {{ display: flex; align-items: center; gap: 10px; padding: 18px 16px 16px; border-bottom: 1px solid var(--sidebar-border); }}
-.brand-mark {{
-  width: 34px; height: 34px; border-radius: 8px; flex-shrink: 0;
-  background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center;
-  font-size: 13px; font-weight: 700; letter-spacing: 0;
-}}
-.brand-block {{ display: flex; flex-direction: column; min-width: 0; }}
-.brand-block h1 {{ font-size: 15px; font-weight: 650; color: #f2f4f8; letter-spacing: 0; white-space: nowrap; }}
-.brand-sub {{ color: #79839a; font-size: 11px; margin-top: 1px; }}
-.nav-list {{ display: flex; flex-direction: column; gap: 2px; padding: 12px; }}
-.nav-item {{
-  display: flex; align-items: center; gap: 10px; width: 100%;
-  border: none; background: transparent; color: var(--sidebar-text);
-  font-size: 13px; font-weight: 550; padding: 9px 12px; border-radius: 8px; cursor: pointer;
-  transition: background .15s, color .15s; font-family: inherit; text-align: left;
-}}
-.nav-item svg {{ width: 16px; height: 16px; flex-shrink: 0; opacity: .9; }}
-.nav-item:hover {{ color: #e8ebf2; background: var(--sidebar-hover); }}
-.nav-item.active {{ color: #fff; background: var(--sidebar-active); box-shadow: inset 2px 0 0 var(--accent); }}
-.sidebar-status {{ padding: 12px 16px; border-top: 1px solid var(--sidebar-border); margin-top: auto; }}
-.sidebar-foot {{ padding: 12px 16px 16px; border-top: 1px solid var(--sidebar-border); }}
-.main {{ flex: 1; min-width: 0; padding: 24px 28px 48px; }}
-.main-inner {{ max-width: 1180px; margin: 0 auto; }}
-.status-strip {{ display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--sidebar-text); }}
-.status-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
-.status-row .label {{ color: #6d7690; min-width: 30px; }}
-.status-row .separator {{ margin-left: 4px; }}
-.status-row code {{ background: #232838; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: #c3c9d8; }}
-.user-id {{ color: #7db3f5; font-size: 12px; }}
-.tab-page {{ display: none; }}
-.tab-page.active {{ display: block; }}
-.panel-grid {{ display: grid; grid-template-columns: 1fr; gap: 14px; }}
-.panel-grid.cols-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }}
-.panel-stack {{ display: flex; flex-direction: column; gap: 14px; }}
-.login-layout {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px 24px; align-items: start; }}
-.login-steps {{ margin: 0; padding-left: 18px; font-size: 12px; color: var(--muted); line-height: 1.7; }}
-.login-steps code {{ background: var(--panel2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-size: 11px; color:#39415a; }}
-.login-steps a {{ color: var(--info); }}
-.login-actions {{ display: flex; flex-direction: column; align-items: flex-end; }}
-.login-actions .btn-group {{ margin-top: 0; justify-content: flex-end; }}
-.login-actions .btn-group + .btn-group {{ margin-top: 8px; }}
-.manual-add {{ margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }}
-.manual-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 12px; margin-top: 12px; }}
-.manual-grid .span-all {{ grid-column: 1 / -1; }}
-.manual-submit {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }}
-.manual-submit .msg {{ margin-top: 0; }}
-.panel-card {{
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 18px 20px;
-  min-width: 0;
-  overflow-x: auto;
-  box-shadow: 0 1px 2px rgba(20,26,40,.05);
-}}
-.section-head {{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
-.section-head > div {{ display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }}
-.section-meta {{ color:var(--faint); font-size:12px; font-weight:400; }}
-.badge {{ display:inline-flex; align-items:center; gap:4px; font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 600; white-space:nowrap; }}
-[hidden] {{ display:none !important; }}
-.badge-ok {{ background: var(--accent-soft); color: var(--accent-strong); border:1px solid var(--accent-border); }}
-.badge-expired {{ background: var(--warn-soft); color: var(--warn); border:1px solid var(--warn-border); }}
-.badge-none {{ background: var(--panel2); color: var(--muted); border:1px solid var(--border); }}
-.badge-active {{ background: var(--info-soft); color: var(--info); border:1px solid var(--info-border); }}
-hr {{ border: none; border-top: 1px solid var(--border); margin: 16px 0; }}
-.btn {{
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  padding: 9px 18px; border-radius: 8px; font-size: 13px; font-weight: 550;
-  cursor: pointer; border: 1px solid transparent; transition: all .15s;
-  text-decoration: none; min-height: 32px;
-}}
-.btn-sm {{ padding: 5px 10px; font-size: 12px; min-height: 26px; }}
-.btn-primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
-.btn-primary:hover {{ background: var(--accent-strong); border-color: var(--accent-strong); }}
-.btn-primary:disabled {{ opacity: .5; cursor: not-allowed; }}
-.btn-secondary {{ background: var(--panel); border-color: var(--border-strong); color: var(--text); }}
-.btn-secondary:hover {{ background: var(--panel2); }}
-.btn-ghost {{ background: transparent; border-color: var(--border-strong); color: var(--muted); }}
-.btn-ghost:hover {{ border-color: #9aa5b5; color: var(--text); }}
-.btn-danger {{ background: transparent; border-color: var(--danger-border); color: var(--danger); }}
-.btn-danger:hover {{ background: var(--danger-soft); border-color: #e59a9e; }}
-.btn-group {{ display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }}
-.account-toolbar {{ align-items:center; margin: 10px 0 14px; }}
-.account-toolbar .inline-msg {{ margin:0; flex:1 1 260px; }}
-.form-group {{ margin-bottom: 10px; }}
-.form-group label {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
-.form-group input, .form-group textarea, .form-group select {{
-  width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-strong);
-  background: var(--panel); color: var(--text); font-size: 13px; font-family: "SF Mono", Consolas, monospace;
-}}
-.form-group select {{ font-family: inherit; }}
-.form-group textarea {{ resize: vertical; min-height: 60px; }}
-.form-group input:focus, .form-group textarea:focus, .form-group select:focus {{ outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(13,138,95,.12); }}
-.form-inline {{ display:flex; gap:12px; flex-wrap:wrap; }}
-.form-inline .form-group {{ flex:1 1 220px; }}
-.acct-table {{ width: 100%; min-width: 920px; border-collapse: collapse; font-size: 13px; }}
-.acct-table th, .acct-table td {{ text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }}
-.acct-table tbody tr {{ transition: background .15s ease; }}
-.acct-table tbody tr:hover {{ background: var(--panel2); }}
-.acct-table tbody tr.active-row {{ background: var(--accent-soft); box-shadow:inset 3px 0 var(--accent); }}
-.acct-table tbody tr.active-row:hover {{ background:#d5ecdf; }}
-.acct-table tbody tr.row-failed {{ background: var(--danger-soft); }}
-.acct-table tbody tr.row-failed:hover {{ background:#fbdddd; }}
-.acct-table th {{ color: var(--muted); font-weight: 600; font-size: 12px; position:sticky; top:0; background:var(--panel); z-index:1; }}
-.acct-table th:nth-child(5), .acct-table td:nth-child(5) {{ text-align:right; }}
-.credit-value {{ font-variant-numeric: tabular-nums; white-space:nowrap; color:#39415a; }}
-.muted-cell {{ color:var(--faint); font-size:12px; white-space:nowrap; }}
-.row-subtitle {{ display:block; color:var(--faint); font-size:11px; margin-top:3px; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.row-actions {{ white-space:nowrap; }}
-.row-actions .btn {{ margin:2px 0; }}
-.usage-records-container {{ max-height: 320px; overflow: auto; }}
-.usage-table {{ width: 100%; min-width: 760px; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
-.usage-table th, .usage-table td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }}
-.usage-table th {{ color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }}
-.usage-table .numeric {{ text-align: right; font-variant-numeric:tabular-nums; }}
-.usage-table .usage-status {{ white-space:nowrap; }}
-.usage-empty {{ padding: 18px 12px; color: var(--faint); text-align: center; font-size: 13px; }}
-.msg {{ margin-top: 12px; padding: 8px 12px; border-radius: 6px; font-size: 13px; display: none; line-height:1.45; }}
-.msg-ok {{ background: var(--accent-soft); color: var(--accent-strong); display: block; border:1px solid var(--accent-border); }}
-.msg-err {{ background: var(--danger-soft); color: var(--danger); display: block; border:1px solid var(--danger-border); }}
-.busy-indicator {{ display:none; color:var(--muted); font-size:12px; align-items:center; gap:6px; }}
-.busy-indicator.visible {{ display:inline-flex; }}
-.busy-indicator::before {{ content:""; width:10px; height:10px; border:2px solid var(--border-strong); border-top-color:var(--accent); border-radius:50%; animation:relay-spin .7s linear infinite; }}
-@keyframes relay-spin {{ to {{ transform:rotate(360deg); }} }}
-.toast {{ position:fixed; top:20px; right:20px; z-index:20; width:min(420px,calc(100vw - 40px)); padding:12px 14px; border:1px solid var(--border); border-radius:8px; background:var(--panel); color:var(--text); box-shadow:0 12px 32px rgba(20,26,40,.16); opacity:0; transform:translateY(-8px); pointer-events:none; transition:opacity .18s ease, transform .18s ease; white-space:pre-wrap; line-height:1.45; }}
-.toast.visible {{ opacity:1; transform:translateY(0); }}
-.toast.ok {{ border-color:var(--accent-border); }}
-.toast.error {{ border-color:var(--danger-border); color:var(--danger); background:var(--danger-soft); }}
-.toast-title {{ display:block; font-size:12px; font-weight:700; margin-bottom:3px; color:var(--accent-strong); }}
-.toast.error .toast-title {{ color:var(--danger); }}
-.busy {{ opacity:.65; pointer-events:none; }}
-.loading {{ margin-top: 12px; display: none; font-size: 13px; color: var(--muted); }}
-.section-title {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 0 0 10px; letter-spacing: 0; }}
-.section-title-block {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid var(--border); }}
-.card-hint {{ font-size:12px; color:var(--muted); line-height:1.6; margin-bottom:10px; }}
-.card-hint code {{ background: var(--panel2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-size: 11px; color:#39415a; }}
-.card-hint a {{ color:var(--info); }}
-.check-row {{ display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }}
-.check-row .label {{ color:var(--faint); }}
-.check-row + .check-row {{ margin-top: 8px; }}
-.check-row label {{ cursor: pointer; }}
-.check-row input[type=checkbox], .check-row input[type=radio] {{ accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; }}
-.radio-group {{ display: inline-flex; align-items: center; gap: 14px; flex-wrap: wrap; }}
-.inline-check {{ display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); font-weight: 400; cursor: pointer; white-space: nowrap; }}
-.inline-check input[type=checkbox] {{ accent-color: var(--accent); width: 15px; height: 15px; }}
-.form-group .inline-check {{ display: inline-flex; margin-bottom: 0; font-size: 13px; }}
-.form-group .inline-field select, .form-group .inline-field input {{ width: auto; padding: 4px 8px; font-family: inherit; }}
-.form-group .inline-field input[type=number] {{ width: 76px; }}
-.option-row {{ display: flex; gap: 10px 18px; align-items: center; flex-wrap: wrap; }}
-.field-spaced {{ margin-top: 12px; }}
-.field-note {{ font-size: 12px; color: var(--faint); margin-top: 8px; }}
-.schedule-row {{ display: flex; align-items: center; gap: 10px 16px; flex-wrap: wrap; }}
-.schedule-row .time-field {{ display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }}
-.schedule-row input[type=time] {{ padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); font-size: 13px; font-family: inherit; min-width: 108px; }}
-.schedule-row input[type=time]:focus {{ outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(13,138,95,.12); }}
-.schedule-row .btn-group {{ margin-top: 0; }}
-.schedule-status {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }}
-.schedule-status div {{ min-width: 0; }}
-.schedule-status dt {{ font-size: 11px; color: var(--faint); }}
-.schedule-status dd {{ font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }}
-.conn-table {{ width: 100%; margin-top: 14px; border-collapse: collapse; font-size: 12px; }}
-.conn-table th {{ text-align: left; color: var(--muted); font-weight: 600; padding: 7px 6px; border-bottom: 1px solid var(--border); }}
-.conn-table td {{ padding: 7px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }}
-.conn-table td.conn-detail {{ color: var(--muted); overflow-wrap: anywhere; }}
-.conn-table .conn-reasoning {{ margin-top: 4px; color: var(--muted); white-space: pre-wrap; }}
-.conn-status.ok {{ color: var(--accent); font-weight: 600; }}
-.conn-status.fail {{ color: var(--danger); font-weight: 600; }}
-.conn-status.pending {{ color: var(--muted); }}
-.max-models {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; font-size:12px; color:var(--muted); }}
-.max-models[hidden] {{ display:none; }}
-.model-chip {{ border:1px solid var(--border-strong); background:var(--panel); color:var(--text); border-radius:6px; padding:4px 8px; font-size:12px; cursor:pointer; font-family:inherit; }}
-.model-chip:hover {{ border-color:var(--accent); color:var(--accent); }}
-pre.code-out {{ margin-top:12px; padding:12px; background:var(--panel2); border:1px solid var(--border); border-radius:6px; font-size:12px; max-height:220px; overflow:auto; white-space:pre-wrap; color:#39415a; display:none; }}
-details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
-@media (max-width: 960px) {{
-  .panel-grid.cols-2 {{ grid-template-columns: 1fr; }}
-  .login-layout {{ grid-template-columns: 1fr; }}
-  .login-actions {{ align-items: stretch; }}
-  .login-actions .btn-group {{ justify-content: flex-start; }}
-  .manual-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-  .schedule-status {{ grid-template-columns: 1fr; }}
-}}
-@media (max-width: 820px) {{
-  .app {{ flex-direction: column; }}
-  .sidebar {{ width: 100%; height: auto; position: static; }}
-  .nav-list {{ flex-direction: row; overflow-x: auto; padding: 8px 12px; }}
-  .nav-item {{ width: auto; white-space: nowrap; }}
-  .sidebar-status {{ margin-top: 0; border-top: 1px solid var(--sidebar-border); }}
-  .sidebar-foot {{ border-top: none; }}
-  .main {{ padding: 16px 14px 36px; }}
-  .panel-card {{ padding: 14px 12px; }}
-  .btn {{ padding:8px 12px; }}
-  .btn-sm {{ padding:6px 9px; }}
-  .account-toolbar {{ align-items:stretch; }}
-  .account-toolbar .btn {{ flex:1 1 150px; }}
-  .account-toolbar .inline-msg {{ flex-basis:100%; }}
-  .usage-table {{ min-width:560px; }}
-  .manual-grid {{ grid-template-columns: 1fr; }}
-}}
+{_CONSOLE_CSS}
 </style>
 </head>
 <body>
@@ -1119,95 +1508,183 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
 <div class="app">
 <aside class="sidebar">
   <div class="brand">
-    <span class="brand-mark">TR</span>
+    <span class="brand-mark">{_LOGO_SVG_INLINE}</span>
     <div class="brand-block">
       <h1>Trae CN Relay</h1>
       <span class="brand-sub">控制台</span>
     </div>
   </div>
-  <nav class="nav-list" role="tablist">
-    <button class="nav-item active" data-tab="accounts" onclick="switchTab('accounts')">账号与签到</button>
-    <button class="nav-item" data-tab="usage" onclick="switchTab('usage')">消费记录</button>
-    <button class="nav-item" data-tab="settings" onclick="switchTab('settings')">轮询与设置</button>
-    <button class="nav-item" data-tab="models" onclick="switchTab('models')">模型测试</button>
+  <nav class="nav-list" role="tablist" aria-label="功能导航">
+    <button class="nav-item active" role="tab" data-tab="overview" data-title="概览" onclick="switchTab('overview')">{ic['layout-dashboard']}<span>概览</span></button>
+    <button class="nav-item" role="tab" data-tab="accounts" data-title="账号与签到" onclick="switchTab('accounts')">{ic['users']}<span>账号与签到</span></button>
+    <button class="nav-item" role="tab" data-tab="usage" data-title="消费记录" onclick="switchTab('usage')">{ic['receipt']}<span>消费记录</span></button>
+    <button class="nav-item" role="tab" data-tab="settings" data-title="轮询与设置" onclick="switchTab('settings')">{ic['sliders-horizontal']}<span>轮询与设置</span></button>
+    <button class="nav-item" role="tab" data-tab="models" data-title="模型测试" onclick="switchTab('models')">{ic['activity']}<span>模型测试</span></button>
   </nav>
-  <div class="sidebar-status">
-    <div class="status-strip">{status_html}</div>
-  </div>
-  <div class="sidebar-foot">
-    {logout_btn}
-  </div>
+  <div class="sidebar-foot"><span>Trae2api-cn</span><span>v{APP_VERSION}</span></div>
 </aside>
 <main class="main">
-<div class="main-inner">
-<div class="tab-page active" data-page="accounts">
+<header class="topbar">
+  <h2 id="page-title">概览</h2>
+  <div class="topbar-right">
+    {status_html}
+    <label class="theme-switch" title="夜间模式">
+      <span class="theme-icon theme-sun">{ic['sun']}</span>
+      <span class="switch"><input type="checkbox" id="theme-toggle" role="switch" aria-label="夜间模式" onchange="applyTheme(this.checked?'dark':'light',true)"><span class="track"></span></span>
+      <span class="theme-icon theme-moon">{ic['moon']}</span>
+    </label>
+    {logout_btn}
+  </div>
+</header>
+<div class="content">
+
+<div class="tab-page active" data-page="overview">
 <div class="panel-stack">
+<dl class="stats stats-6" aria-label="用量概览">
+  <div class="stat"><dt>{ic['sigma']}累计 Token</dt><dd id="ov-total">--</dd><dd class="stat-sub" id="ov-total-sub">--</dd></div>
+  <div class="stat"><dt>{ic['arrow-down-to-line']}累计输入</dt><dd id="ov-input">--</dd><dd class="stat-sub" id="ov-input-sub">--</dd></div>
+  <div class="stat"><dt>{ic['arrow-up-from-line']}累计输出</dt><dd id="ov-output">--</dd><dd class="stat-sub" id="ov-output-sub">--</dd></div>
+  <div class="stat"><dt>{ic['database']}累计缓存</dt><dd id="ov-cache">--</dd><dd class="stat-sub" id="ov-cache-sub">--</dd></div>
+  <div class="stat"><dt>{ic['calendar']}今日 Token</dt><dd id="ov-today">--</dd><dd class="stat-sub" id="ov-today-sub">--</dd></div>
+  <div class="stat"><dt>{ic['users']}有效账号</dt><dd id="ov-accounts">--</dd><dd class="stat-sub" id="ov-accounts-sub">--</dd></div>
+</dl>
+<div id="ov-msg" class="msg" role="status" aria-live="polite"></div>
+<div class="ov-grid">
+<section class="panel-card" aria-labelledby="ov-chart-title">
+  <div class="section-head">
+    <div><div class="section-title" id="ov-chart-title">每日 Token 用量</div><span id="ov-updated" class="section-meta"></span></div>
+    <div class="segmented" role="radiogroup" aria-label="统计范围">
+      <label><input type="radio" name="ov-range" value="7" onchange="setOverviewRange(this.value)"><span>7 天</span></label>
+      <label><input type="radio" name="ov-range" value="14" onchange="setOverviewRange(this.value)" checked><span>14 天</span></label>
+      <label><input type="radio" name="ov-range" value="30" onchange="setOverviewRange(this.value)"><span>30 天</span></label>
+    </div>
+  </div>
+  <div id="ov-readout" class="chart-readout" aria-live="polite"></div>
+  <div class="chart-wrap">
+    <div class="chart-y" aria-hidden="true"><span id="ov-y-max">0</span><span id="ov-y-mid">0</span><span>0</span></div>
+    <div id="ov-chart" class="chart" role="group" aria-label="每日 Token 柱状图"></div>
+    <div id="ov-axis" class="chart-axis" aria-hidden="true"></div>
+  </div>
+</section>
+<section class="panel-card" aria-labelledby="ov-service-title">
+  <div class="section-head"><div class="section-title" id="ov-service-title">服务状态</div></div>
+  <dl class="kv-list">
+    <div><dt>{ic['shield-check']}登录凭据</dt><dd id="ov-token">--</dd></div>
+    <div><dt>{ic['server']}版本</dt><dd id="ov-version">v{APP_VERSION}</dd></div>
+    <div><dt>{ic['activity']}运行时长</dt><dd id="ov-uptime">--</dd></div>
+    <div><dt>{ic['arrow-left-right']}上游端点</dt><dd id="ov-upstream">--</dd></div>
+    <div><dt>{ic['refresh-cw']}多账号轮询</dt><dd id="ov-polling">--</dd></div>
+    <div><dt>{ic['zap']}1M 上下文</dt><dd id="ov-max">--</dd></div>
+    <div><dt>{ic['calendar-check']}自动签到</dt><dd id="ov-autocheckin">--</dd></div>
+    <div><dt>{ic['list']}进行中请求</dt><dd id="ov-inflight">--</dd></div>
+    <div><dt>{ic['coins']}剩余通用积分</dt><dd id="ov-credits">--</dd></div>
+  </dl>
+</section>
+</div>
+<section class="panel-card" aria-labelledby="ov-days-title">
+  <div class="section-head">
+    <div><div class="section-title" id="ov-days-title">按日期汇总</div><span id="ov-days-meta" class="section-meta"></span></div>
+    <label class="inline-check"><input type="checkbox" id="ov-hide-empty" onchange="renderOverviewDays()">隐藏无请求日期</label>
+  </div>
+  <div class="day-wrap">
+    <table class="day-table">
+      <thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>缓存</th><th>总计</th><th>积分</th></tr></thead>
+      <tbody id="ov-days-body"></tbody>
+      <tfoot><tr id="ov-days-foot"></tr></tfoot>
+    </table>
+  </div>
+</section>
+</div>
+</div>
+
+<div class="tab-page" data-page="accounts">
+<div class="panel-stack">
+<dl class="stats" aria-label="账号概览">
+  <div class="stat"><dt>{ic['users']}账号</dt><dd id="stat-total">{stat_total}</dd></div>
+  <div class="stat"><dt>{ic['shield-check']}有效</dt><dd id="stat-valid">{stat_valid}</dd></div>
+  <div class="stat"><dt>{ic['check-check']}今日已签到</dt><dd id="stat-checked">{stat_checked}</dd></div>
+  <div class="stat"><dt>{ic['coins']}剩余通用积分</dt><dd id="stat-credits">{stat_credits}</dd></div>
+</dl>
+<section class="panel-card" aria-label="账号列表">
+  <div class="section-head">
+    <div><div class="section-title">账号列表</div><span id="checkin-summary" class="section-meta">{stat_total} 个账号</span><span id="checkin-updated" class="section-meta"></span></div>
+    <div class="toolbar account-toolbar"{toolbar_hidden} aria-live="polite">
+      <span id="checkin-busy" class="busy-indicator" role="status" aria-live="polite">正在处理...</span>
+      <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">{ic['refresh-cw']}查询签到状态</button>
+      <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">{ic['coins']}查询全部积分</button>
+      <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">{ic['calendar-check']}一键轮询签到</button>
+    </div>
+  </div>
+  {accounts_html}
+  <div class="account-msgs">
+    <div id="account-msg" class="msg" role="status" aria-live="polite"></div>
+    <div id="checkin-msg" class="msg" role="status" aria-live="polite"></div>
+  </div>
+</section>
+<div class="panel-grid cols-2">
 <section class="panel-card" aria-labelledby="login-title">
-<div class="section-head"><div class="section-title" id="login-title">授权登录</div></div>
-<div class="login-layout">
+  <div class="section-head"><div class="section-title" id="login-title">授权登录</div></div>
   <ol class="login-steps">
     <li>点击授权登录，自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。</li>
     <li>未检测到时，下载 <code>web_login.py</code> 或 <code>start_auth.bat</code> 在<b>本机</b>运行后重试。</li>
-    <li>确保浏览器已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener">trae.cn</a>，授权完成后凭据自动写入服务器。</li>
+    <li>浏览器需已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener">trae.cn</a>，授权完成后凭据自动写入服务器。</li>
   </ol>
-  <div class="login-actions">
-    <div class="btn-group">
-      <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">使用 Trae 网页授权登录</button>
-      <a class="btn btn-ghost" href="https://www.trae.cn" target="_blank" rel="noopener">访问 trae.cn</a>
-    </div>
-    <div class="btn-group">
-      <a class="btn btn-secondary" href="/web/login/download" download>下载授权助手 web_login.py</a>
-      <a class="btn btn-ghost" href="/web/login/download?as=bat" download id="bat-link" style="display:none">下载 start_auth.bat</a>
-    </div>
+  <div class="btn-group">
+    <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">{ic['log-in']}使用 Trae 网页授权登录</button>
+    <a class="btn btn-secondary" href="/web/login/download" download>{ic['download']}授权助手 web_login.py</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=bat" download id="bat-link" style="display:none">{ic['download']}start_auth.bat</a>
+    <a class="icon-btn" href="https://www.trae.cn" target="_blank" rel="noopener" title="访问 trae.cn" aria-label="访问 trae.cn">{ic['external-link']}</a>
   </div>
-</div>
-<div id="loading" class="loading">等待授权中...</div>
-<div id="auth-msg" class="msg"></div>
-<details class="manual-add">
-  <summary>手动填写凭证添加账号</summary>
-  <form id="manual-form" class="manual-grid">
-    <div class="form-group span-all">
-      <label for="manual-token">Token（Cloud-IDE-JWT）<span style="color:var(--danger)">*</span></label>
-      <textarea id="manual-token" name="token" required placeholder="eyJhbGciOiJSUzI1NiI6Ik9wZW5TU0..."></textarea>
-    </div>
-    <div class="form-group">
-      <label for="manual-refresh">Refresh Token</label>
-      <input id="manual-refresh" name="refreshToken" placeholder="可选">
-    </div>
-    <div class="form-group">
-      <label for="manual-uid">User ID</label>
-      <input id="manual-uid" name="userId" placeholder="可选">
-    </div>
-    <div class="form-group">
-      <label for="manual-cid">Client ID</label>
-      <input id="manual-cid" name="clientId" value="{html_mod.escape(client_id)}">
-    </div>
-    <div class="form-group">
-      <label for="manual-label">备注（标签）</label>
-      <input id="manual-label" name="label" placeholder="可选">
-    </div>
-    <div class="span-all manual-submit">
-      <button type="submit" class="btn btn-primary">添加账号</button>
-      <div id="manual-msg" class="msg"></div>
-    </div>
-  </form>
-</details>
+  <div id="loading" class="loading">等待授权中...</div>
+  <div id="auth-msg" class="msg"></div>
+  <details class="manual-add">
+    <summary>手动填写凭证添加账号</summary>
+    <form id="manual-form" class="manual-grid">
+      <div class="form-group span-all">
+        <label for="manual-token">Token（Cloud-IDE-JWT）<span class="required">*</span></label>
+        <textarea id="manual-token" name="token" required placeholder="eyJhbGciOiJSUzI1NiI6Ik9wZW5TU0..."></textarea>
+      </div>
+      <div class="form-group">
+        <label for="manual-refresh">Refresh Token</label>
+        <input id="manual-refresh" name="refreshToken" placeholder="可选">
+      </div>
+      <div class="form-group">
+        <label for="manual-uid">User ID</label>
+        <input id="manual-uid" name="userId" placeholder="可选">
+      </div>
+      <div class="form-group">
+        <label for="manual-cid">Client ID</label>
+        <input id="manual-cid" name="clientId" value="{html_mod.escape(client_id)}">
+      </div>
+      <div class="form-group">
+        <label for="manual-label">备注</label>
+        <input id="manual-label" name="label" placeholder="可选">
+      </div>
+      <div class="span-all manual-submit">
+        <button type="submit" class="btn btn-primary btn-sm">添加账号</button>
+        <div id="manual-msg" class="msg"></div>
+      </div>
+    </form>
+  </details>
 </section>
 <section class="panel-card" id="auto-checkin-panel" aria-labelledby="auto-checkin-title">
   <div class="section-head">
     <div class="section-title" id="auto-checkin-title">自动签到</div>
-    <span id="auto-checkin-state" class="section-meta">{auto_checkin_state_text}</span>
+    <span id="auto-checkin-state" class="state-pill{auto_checkin_pill}">{auto_checkin_state_text}</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>定时签到</strong><span>每天按设定时间依次签到所有账号，已签到账号自动跳过</span></div>
+    <label class="switch" title="启用定时签到">
+      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked} aria-label="启用定时签到"><span class="track"></span>
+    </label>
   </div>
   <div class="schedule-row">
-    <label class="inline-check" for="auto-checkin-toggle">
-      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked}> 启用定时签到
-    </label>
     <label class="time-field" for="auto-checkin-time">每天（北京时间）
-      <input type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required>
+      <input class="control" type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required>
     </label>
-    <div class="btn-group">
-      <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()">保存</button>
-      <button class="btn btn-secondary btn-sm" id="auto-checkin-run-btn" onclick="runAutoCheckinNow()" title="立即按顺序签到所有未签到账号，已签到账号自动跳过">立即执行</button>
+    <div class="toolbar">
+      <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()">{ic['save']}保存</button>
+      <button class="btn btn-secondary btn-sm" id="auto-checkin-run-btn" onclick="runAutoCheckinNow()" title="立即按顺序签到所有未签到账号，已签到账号自动跳过">{ic['play']}立即执行</button>
     </div>
   </div>
   <dl class="schedule-status">
@@ -1217,174 +1694,249 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   </dl>
   <div id="auto-checkin-msg" class="msg" role="status" aria-live="polite"></div>
 </section>
-<section class="panel-card" aria-label="账号列表">
-<div class="section-title">账号列表</div>
-{accounts_html}
-</section>
 </div>
 </div>
+</div>
+
 <div class="tab-page" data-page="usage">
 <div class="panel-grid">
 <div class="panel-card" id="usage-panel">
-<div class="section-head"><div class="section-title">消费记录</div><span id="usage-updated" class="section-meta"></span></div>
-<div id="usage-msg" class="msg" role="status" aria-live="polite"></div>
-{usage_records_html}
+  <div class="section-head"><div class="section-title">消费记录</div><span id="usage-updated" class="section-meta"></span></div>
+  <div id="usage-msg" class="msg" role="status" aria-live="polite"></div>
+  {usage_records_html}
 </div>
 </div>
 </div>
+
 <div class="tab-page" data-page="settings">
 <div class="panel-grid cols-2">
 <div class="panel-card">
-<div class="section-title">多账号轮询</div>
-<div class="check-row">
-  <input type="checkbox" id="poll-toggle" {poll_checked} onchange="togglePolling()">
-  <label for="poll-toggle">启用轮询（每次请求自动切换下一个有效账号）</label>
-</div>
-<div class="check-row">
-  <span class="label">轮询模式</span>
-  <span class="radio-group">
-    <label class="inline-check"><input type="radio" name="poll-mode" value="round-robin" onchange="togglePolling()" {poll_mode_rr}> 顺序轮询</label>
-    <label class="inline-check"><input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}> 积分优先</label>
-  </span>
-</div>
-<p id="poll-status" class="field-note">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
+  <div class="section-head"><div class="section-title">多账号轮询</div></div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用轮询</strong><span>每次请求自动切换到下一个有效账号</span></div>
+    <label class="switch" title="启用轮询">
+      <input type="checkbox" id="poll-toggle" {poll_checked} onchange="togglePolling()" aria-label="启用轮询"><span class="track"></span>
+    </label>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>轮询模式</strong></div>
+    <div class="segmented" role="radiogroup" aria-label="轮询模式">
+      <label><input type="radio" name="poll-mode" value="round-robin" onchange="togglePolling()" {poll_mode_rr}><span>顺序轮询</span></label>
+      <label><input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}><span>积分优先</span></label>
+    </div>
+  </div>
+  <p id="poll-status" class="field-note">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
 </div>
 <div class="panel-card">
-  <div class="section-title">上游端点</div>
-<div class="form-group">
-  <label>预设端点</label>
-  <select id="settings-endpoint-preset" onchange="applyEndpointPreset()">
-    <option value="">自定义</option>
-    {endpoint_options_html}
-  </select>
-</div>
-<div class="form-group">
-  <label>自定义 Web Base URL</label>
-  <input id="settings-web" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1">
-</div>
-<div class="form-group">
-  <label>Relay 端口（需重启容器生效）</label>
-  <input id="settings-port" type="number" value="{settings_port}" placeholder="8000">
-</div>
-<div class="btn-group">
-  <button class="btn btn-secondary" onclick="saveSettings()">保存设置</button>
-</div>
-<div id="settings-msg" class="msg"></div>
+  <div class="section-head"><div class="section-title">上游端点</div></div>
+  <div class="form-group">
+    <label for="settings-endpoint-preset">预设端点</label>
+    <select id="settings-endpoint-preset" onchange="applyEndpointPreset()">
+      {endpoint_options_html}
+    </select>
+  </div>
+  <div class="form-row">
+    <div class="form-group">
+      <label for="settings-web">自定义 Web Base URL</label>
+      <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1">
+    </div>
+  </div>
+  <div class="form-group">
+    <label for="settings-port">Relay 端口（需重启容器生效）</label>
+    <input id="settings-port" type="number" value="{settings_port}" placeholder="8000">
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" onclick="saveSettings()">{ic['save']}保存设置</button>
+  </div>
+  <div id="settings-msg" class="msg"></div>
 </div>
 <div class="panel-card" id="auto-route-panel">
   <div class="section-head">
     <div class="section-title">自动路由</div>
-    <span id="auto-route-state" class="section-meta">{auto_route_state_text}</span>
+    <span id="auto-route-state" class="state-pill{auto_route_pill}">{auto_route_state_text}</span>
   </div>
-  <div class="check-row">
-    <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="saveAutoRoute()">
-    <label for="auto-route-toggle" title="开启后忽略上方预设端点的模式选择；端点失败时回落 Remote">启用自动路由（工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote）</label>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用自动路由</strong><span>工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
+    <label class="switch" title="启用自动路由">
+      <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="saveAutoRoute()" aria-label="启用自动路由"><span class="track"></span>
+    </label>
   </div>
   <div id="auto-route-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
 <div class="panel-card" id="max-mode-panel">
   <div class="section-head">
     <div class="section-title">1M 上下文（Max 模式）</div>
-    <span id="max-mode-state" class="section-meta">{max_state_text}</span>
+    <span id="max-mode-state" class="state-pill{max_pill}">{max_state_text}</span>
   </div>
-  <div class="check-row">
-    <input type="checkbox" id="max-mode-toggle" {max_checked}>
-    <label for="max-mode-toggle" title="只对 Remote 的 Agent 会话生效；带调用端工具的请求默认走 Work，不使用 Max">启用 Max 模式（Remote Agent 会话使用 1M 上下文）</label>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用 Max 模式</strong><span>Remote Agent 会话使用 1M 上下文；带调用端工具的请求走 Work，不使用 Max</span></div>
+    <label class="switch" title="启用 Max 模式">
+      <input type="checkbox" id="max-mode-toggle" {max_checked} aria-label="启用 Max 模式"><span class="track"></span>
+    </label>
   </div>
-  <div class="form-group field-spaced">
+  <div class="form-group">
     <label for="max-mode-models">生效模型（逗号分隔，留空表示账号中所有支持 Max 的模型）</label>
     <input id="max-mode-models" value="{max_models}" placeholder="glm-5.3, deepseek-v4-pro">
   </div>
   <div class="btn-group">
-    <button class="btn btn-secondary" onclick="saveMaxMode()">保存</button>
-    <button class="btn btn-ghost" id="max-mode-detect-btn" onclick="detectMaxModels()">检测支持的模型</button>
+    <button class="btn btn-primary btn-sm" onclick="saveMaxMode()">{ic['save']}保存</button>
+    <button class="btn btn-secondary btn-sm" id="max-mode-detect-btn" onclick="detectMaxModels()">{ic['search']}检测支持的模型</button>
   </div>
   <div id="max-mode-models-out" class="max-models" hidden></div>
   <div id="max-mode-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
 </div>
 </div>
+
 <div class="tab-page" data-page="models">
 <div class="panel-grid">
-<div class="panel-card">
-<div class="section-title">模型列表</div>
-<div class="form-group">
-  <label>刷新 /v1/models（TRAE_FETCH_MODEL_LIST=true 时从上游拉取，否则返回内置列表）</label>
-</div>
-<div class="btn-group">
-  <button class="btn btn-secondary" onclick="refreshModels()">获取模型列表</button>
-</div>
-<pre id="models-out" class="code-out"></pre>
-<div id="models-msg" class="msg"></div>
-</div>
 <div class="panel-card" id="conn-panel">
   <div class="section-head">
     <div class="section-title">模型连通性测试</div>
     <span id="conn-summary" class="section-meta">未运行</span>
   </div>
-  <div class="form-group">
-    <label for="conn-models">测试模型（逗号或换行分隔，留空使用下方常用模型）</label>
-    <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"></textarea>
+  <div class="form-row">
+    <div class="form-group">
+      <label for="conn-models">测试模型（逗号或换行分隔，留空使用常用模型）</label>
+      <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"></textarea>
+    </div>
+    <div class="form-group">
+      <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
+      <select id="conn-endpoint">
+        <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
+        <option value="remote">Remote / chat_sessions</option>
+        <option value="raw">IDE Raw / llm_raw_chat</option>
+        <option value="ide">IDE Agent / llm_utils_chat</option>
+        <option value="work-agent">Work Agent / solo_work_remote</option>
+      </select>
+    </div>
   </div>
   <div class="form-group">
-    <label>测试内容</label>
+    <span class="field-label">测试内容</span>
     <div class="option-row">
-      <label class="inline-check">
-        <input type="checkbox" id="conn-mode-text" checked> 文本回复
-      </label>
-      <label class="inline-check">
-        <input type="checkbox" id="conn-mode-tool"> 工具调用
-      </label>
-      <label class="inline-check inline-field">
-        思考强度
+      <label class="inline-check"><input type="checkbox" id="conn-mode-text" checked> 文本回复</label>
+      <label class="inline-check"><input type="checkbox" id="conn-mode-tool"> 工具调用</label>
+      <label class="inline-check"><input type="checkbox" id="conn-thinking"> 返回思考内容</label>
+      <label class="inline-check" title="请求 1M Max 上下文，结果中显示是否实际生效"><input type="checkbox" id="conn-max"> 1M Max</label>
+      <label class="inline-check inline-field">思考强度
         <select id="conn-effort" title="映射到 Trae custom_model.reasoning_effort：low=light，medium/high=high，xhigh=extra_high，超出模型支持的档位会向下取">
-          <option value="">默认（不传）</option>
+          <option value="">默认</option>
           <option value="low">low / 轻</option>
           <option value="medium">medium / 高</option>
           <option value="high">high / 高</option>
           <option value="xhigh">xhigh / 极高</option>
         </select>
       </label>
-      <label class="inline-check">
-        <input type="checkbox" id="conn-thinking"> 返回思考内容
-      </label>
-      <label class="inline-check" title="请求 1M Max 上下文，结果中显示是否实际生效">
-        <input type="checkbox" id="conn-max"> 1M Max
-      </label>
-      <label class="inline-check inline-field">
-        超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600">
-      </label>
+      <label class="inline-check inline-field">超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"></label>
     </div>
   </div>
-  <div class="form-group">
-    <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
-    <select id="conn-endpoint">
-      <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
-      <option value="remote">Remote / chat_sessions</option>
-      <option value="raw">IDE Raw / llm_raw_chat</option>
-      <option value="ide">IDE Agent / llm_utils_chat</option>
-      <option value="work-agent">Work Agent / solo_work_remote</option>
-    </select>
-  </div>
   <div class="btn-group">
-    <button class="btn btn-secondary" id="conn-run-btn" onclick="runConnTest()">开始测试</button>
-    <button class="btn btn-secondary" onclick="fillConnPreset()">填入常用模型</button>
+    <button class="btn btn-primary btn-sm" id="conn-run-btn" onclick="runConnTest()">{ic['play']}开始测试</button>
+    <button class="btn btn-secondary btn-sm" onclick="fillConnPreset()">{ic['list-plus']}填入常用模型</button>
   </div>
-  <table id="conn-table" class="conn-table" hidden>
-    <thead><tr><th>模型</th><th>类型</th><th>结果</th><th>耗时</th><th>详情</th></tr></thead>
-    <tbody id="conn-tbody"></tbody>
-  </table>
+  <div class="conn-wrap" id="conn-table" hidden>
+    <table class="conn-table">
+      <thead><tr><th>模型</th><th>类型</th><th>结果</th><th>耗时</th><th>详情</th></tr></thead>
+      <tbody id="conn-tbody"></tbody>
+    </table>
+  </div>
   <div id="conn-msg" class="msg"></div>
 </div>
+<div class="panel-card">
+  <div class="section-head">
+    <div class="section-title">模型列表</div>
+    <button class="btn btn-secondary btn-sm" onclick="refreshModels()">{ic['list']}获取模型列表</button>
+  </div>
+  <p class="section-desc">刷新 /v1/models；TRAE_FETCH_MODEL_LIST=true 时从上游拉取，否则返回内置列表。</p>
+  <pre id="models-out" class="code-out"></pre>
+  <div id="models-msg" class="msg"></div>
 </div>
 </div>
+</div>
+
 </div>
 </main>
 </div>
 <script>
+function applyTheme(theme,persist){{
+  var t=theme==='dark'?'dark':'light';
+  document.documentElement.setAttribute('data-theme',t);
+  var cb=document.getElementById('theme-toggle');
+  if(cb) cb.checked=(t==='dark');
+  if(persist){{
+    try{{ localStorage.setItem('relay-theme',t); }}catch(e){{}}
+    var root=document.documentElement; root.classList.add('theme-anim');
+    clearTimeout(applyTheme.timer); applyTheme.timer=setTimeout(function(){{ root.classList.remove('theme-anim'); }},360);
+  }}
+}}
+applyTheme(document.documentElement.getAttribute('data-theme')||'light',false);
 function switchTab(name){{
-  document.querySelectorAll('.nav-item').forEach(function(b){{ b.classList.toggle('active', b.getAttribute('data-tab')===name); }});
+  document.querySelectorAll('.nav-item').forEach(function(b){{
+    var on=b.getAttribute('data-tab')===name;
+    b.classList.toggle('active',on);
+    b.setAttribute('aria-selected',on?'true':'false');
+    if(on){{ var t=document.getElementById('page-title'); if(t) t.textContent=b.getAttribute('data-title')||''; }}
+  }});
   document.querySelectorAll('.tab-page').forEach(function(p){{ p.classList.toggle('active', p.getAttribute('data-page')===name); }});
+  try{{ history.replaceState(null,'','#'+name); }}catch(e){{}}
+  syncSelection();
+  if(name==='overview') refreshOverview();
+}}
+// Sliding highlights for the nav and segmented controls. The first placement
+// skips the transition so elements don't fly in from the corner.
+function placeSel(el,x,y,w,h){{
+  if(!w||!h) return;
+  var first=!el.dataset.placed;
+  if(first) el.classList.remove('ready');
+  el.style.width=w+'px'; el.style.height=h+'px';
+  el.style.transform='translate('+x+'px,'+y+'px)'; el.style.opacity='1';
+  if(first){{ el.dataset.placed='1'; void el.offsetWidth; el.classList.add('ready'); }}
+}}
+function syncSelection(){{
+  var nav=document.querySelector('.nav-list');
+  if(nav){{
+    var ind=nav.querySelector('.nav-indicator');
+    if(!ind){{ ind=document.createElement('span'); ind.className='nav-indicator'; ind.setAttribute('aria-hidden','true'); nav.insertBefore(ind,nav.firstChild); nav.classList.add('has-indicator'); }}
+    var a=nav.querySelector('.nav-item.active');
+    if(a) placeSel(ind,a.offsetLeft,a.offsetTop,a.offsetWidth,a.offsetHeight);
+  }}
+  document.querySelectorAll('.segmented').forEach(function(seg){{
+    var th=seg.querySelector('.seg-thumb');
+    if(!th){{
+      th=document.createElement('span'); th.className='seg-thumb'; th.setAttribute('aria-hidden','true');
+      seg.insertBefore(th,seg.firstChild); seg.classList.add('has-thumb');
+      seg.addEventListener('change',syncSelection);
+    }}
+    var c=seg.querySelector('input:checked');
+    var sp=c?c.nextElementSibling:null;
+    if(sp){{ var lab=sp.parentElement; placeSel(th,lab.offsetLeft+sp.offsetLeft,lab.offsetTop+sp.offsetTop,sp.offsetWidth,sp.offsetHeight); }}
+    else th.style.opacity='0';
+  }});
+}}
+function setStatePill(id,text,on){{
+  var el=document.getElementById(id);
+  if(!el) return;
+  el.textContent=text;
+  el.classList.toggle('on',!!on);
+}}
+// Overview numbers are derived from the rendered rows so every partial
+// refresh (single check-in, credits query, claim-all) keeps them in sync.
+function refreshStats(){{
+  var rows=Array.from(document.querySelectorAll('tr[data-account-id]'));
+  var checked=0, sum=0, known=false, unlimited=false;
+  rows.forEach(function(row){{
+    var st=row.querySelector('.checkin-state');
+    if(st&&st.textContent.trim()==='已签到') checked++;
+    var cv=row.querySelector('.credit-value');
+    var text=cv?cv.textContent:'';
+    if(text.indexOf('无限')>=0) unlimited=true;
+    var m=text.match(/剩(-?[0-9.]+)/);
+    if(m){{ sum+=Number(m[1]); known=true; }}
+  }});
+  var set=function(id,v){{ var el=document.getElementById(id); if(el) el.textContent=v; }};
+  set('stat-total',rows.length);
+  set('stat-checked',checked);
+  set('stat-credits',unlimited?'无限':(known?sum.toFixed(2):'-'));
 }}
 const state = {{ traceId: null, win: null }};
 let currentCodeVerifier = '';
@@ -1497,6 +2049,211 @@ async function refreshUsage() {{
 }}
 setInterval(refreshUsage, 5000);
 refreshUsage();
+// Overview dashboard. Data comes from /api/overview (persistent daily
+// buckets); the chart reuses its bar nodes so refreshes animate heights.
+var ovData=null, ovRange=14, ovDay='', ovLoading=false;
+function fmtInt(n){{ return Number(n||0).toLocaleString('en-US'); }}
+function fmtCompact(n){{
+  n=Number(n||0); var a=Math.abs(n);
+  if(a>=1e9) return (n/1e9).toFixed(2)+'B';
+  if(a>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(a>=1e4) return (n/1e3).toFixed(1)+'K';
+  return fmtInt(n);
+}}
+function fmtPct(part,whole){{ return whole?(part/whole*100).toFixed(1)+'%':'--'; }}
+function fmtUptime(s){{
+  s=Math.max(0,Math.floor(s||0));
+  var d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  return d?(d+' 天 '+h+' 小时'):(h?(h+' 小时 '+m+' 分'):(m+' 分'));
+}}
+function setOv(id,value,title){{
+  var el=document.getElementById(id); if(!el) return;
+  el.textContent=value;
+  if(title!==undefined) el.title=title;
+}}
+function setOvPill(id,on,label){{
+  var el=document.getElementById(id); if(!el) return;
+  el.innerHTML='<span class="state-pill'+(on?' on':'')+'">'+escapeHtml(label)+'</span>';
+}}
+function niceCeil(v){{
+  if(v<=0) return 1;
+  var p=Math.pow(10,Math.floor(Math.log10(v))), f=v/p;
+  return (f<=1?1:f<=2?2:f<=5?5:10)*p;
+}}
+function ovRows(){{ return ovData?ovData.usage.daily.slice(0,ovRange).reverse():[]; }}
+function ovFind(day){{
+  if(!ovData) return null;
+  var rows=ovData.usage.daily;
+  for(var i=0;i<rows.length;i++){{ if(rows[i].date===day) return rows[i]; }}
+  return null;
+}}
+async function refreshOverview(){{
+  if(ovLoading) return;
+  ovLoading=true;
+  var msg=document.getElementById('ov-msg');
+  try{{
+    var r=await requestJSON('/api/overview?days=30',{{method:'GET'}},15000);
+    if(!r.ok||!r.data||!r.data.success) throw new Error(apiError(r.data,r.status));
+    ovData=r.data;
+    renderOverview();
+    setOv('ov-updated','更新于 '+new Date().toLocaleTimeString());
+    if(msg){{ msg.textContent=''; msg.className='msg'; }}
+  }}catch(e){{
+    if(msg){{ msg.textContent=String(e&&e.message||e); msg.className='msg msg-err'; }}
+  }}finally{{ ovLoading=false; }}
+}}
+function renderOverview(){{
+  if(!ovData) return;
+  var u=ovData.usage, t=u.totals, td=u.today, a=ovData.accounts, s=ovData.service;
+  setOv('ov-total',fmtCompact(t.total_tokens),fmtInt(t.total_tokens));
+  setOv('ov-total-sub',u.first_day?(fmtInt(t.requests)+' 次请求 · 自 '+u.first_day):'暂无记录');
+  setOv('ov-input',fmtCompact(t.input_tokens),fmtInt(t.input_tokens));
+  setOv('ov-input-sub','占总量 '+fmtPct(t.input_tokens,t.total_tokens));
+  setOv('ov-output',fmtCompact(t.output_tokens),fmtInt(t.output_tokens));
+  setOv('ov-output-sub','占总量 '+fmtPct(t.output_tokens,t.total_tokens));
+  setOv('ov-cache',fmtCompact(t.cached_tokens),fmtInt(t.cached_tokens));
+  setOv('ov-cache-sub','输入命中率 '+fmtPct(t.cached_tokens,t.input_tokens));
+  setOv('ov-today',fmtCompact(td.total_tokens),fmtInt(td.total_tokens));
+  setOv('ov-today-sub',fmtInt(td.requests)+' 次请求'+(td.failed?' · '+td.failed+' 失败':''));
+  setOv('ov-accounts',a.valid+' / '+a.total);
+  setOv('ov-accounts-sub','今日签到 '+a.checked_in+' / '+a.total);
+  setOvPill('ov-token',s.token_ok,s.token_ok?'有效':'失效');
+  setOv('ov-version','v'+s.version);
+  setOv('ov-uptime',fmtUptime(s.uptime_seconds));
+  setOv('ov-upstream',s.auto_route?'自动路由':s.upstream_mode);
+  setOvPill('ov-polling',s.polling,s.polling?(s.polling_mode==='credit-priority'?'积分优先':'顺序轮询'):'关');
+  setOvPill('ov-max',s.max_mode,s.max_mode?'开':'关');
+  var ac=s.auto_checkin||{{}};
+  setOvPill('ov-autocheckin',ac.enabled,ac.enabled?('每日 '+(ac.time||'')):'关');
+  setOv('ov-inflight',String(s.in_flight||0));
+  var cr=a.credits_remaining;
+  setOv('ov-credits',cr==='unlimited'?'无限':(cr===null||cr===undefined?'--':Number(cr).toFixed(2)));
+  renderOverviewChart();
+  renderOverviewDays();
+  showOverviewDay(ovDay);
+}}
+function renderOverviewChart(){{
+  var chart=document.getElementById('ov-chart'), axis=document.getElementById('ov-axis');
+  if(!chart||!axis) return;
+  var rows=ovRows(), max=0;
+  rows.forEach(function(r){{ max=Math.max(max,(r.input_tokens||0)+(r.output_tokens||0)); }});
+  var scale=niceCeil(max);
+  setOv('ov-y-max',max?fmtCompact(scale):'0');
+  setOv('ov-y-mid',max?fmtCompact(scale/2):'0');
+  var rebuild=chart.children.length!==rows.length;
+  if(rebuild){{
+    chart.innerHTML=rows.map(function(){{
+      return '<div class="bar-col" tabindex="0" role="button"><div class="bar-stack">'
+        +'<span class="bar-seg seg-out"></span><span class="bar-seg seg-in"></span><span class="bar-seg seg-cache"></span>'
+        +'</div></div>';
+    }}).join('');
+    var step=Math.ceil(rows.length/8);
+    axis.innerHTML=rows.map(function(r,i){{
+      var show=(rows.length-1-i)%step===0;
+      return '<span>'+(show?escapeHtml(r.date.slice(5)):'')+'</span>';
+    }}).join('');
+  }}
+  function apply(){{
+    rows.forEach(function(r,i){{
+      var col=chart.children[i]; if(!col) return;
+      var cache=Math.min(r.cached_tokens||0,r.input_tokens||0);
+      var segs=col.firstChild.children;
+      segs[0].style.height=((r.output_tokens||0)/scale*100)+'%';
+      segs[1].style.height=(((r.input_tokens||0)-cache)/scale*100)+'%';
+      segs[2].style.height=(cache/scale*100)+'%';
+      col.setAttribute('data-day',r.date);
+      col.setAttribute('aria-label',r.date+' 总计 '+fmtInt(r.total_tokens)+' Token');
+      col.classList.toggle('sel',r.date===ovDay);
+    }});
+  }}
+  // Fresh bars start at zero height and grow on the next frame.
+  if(rebuild) requestAnimationFrame(function(){{ requestAnimationFrame(apply); }}); else apply();
+}}
+function renderOverviewDays(){{
+  var body=document.getElementById('ov-days-body'), foot=document.getElementById('ov-days-foot');
+  if(!body||!foot||!ovData) return;
+  var hide=document.getElementById('ov-hide-empty');
+  var today=ovData.usage.today.date;
+  var rows=ovData.usage.daily.slice(0,ovRange);
+  var sum={{requests:0,failed:0,input_tokens:0,output_tokens:0,cached_tokens:0,total_tokens:0,credits:0}};
+  rows.forEach(function(r){{ for(var k in sum) sum[k]+=Number(r[k]||0); }});
+  var shown=rows.filter(function(r){{ return !(hide&&hide.checked&&!r.requests); }});
+  body.innerHTML=shown.length?shown.map(function(r){{
+    var cls=(r.requests?'':'zero')+(r.date===ovDay?' sel':'');
+    var top=(r.models||[]).slice(0,3).map(function(m){{ return m.model+' '+fmtInt(m.total_tokens); }}).join('，');
+    return '<tr class="'+cls+'" data-day="'+escapeHtml(r.date)+'" title="'+escapeHtml(top)+'">'
+      +'<td>'+escapeHtml(r.date)+(r.date===today?'<span class="badge badge-active">今日</span>':'')+'</td>'
+      +'<td>'+fmtInt(r.requests)+'</td>'
+      +'<td>'+fmtInt(r.failed)+'</td>'
+      +'<td>'+fmtInt(r.input_tokens)+'</td>'
+      +'<td>'+fmtInt(r.output_tokens)+'</td>'
+      +'<td>'+fmtInt(r.cached_tokens)+'</td>'
+      +'<td>'+fmtInt(r.total_tokens)+'</td>'
+      +'<td>'+Number(r.credits||0).toFixed(2)+'</td>'
+      +'</tr>';
+  }}).join(''):'<tr class="zero"><td colspan="8">所选范围内没有请求</td></tr>';
+  foot.innerHTML='<td>合计 '+ovRange+' 天</td>'
+    +'<td>'+fmtInt(sum.requests)+'</td><td>'+fmtInt(sum.failed)+'</td>'
+    +'<td>'+fmtInt(sum.input_tokens)+'</td><td>'+fmtInt(sum.output_tokens)+'</td>'
+    +'<td>'+fmtInt(sum.cached_tokens)+'</td><td>'+fmtInt(sum.total_tokens)+'</td>'
+    +'<td>'+sum.credits.toFixed(2)+'</td>';
+  var active=rows.filter(function(r){{ return r.requests; }}).length;
+  setOv('ov-days-meta',active+' / '+ovRange+' 天有请求');
+}}
+function showOverviewDay(day){{
+  var box=document.getElementById('ov-readout');
+  if(!box||!ovData) return;
+  var r=ovFind(day)||ovData.usage.today;
+  var label=r.date===ovData.usage.today.date?r.date+' 今日':r.date;
+  function item(sw,name,value){{
+    return '<span class="readout-item">'+(sw?'<span class="swatch '+sw+'"></span>':'')+name+' <strong>'+value+'</strong></span>';
+  }}
+  box.innerHTML='<span class="readout-date">'+escapeHtml(label)+'</span>'
+    +item('sw-in','输入',fmtInt(r.input_tokens))
+    +item('sw-cache','缓存',fmtInt(r.cached_tokens))
+    +item('sw-out','输出',fmtInt(r.output_tokens))
+    +item('','总计',fmtInt(r.total_tokens))
+    +item('','请求',fmtInt(r.requests));
+}}
+function selectOverviewDay(day){{
+  ovDay=day||'';
+  document.querySelectorAll('#ov-chart .bar-col').forEach(function(c){{ c.classList.toggle('sel',c.getAttribute('data-day')===ovDay); }});
+  document.querySelectorAll('#ov-days-body tr[data-day]').forEach(function(tr){{
+    var on=tr.getAttribute('data-day')===ovDay;
+    tr.classList.toggle('sel',on);
+    if(on&&tr.scrollIntoView) tr.scrollIntoView({{block:'nearest'}});
+  }});
+  showOverviewDay(ovDay);
+}}
+function setOverviewRange(value){{
+  ovRange=Number(value)||14;
+  renderOverviewChart();
+  renderOverviewDays();
+}}
+(function(){{
+  var chart=document.getElementById('ov-chart');
+  if(chart){{
+    var pick=function(e){{ var c=e.target.closest&&e.target.closest('.bar-col'); return c?c.getAttribute('data-day'):null; }};
+    chart.addEventListener('mouseover',function(e){{ var d=pick(e); if(d) showOverviewDay(d); }});
+    chart.addEventListener('focusin',function(e){{ var d=pick(e); if(d) showOverviewDay(d); }});
+    chart.addEventListener('mouseleave',function(){{ showOverviewDay(ovDay); }});
+    chart.addEventListener('click',function(e){{ var d=pick(e); if(d) selectOverviewDay(d); }});
+    chart.addEventListener('keydown',function(e){{
+      if(e.key!=='Enter'&&e.key!==' ') return;
+      var d=pick(e); if(d){{ e.preventDefault(); selectOverviewDay(d); }}
+    }});
+  }}
+  var body=document.getElementById('ov-days-body');
+  if(body) body.addEventListener('click',function(e){{
+    var tr=e.target.closest&&e.target.closest('tr[data-day]');
+    if(tr) selectOverviewDay(tr.getAttribute('data-day'));
+  }});
+}})();
+setInterval(function(){{
+  if(document.hidden) return;
+  if(document.querySelector('.tab-page.active[data-page="overview"]')) refreshOverview();
+}},10000);
+refreshOverview();
 window.addEventListener('message',function(ev){{
   if (!ev.data||ev.data.type!=='trae-relay-web-login') return;
   if (state.traceId&&ev.data.loginTraceId!==state.traceId) return;
@@ -1629,6 +2386,7 @@ function updateAccountRow(account){{
 function updateAccountCreditsRow(account){{
   if(!account||!account.id) return;
   setCredits(account.id,account);
+  refreshStats();
 }}
 function updateAccountCheckinRow(account){{
   if(!account||!account.id) return;
@@ -1640,6 +2398,7 @@ function updateAccountCheckinRow(account){{
   if(labelEl&&account.label) labelEl.textContent=account.label;
   var row=document.getElementById('row-'+account.id);
   if(row) row.classList.toggle('row-failed',!!account.error||account.success===false);
+  refreshStats();
 }}
 function setActiveAccount(id,account){{
   document.querySelectorAll('tr[data-account-id]').forEach(function(row){{
@@ -1872,7 +2631,7 @@ async function saveAutoRoute(){{
   var d=await postJSON('/api/auto-route',{{enabled:toggle.checked}});
   if(d.success){{
     toggle.checked=!!d.enabled;
-    document.getElementById('auto-route-state').textContent=d.enabled?'已开启':'已关闭';
+    setStatePill('auto-route-state',d.enabled?'已开启':'已关闭',d.enabled);
     showMsg('auto-route-msg',d.enabled?'自动路由已开启，下一个请求生效':'自动路由已关闭，使用预设端点',true,3000);
   }} else {{
     toggle.checked=!toggle.checked;
@@ -1886,7 +2645,7 @@ async function saveMaxMode(){{
   if(d.success){{
     document.getElementById('max-mode-toggle').checked=!!d.enabled;
     document.getElementById('max-mode-models').value=d.models||'';
-    document.getElementById('max-mode-state').textContent=d.enabled?'已开启':'已关闭';
+    setStatePill('max-mode-state',d.enabled?'已开启':'已关闭',d.enabled);
     showMsg('max-mode-msg',d.enabled?'Max 模式已开启，新会话生效':'Max 模式已关闭',true,3000);
   }} else showMsg('max-mode-msg',d.error||'保存失败',false);
 }}
@@ -2027,8 +2786,7 @@ function renderAutoCheckin(d){{
   var timeInput=document.getElementById('auto-checkin-time');
   if(toggle) toggle.checked=!!d.enabled;
   if(timeInput&&d.time) timeInput.value=d.time;
-  var stateEl=document.getElementById('auto-checkin-state');
-  if(stateEl) stateEl.textContent=d.running?'正在执行...':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭');
+  setStatePill('auto-checkin-state',d.running?'正在执行...':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭'),d.enabled||d.running);
   document.getElementById('auto-checkin-next').textContent=d.enabled?formatCheckinTime(d.next_run):'未启用';
   document.getElementById('auto-checkin-last').textContent=d.last_run_at
     ? formatCheckinTime(d.last_run_at)+(d.last_trigger==='manual'?'（手动）':'（定时）') : '-';
@@ -2073,6 +2831,13 @@ async function runAutoCheckinNow(){{
 }}
 loadAutoCheckin();
 setInterval(loadAutoCheckin,60000);
+(function(){{
+  var initial=(location.hash||'').replace('#','');
+  if(initial&&document.querySelector('.tab-page[data-page="'+initial+'"]')) switchTab(initial);
+}})();
+syncSelection();
+window.addEventListener('resize',syncSelection);
+if(document.fonts&&document.fonts.ready) document.fonts.ready.then(syncSelection);
 var manualForm=document.getElementById('manual-form');
 if(manualForm) manualForm.addEventListener('submit',async function(e){{
   e.preventDefault();var fd=new FormData(e.target);
@@ -2092,7 +2857,7 @@ def _oauth_result_html(success: bool, message: str, login_trace_id: str = "") ->
     safe_trace = html_mod.escape(login_trace_id)
     return f"""<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><title>Trae 授权</title>
+<head><meta charset="utf-8"><title>Trae 授权</title>{_FAVICON_LINKS}
 <style>
 body {{ font:16px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#eef0f4;color:#1d2331;padding:40px; }}
 .msg {{ padding:20px;border-radius:10px;margin-bottom:16px;border:1px solid; }}
@@ -3085,6 +3850,7 @@ def _usage_values(usage: Any) -> dict[str, Any]:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cached_tokens": 0,
             "credits_consumed": None,
         }
     prompt = _first_number(
@@ -3118,10 +3884,23 @@ def _usage_values(usage: Any) -> dict[str, Any]:
             "credits_cost",
             "credits_float",
         )
+    cached = _first_number(
+        usage,
+        "cached_tokens",
+        "cache_read_tokens",
+        "cacheReadTokens",
+        "cachedTokens",
+        "cache_read_input_tokens",
+    )
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(details_key)
+        if cached is None and isinstance(details, Mapping):
+            cached = _first_number(details, "cached_tokens", "cache_read_tokens")
     return {
         "prompt_tokens": int(prompt),
         "completion_tokens": int(completion),
         "total_tokens": int(total),
+        "cached_tokens": int(cached or 0),
         "credits_consumed": credits,
     }
 
@@ -3472,6 +4251,7 @@ class _UsageTracker:
             status=final_status,
             duration_ms=round((time.perf_counter() - self.started) * 1000, 1),
             tokens_source="upstream" if self.saw_usage else "unknown",
+            cached_tokens=values.get("cached_tokens", 0),
         )
         if explicit_credits is not None:
             try:
@@ -3522,6 +4302,7 @@ def _track_usage_from_result(result: dict, model: str) -> None:
         values["completion_tokens"],
         credits_consumed=values.get("credits_consumed"),
         credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
+        cached_tokens=values.get("cached_tokens", 0),
     )
 
 
@@ -3586,6 +4367,7 @@ def _track_usage_from_chunk(chunk: str, model: str) -> None:
             values["completion_tokens"],
             credits_consumed=values.get("credits_consumed"),
             credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
+            cached_tokens=values.get("cached_tokens", 0),
         )
 
 
@@ -5111,6 +5893,7 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             "input_tokens": prompt,
             "output_tokens": completion,
             "total_tokens": total,
+            "cached_tokens": int(values.get("cached_tokens") or 0),
             "tokens_source": str(
                 record.get("tokens_source")
                 or (
@@ -5183,6 +5966,157 @@ def _load_usage_history() -> None:
         logger.warning("usage records could not be loaded: %s", exc)
 
 
+def _usage_day(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, _CHECKIN_TIMEZONE).strftime("%Y-%m-%d")
+
+
+def _empty_usage_bucket() -> dict[str, Any]:
+    bucket: dict[str, Any] = {key: 0 for key in _USAGE_STATS_FIELDS}
+    bucket["credits"] = 0.0
+    bucket["models"] = {}
+    return bucket
+
+
+def _usage_contribution(record: Mapping[str, Any]) -> dict[str, Any]:
+    status = str(record.get("status") or "completed")
+    credits = _number_value(record.get("credits_consumed"))
+    return {
+        "model": str(record.get("model") or "auto"),
+        "requests": 1,
+        "completed": 1 if status == "completed" else 0,
+        "failed": 1 if status == "error" else 0,
+        "input_tokens": int(record.get("input_tokens") or 0),
+        "output_tokens": int(record.get("output_tokens") or 0),
+        "cached_tokens": int(record.get("cached_tokens") or 0),
+        "total_tokens": int(record.get("total_tokens") or 0),
+        "credits": float(credits or 0),
+    }
+
+
+def _apply_usage_contribution_locked(
+    day: str, contribution: Mapping[str, Any], sign: int
+) -> None:
+    days = _USAGE_STATS.setdefault("days", {})
+    bucket = days.setdefault(day, _empty_usage_bucket())
+    for key in _USAGE_STATS_FIELDS:
+        value = bucket.get(key, 0) + sign * contribution.get(key, 0)
+        bucket[key] = max(0, round(value, 4) if key == "credits" else int(value))
+    models = bucket.setdefault("models", {})
+    model = contribution.get("model") or "auto"
+    entry = models.setdefault(
+        model, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    )
+    for key in ("requests", "input_tokens", "output_tokens", "total_tokens"):
+        entry[key] = max(0, int(entry.get(key, 0) + sign * contribution.get(key, 0)))
+    if entry["requests"] == 0:
+        models.pop(model, None)
+    if len(days) > _USAGE_STATS_MAX_DAYS:
+        for stale in sorted(days)[: len(days) - _USAGE_STATS_MAX_DAYS]:
+            days.pop(stale, None)
+
+
+def _usage_stats_replace_locked(
+    previous: Mapping[str, Any] | None, record: Mapping[str, Any]
+) -> None:
+    """Move one request's contribution from its previous form to ``record``.
+
+    Records are rewritten in place (same request id) when retries settle or
+    credits are enriched later; subtracting the old row keeps totals exact.
+    """
+    if previous is not None:
+        day = _usage_day(float(previous.get("timestamp") or 0) or time.time())
+        _apply_usage_contribution_locked(day, _usage_contribution(previous), -1)
+    day = _usage_day(float(record.get("timestamp") or 0) or time.time())
+    _apply_usage_contribution_locked(day, _usage_contribution(record), 1)
+    _save_usage_stats_locked()
+
+
+def _usage_stats_path() -> Path:
+    # Sits next to usage_records.json unless explicitly overridden, so a
+    # relocated records path (tests, alternate data dirs) moves both files.
+    if _USAGE_STATS_PATH_OVERRIDE:
+        return Path(_USAGE_STATS_PATH_OVERRIDE)
+    return _USAGE_RECORDS_PATH.with_name("usage_stats.json")
+
+
+def _save_usage_stats_locked() -> None:
+    try:
+        path = _usage_stats_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "days": _USAGE_STATS.get("days", {})}
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", "utf-8")
+        os.replace(temporary, path)
+    except Exception as exc:
+        logger.warning("usage stats could not be saved: %s", exc)
+
+
+def _load_usage_stats() -> None:
+    """Load daily totals, seeding them once from the request history."""
+    global _USAGE_STATS
+    try:
+        path = _usage_stats_path()
+        if path.exists():
+            payload = json.loads(path.read_text("utf-8"))
+            days = payload.get("days") if isinstance(payload, dict) else None
+            if not isinstance(days, dict):
+                raise ValueError("usage stats must contain a days mapping")
+            with _USAGE_LOCK:
+                _USAGE_STATS = {"days": days}
+            return
+        with _USAGE_LOCK:
+            _USAGE_STATS = {"days": {}}
+            for record in _USAGE_HISTORY:
+                day = _usage_day(float(record.get("timestamp") or 0) or time.time())
+                _apply_usage_contribution_locked(day, _usage_contribution(record), 1)
+            if _USAGE_HISTORY:
+                _save_usage_stats_locked()
+    except Exception as exc:
+        logger.warning("usage stats could not be loaded: %s", exc)
+
+
+def _usage_overview(days: int = 30) -> dict[str, Any]:
+    days = max(1, min(int(days or 30), 366))
+    now = time.time()
+    today = _usage_day(now)
+    with _USAGE_LOCK:
+        stored = json.loads(json.dumps(_USAGE_STATS.get("days", {})))
+    totals = _empty_usage_bucket()
+    totals.pop("models")
+    for bucket in stored.values():
+        for key in _USAGE_STATS_FIELDS:
+            totals[key] += bucket.get(key, 0)
+    totals["credits"] = round(totals["credits"], 2)
+    start = datetime.fromtimestamp(now, _CHECKIN_TIMEZONE).date()
+    daily = []
+    for offset in range(days):
+        day = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+        bucket = stored.get(day) or _empty_usage_bucket()
+        models = sorted(
+            (
+                {"model": name, **values}
+                for name, values in (bucket.get("models") or {}).items()
+            ),
+            key=lambda item: item.get("total_tokens", 0),
+            reverse=True,
+        )
+        daily.append(
+            {
+                "date": day,
+                **{key: bucket.get(key, 0) for key in _USAGE_STATS_FIELDS},
+                "credits": round(float(bucket.get("credits") or 0), 2),
+                "models": models[:6],
+            }
+        )
+    return {
+        "today": next((row for row in daily if row["date"] == today), daily[0]),
+        "totals": totals,
+        "active_days": sum(1 for bucket in stored.values() if bucket.get("requests")),
+        "first_day": min(stored) if stored else None,
+        "daily": daily,
+    }
+
+
 def _record_usage(
     account_id: str,
     model: str,
@@ -5197,6 +6131,7 @@ def _record_usage(
     status: str = "completed",
     duration_ms: int | float | None = None,
     tokens_source: str = "upstream",
+    cached_tokens: int = 0,
 ) -> dict[str, Any]:
     """Record one API request (newest first) and persist it independently."""
     global _USAGE_HISTORY
@@ -5207,6 +6142,7 @@ def _record_usage(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "cached_tokens": cached_tokens,
             "tokens_source": tokens_source,
             "credits_consumed": credits_consumed,
             "credits_source": credits_source,
@@ -5219,15 +6155,20 @@ def _record_usage(
         }
     )
     with _USAGE_LOCK:
+        previous = None
         if request_id:
             for index, existing in enumerate(_USAGE_HISTORY):
                 if existing.get("request_id") == request_id:
+                    previous = existing
+                    # Keep the original day bucket for a rewritten request.
+                    record["timestamp"] = existing.get("timestamp") or record["timestamp"]
                     _USAGE_HISTORY[index] = record
                     break
             else:
                 _USAGE_HISTORY.insert(0, record)
         else:
             _USAGE_HISTORY.insert(0, record)
+        _usage_stats_replace_locked(previous, record)
         if len(_USAGE_HISTORY) > _USAGE_MAX_HISTORY:
             _USAGE_HISTORY = _USAGE_HISTORY[:_USAGE_MAX_HISTORY]
         _save_usage_history_locked()
@@ -5296,6 +6237,7 @@ def _update_usage_record(request_id: str, **updates: Any) -> None:
                 if key in merged:
                     merged[key] = _credit_round(merged[key])
             _USAGE_HISTORY[index] = _normalize_usage_record(merged)
+            _usage_stats_replace_locked(existing, _USAGE_HISTORY[index])
             _save_usage_history_locked()
             return
 
@@ -5977,6 +6919,7 @@ async def handle_responses(req: Request):
 
 async def init_app():
     _load_usage_history()
+    _load_usage_stats()
     auth.init_auth()
     auth.apply_max_mode_settings()
     logger.info(
@@ -6210,7 +7153,61 @@ async def lifespan(app: FastAPI):
         await _cancel_usage_tasks()
 
 
-app = FastAPI(title="Trae CN Relay", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Trae CN Relay", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.get("/api/overview")
+async def api_overview(days: int = Query(30, ge=1, le=366)):
+    """Dashboard home: token totals by day plus account and service state."""
+    accounts = auth.list_accounts()
+    remaining = 0.0
+    credits_known = False
+    unlimited = False
+    for account in accounts:
+        credits = account.get("account_credits") or {}
+        if credits.get("unlimited"):
+            unlimited = True
+        elif credits.get("remaining") is not None:
+            try:
+                remaining += float(credits["remaining"])
+                credits_known = True
+            except (TypeError, ValueError):
+                pass
+    polling = auth.get_polling_status()
+    with _USAGE_LOCK:
+        in_flight = sum(_USAGE_ACTIVE_ACCOUNTS.values())
+        recent = [_normalize_usage_record(record) for record in _USAGE_HISTORY[:5]]
+    return JSONResponse(
+        {
+            "success": True,
+            "generated_at": time.time(),
+            "timezone": "Asia/Shanghai",
+            "usage": _usage_overview(days),
+            "accounts": {
+                "total": len(accounts),
+                "valid": sum(1 for account in accounts if account.get("is_valid")),
+                "checked_in": sum(1 for account in accounts if account.get("checked_in") is True),
+                "credits_remaining": (
+                    "unlimited" if unlimited else round(remaining, 2) if credits_known else None
+                ),
+                "active": auth.get_active_account_id() or None,
+            },
+            "service": {
+                "version": APP_VERSION,
+                "uptime_seconds": round(time.time() - _PROCESS_STARTED_AT),
+                "upstream_mode": _current_upstream_mode(),
+                "auto_route": _auto_route_enabled(),
+                "polling": bool(polling.get("enabled")),
+                "polling_mode": polling.get("mode"),
+                "max_mode": bool(auth.get_max_mode_settings().get("enabled")),
+                "auto_checkin": auth.get_auto_checkin_settings(),
+                "in_flight": in_flight,
+                "token_ok": auth.get_auth().is_valid(),
+            },
+            "recent": recent,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/usage/records")
@@ -6261,6 +7258,16 @@ async def auth_middleware(request: Request, call_next):
 @app.get("/")
 async def root():
     return {"service": "trae-cn-relay", "status": "ok"}
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(
+        LOGO_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/healthz")
