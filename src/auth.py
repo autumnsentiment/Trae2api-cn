@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1395,6 +1396,53 @@ def set_auto_route_settings(enabled: bool) -> dict:
     os.environ[_AUTO_ROUTE_ENV] = '1' if enabled else '0'
     _write_env_values({_AUTO_ROUTE_ENV: '1' if enabled else '0'})
     return get_auto_route_settings()
+
+
+_AUTO_CHECKIN_ENV = 'TRAE_AUTO_CHECKIN'
+_AUTO_CHECKIN_TIME_ENV = 'TRAE_AUTO_CHECKIN_TIME'
+_AUTO_CHECKIN_DEFAULT_TIME = '08:30'
+
+
+def normalize_checkin_time(value) -> str:
+    """Validate an HH:MM (24h) string; raise ValueError when malformed."""
+    text = str(value or '').strip()
+    m = re.fullmatch(r'(\d{1,2}):(\d{2})', text)
+    if not m:
+        raise ValueError(f'Invalid time: {text!r}, expected HH:MM')
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError(f'Invalid time: {text!r}, expected HH:MM')
+    return f'{hour:02d}:{minute:02d}'
+
+
+def get_auto_checkin_settings() -> dict:
+    """Return the scheduled check-in switch and daily time (UTC+8)."""
+    with _STORE_LOCK:
+        saved = _settings.get('auto_checkin')
+    if isinstance(saved, dict):
+        try:
+            time_text = normalize_checkin_time(saved.get('time'))
+        except ValueError:
+            time_text = _AUTO_CHECKIN_DEFAULT_TIME
+        return {'enabled': bool(saved.get('enabled')), 'time': time_text, 'source': 'console'}
+    enabled = os.environ.get(_AUTO_CHECKIN_ENV, '').strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        time_text = normalize_checkin_time(os.environ.get(_AUTO_CHECKIN_TIME_ENV) or _AUTO_CHECKIN_DEFAULT_TIME)
+    except ValueError:
+        time_text = _AUTO_CHECKIN_DEFAULT_TIME
+    return {'enabled': enabled, 'time': time_text, 'source': 'env'}
+
+
+def set_auto_checkin_settings(enabled: bool, time_text=None) -> dict:
+    current = get_auto_checkin_settings()
+    normalized = normalize_checkin_time(time_text) if time_text not in (None, '') else current['time']
+    with _STORE_LOCK:
+        _settings['auto_checkin'] = {'enabled': bool(enabled), 'time': normalized}
+        _save_accounts()
+    os.environ[_AUTO_CHECKIN_ENV] = '1' if enabled else '0'
+    os.environ[_AUTO_CHECKIN_TIME_ENV] = normalized
+    _write_env_values({_AUTO_CHECKIN_ENV: '1' if enabled else '0', _AUTO_CHECKIN_TIME_ENV: normalized})
+    return get_auto_checkin_settings()
 
 
 def set_polling_mode(mode: str) -> None:

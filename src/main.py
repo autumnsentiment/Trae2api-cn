@@ -320,6 +320,8 @@ PUBLIC_PATHS = {
     "/api/max-mode",
     "/api/max-mode/models",
     "/api/auto-route",
+    "/api/auto-checkin",
+    "/api/auto-checkin/run",
     "/api/checkin/status",
     "/api/checkin/claim",
     "/api/checkin/accounts",
@@ -857,6 +859,12 @@ def _web_login_html() -> str:
     max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
     auto_route_checked = 'checked' if auto_route_on else ''
     auto_route_state_text = '已开启' if auto_route_on else '已关闭'
+    auto_checkin = auth.get_auto_checkin_settings()
+    auto_checkin_checked = 'checked' if auto_checkin.get('enabled') else ''
+    auto_checkin_time = html_mod.escape(auto_checkin.get('time') or '08:30')
+    auto_checkin_state_text = (
+        f"每天 {auto_checkin_time} 自动签到" if auto_checkin.get('enabled') else '已关闭'
+    )
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -909,10 +917,10 @@ body {{
 .brand-mark {{
   width: 34px; height: 34px; border-radius: 8px; flex-shrink: 0;
   background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center;
-  font-size: 13px; font-weight: 700; letter-spacing: .5px;
+  font-size: 13px; font-weight: 700; letter-spacing: 0;
 }}
 .brand-block {{ display: flex; flex-direction: column; min-width: 0; }}
-.brand-block h1 {{ font-size: 15px; font-weight: 650; color: #f2f4f8; letter-spacing: .2px; white-space: nowrap; }}
+.brand-block h1 {{ font-size: 15px; font-weight: 650; color: #f2f4f8; letter-spacing: 0; white-space: nowrap; }}
 .brand-sub {{ color: #79839a; font-size: 11px; margin-top: 1px; }}
 .nav-list {{ display: flex; flex-direction: column; gap: 2px; padding: 12px; }}
 .nav-item {{
@@ -937,7 +945,7 @@ body {{
 .tab-page {{ display: none; }}
 .tab-page.active {{ display: block; }}
 .panel-grid {{ display: grid; grid-template-columns: 1fr; gap: 14px; }}
-.panel-grid.cols-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }}
+.panel-grid.cols-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }}
 .panel-stack {{ display: flex; flex-direction: column; gap: 14px; }}
 .login-layout {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px 24px; align-items: start; }}
 .login-steps {{ margin: 0; padding-left: 18px; font-size: 12px; color: var(--muted); line-height: 1.7; }}
@@ -954,8 +962,8 @@ body {{
 .panel-card {{
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 18px;
+  border-radius: 8px;
+  padding: 18px 20px;
   min-width: 0;
   overflow-x: auto;
   box-shadow: 0 1px 2px rgba(20,26,40,.05);
@@ -1029,7 +1037,7 @@ hr {{ border: none; border-top: 1px solid var(--border); margin: 16px 0; }}
 .busy-indicator.visible {{ display:inline-flex; }}
 .busy-indicator::before {{ content:""; width:10px; height:10px; border:2px solid var(--border-strong); border-top-color:var(--accent); border-radius:50%; animation:relay-spin .7s linear infinite; }}
 @keyframes relay-spin {{ to {{ transform:rotate(360deg); }} }}
-.toast {{ position:fixed; top:20px; right:20px; z-index:20; width:min(420px,calc(100vw - 40px)); padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--panel); color:var(--text); box-shadow:0 12px 32px rgba(20,26,40,.16); opacity:0; transform:translateY(-8px); pointer-events:none; transition:opacity .18s ease, transform .18s ease; white-space:pre-wrap; line-height:1.45; }}
+.toast {{ position:fixed; top:20px; right:20px; z-index:20; width:min(420px,calc(100vw - 40px)); padding:12px 14px; border:1px solid var(--border); border-radius:8px; background:var(--panel); color:var(--text); box-shadow:0 12px 32px rgba(20,26,40,.16); opacity:0; transform:translateY(-8px); pointer-events:none; transition:opacity .18s ease, transform .18s ease; white-space:pre-wrap; line-height:1.45; }}
 .toast.visible {{ opacity:1; transform:translateY(0); }}
 .toast.ok {{ border-color:var(--accent-border); }}
 .toast.error {{ border-color:var(--danger-border); color:var(--danger); background:var(--danger-soft); }}
@@ -1037,13 +1045,42 @@ hr {{ border: none; border-top: 1px solid var(--border); margin: 16px 0; }}
 .toast.error .toast-title {{ color:var(--danger); }}
 .busy {{ opacity:.65; pointer-events:none; }}
 .loading {{ margin-top: 12px; display: none; font-size: 13px; color: var(--muted); }}
-.section-title {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 0 0 10px; letter-spacing: .2px; }}
+.section-title {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 0 0 10px; letter-spacing: 0; }}
 .section-title-block {{ font-size: 13px; font-weight: 650; color: var(--text); margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid var(--border); }}
 .card-hint {{ font-size:12px; color:var(--muted); line-height:1.6; margin-bottom:10px; }}
 .card-hint code {{ background: var(--panel2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-size: 11px; color:#39415a; }}
 .card-hint a {{ color:var(--info); }}
 .check-row {{ display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }}
 .check-row .label {{ color:var(--faint); }}
+.check-row + .check-row {{ margin-top: 8px; }}
+.check-row label {{ cursor: pointer; }}
+.check-row input[type=checkbox], .check-row input[type=radio] {{ accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; }}
+.radio-group {{ display: inline-flex; align-items: center; gap: 14px; flex-wrap: wrap; }}
+.inline-check {{ display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); font-weight: 400; cursor: pointer; white-space: nowrap; }}
+.inline-check input[type=checkbox] {{ accent-color: var(--accent); width: 15px; height: 15px; }}
+.form-group .inline-check {{ display: inline-flex; margin-bottom: 0; font-size: 13px; }}
+.form-group .inline-field select, .form-group .inline-field input {{ width: auto; padding: 4px 8px; font-family: inherit; }}
+.form-group .inline-field input[type=number] {{ width: 76px; }}
+.option-row {{ display: flex; gap: 10px 18px; align-items: center; flex-wrap: wrap; }}
+.field-spaced {{ margin-top: 12px; }}
+.field-note {{ font-size: 12px; color: var(--faint); margin-top: 8px; }}
+.schedule-row {{ display: flex; align-items: center; gap: 10px 16px; flex-wrap: wrap; }}
+.schedule-row .time-field {{ display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }}
+.schedule-row input[type=time] {{ padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); font-size: 13px; font-family: inherit; min-width: 108px; }}
+.schedule-row input[type=time]:focus {{ outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(13,138,95,.12); }}
+.schedule-row .btn-group {{ margin-top: 0; }}
+.schedule-status {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }}
+.schedule-status div {{ min-width: 0; }}
+.schedule-status dt {{ font-size: 11px; color: var(--faint); }}
+.schedule-status dd {{ font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }}
+.conn-table {{ width: 100%; margin-top: 14px; border-collapse: collapse; font-size: 12px; }}
+.conn-table th {{ text-align: left; color: var(--muted); font-weight: 600; padding: 7px 6px; border-bottom: 1px solid var(--border); }}
+.conn-table td {{ padding: 7px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }}
+.conn-table td.conn-detail {{ color: var(--muted); overflow-wrap: anywhere; }}
+.conn-table .conn-reasoning {{ margin-top: 4px; color: var(--muted); white-space: pre-wrap; }}
+.conn-status.ok {{ color: var(--accent); font-weight: 600; }}
+.conn-status.fail {{ color: var(--danger); font-weight: 600; }}
+.conn-status.pending {{ color: var(--muted); }}
 .max-models {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; font-size:12px; color:var(--muted); }}
 .max-models[hidden] {{ display:none; }}
 .model-chip {{ border:1px solid var(--border-strong); background:var(--panel); color:var(--text); border-radius:6px; padding:4px 8px; font-size:12px; cursor:pointer; font-family:inherit; }}
@@ -1056,6 +1093,7 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   .login-actions {{ align-items: stretch; }}
   .login-actions .btn-group {{ justify-content: flex-start; }}
   .manual-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .schedule-status {{ grid-template-columns: 1fr; }}
 }}
 @media (max-width: 820px) {{
   .app {{ flex-direction: column; }}
@@ -1155,6 +1193,30 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   </form>
 </details>
 </section>
+<section class="panel-card" id="auto-checkin-panel" aria-labelledby="auto-checkin-title">
+  <div class="section-head">
+    <div class="section-title" id="auto-checkin-title">自动签到</div>
+    <span id="auto-checkin-state" class="section-meta">{auto_checkin_state_text}</span>
+  </div>
+  <div class="schedule-row">
+    <label class="inline-check" for="auto-checkin-toggle">
+      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked}> 启用定时签到
+    </label>
+    <label class="time-field" for="auto-checkin-time">每天（北京时间）
+      <input type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required>
+    </label>
+    <div class="btn-group">
+      <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()">保存</button>
+      <button class="btn btn-secondary btn-sm" id="auto-checkin-run-btn" onclick="runAutoCheckinNow()" title="立即按顺序签到所有未签到账号，已签到账号自动跳过">立即执行</button>
+    </div>
+  </div>
+  <dl class="schedule-status">
+    <div><dt>下次执行</dt><dd id="auto-checkin-next">-</dd></div>
+    <div><dt>上次执行</dt><dd id="auto-checkin-last">-</dd></div>
+    <div><dt>上次结果</dt><dd id="auto-checkin-result">-</dd></div>
+  </dl>
+  <div id="auto-checkin-msg" class="msg" role="status" aria-live="polite"></div>
+</section>
 <section class="panel-card" aria-label="账号列表">
 <div class="section-title">账号列表</div>
 {accounts_html}
@@ -1176,18 +1238,16 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
 <div class="section-title">多账号轮询</div>
 <div class="check-row">
   <input type="checkbox" id="poll-toggle" {poll_checked} onchange="togglePolling()">
-  <label for="poll-toggle" style="cursor:pointer">启用轮询（每次请求自动切换下一个有效账号）</label>
+  <label for="poll-toggle">启用轮询（每次请求自动切换下一个有效账号）</label>
 </div>
-<div class="check-row" style="margin-top:4px">
-  <span class="label" style="margin-right:8px">轮询模式:</span>
-  <label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;cursor:pointer">
-    <input type="radio" name="poll-mode" value="round-robin" onchange="togglePolling()" {poll_mode_rr}> 顺序轮询
-  </label>
-  <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-    <input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}> 积分优先
-  </label>
+<div class="check-row">
+  <span class="label">轮询模式</span>
+  <span class="radio-group">
+    <label class="inline-check"><input type="radio" name="poll-mode" value="round-robin" onchange="togglePolling()" {poll_mode_rr}> 顺序轮询</label>
+    <label class="inline-check"><input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}> 积分优先</label>
+  </span>
 </div>
-<p id="poll-status" style="font-size:12px;color:var(--faint);margin-top:6px">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
+<p id="poll-status" class="field-note">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
 </div>
 <div class="panel-card">
   <div class="section-title">上游端点</div>
@@ -1218,7 +1278,7 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   </div>
   <div class="check-row">
     <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="saveAutoRoute()">
-    <label for="auto-route-toggle" style="cursor:pointer" title="开启后忽略上方预设端点的模式选择；端点失败时回落 Remote">启用自动路由（工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote）</label>
+    <label for="auto-route-toggle" title="开启后忽略上方预设端点的模式选择；端点失败时回落 Remote">启用自动路由（工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote）</label>
   </div>
   <div id="auto-route-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
@@ -1229,9 +1289,9 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   </div>
   <div class="check-row">
     <input type="checkbox" id="max-mode-toggle" {max_checked}>
-    <label for="max-mode-toggle" style="cursor:pointer" title="只对 Remote 的 Agent 会话生效；带调用端工具的请求默认走 Work，不使用 Max">启用 Max 模式（Remote Agent 会话使用 1M 上下文）</label>
+    <label for="max-mode-toggle" title="只对 Remote 的 Agent 会话生效；带调用端工具的请求默认走 Work，不使用 Max">启用 Max 模式（Remote Agent 会话使用 1M 上下文）</label>
   </div>
-  <div class="form-group" style="margin-top:10px">
+  <div class="form-group field-spaced">
     <label for="max-mode-models">生效模型（逗号分隔，留空表示账号中所有支持 Max 的模型）</label>
     <input id="max-mode-models" value="{max_models}" placeholder="glm-5.3, deepseek-v4-pro">
   </div>
@@ -1264,22 +1324,20 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
   </div>
   <div class="form-group">
     <label for="conn-models">测试模型（逗号或换行分隔，留空使用下方常用模型）</label>
-    <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"
-      style="width:100%;box-sizing:border-box;padding:8px;background:var(--panel);border:1px solid var(--border-strong);border-radius:6px;color:var(--text);font-size:12px;font-family:inherit"></textarea>
+    <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"></textarea>
   </div>
   <div class="form-group">
     <label>测试内容</label>
-    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
-      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+    <div class="option-row">
+      <label class="inline-check">
         <input type="checkbox" id="conn-mode-text" checked> 文本回复
       </label>
-      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+      <label class="inline-check">
         <input type="checkbox" id="conn-mode-tool"> 工具调用
       </label>
-      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+      <label class="inline-check inline-field">
         思考强度
-        <select id="conn-effort" title="映射到 Trae custom_model.reasoning_effort：low=light，medium/high=high，xhigh=extra_high，超出模型支持的档位会向下取"
-          style="width:auto;padding:4px 6px;background:var(--panel);border:1px solid var(--border-strong);border-radius:4px;color:var(--text)">
+        <select id="conn-effort" title="映射到 Trae custom_model.reasoning_effort：low=light，medium/high=high，xhigh=extra_high，超出模型支持的档位会向下取">
           <option value="">默认（不传）</option>
           <option value="low">low / 轻</option>
           <option value="medium">medium / 高</option>
@@ -1287,15 +1345,14 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
           <option value="xhigh">xhigh / 极高</option>
         </select>
       </label>
-      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
+      <label class="inline-check">
         <input type="checkbox" id="conn-thinking"> 返回思考内容
       </label>
-      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400" title="请求 1M Max 上下文，结果中显示是否实际生效">
+      <label class="inline-check" title="请求 1M Max 上下文，结果中显示是否实际生效">
         <input type="checkbox" id="conn-max"> 1M Max
       </label>
-      <label style="display:inline-flex;align-items:center;gap:6px;font-weight:400">
-        超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"
-          style="width:72px;padding:4px 6px;background:var(--panel);border:1px solid var(--border-strong);border-radius:4px;color:var(--text)">
+      <label class="inline-check inline-field">
+        超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600">
       </label>
     </div>
   </div>
@@ -1313,12 +1370,8 @@ details summary {{ font-size:13px; color:var(--muted); cursor:pointer; }}
     <button class="btn btn-secondary" id="conn-run-btn" onclick="runConnTest()">开始测试</button>
     <button class="btn btn-secondary" onclick="fillConnPreset()">填入常用模型</button>
   </div>
-  <table id="conn-table" style="width:100%;margin-top:12px;border-collapse:collapse;font-size:12px;display:none">
-    <thead><tr style="text-align:left;color:var(--muted)">
-      <th style="padding:6px 4px">模型</th><th style="padding:6px 4px">类型</th>
-      <th style="padding:6px 4px">结果</th><th style="padding:6px 4px">耗时</th>
-      <th style="padding:6px 4px">详情</th>
-    </tr></thead>
+  <table id="conn-table" class="conn-table" hidden>
+    <thead><tr><th>模型</th><th>类型</th><th>结果</th><th>耗时</th><th>详情</th></tr></thead>
     <tbody id="conn-tbody"></tbody>
   </table>
   <div id="conn-msg" class="msg"></div>
@@ -1566,7 +1619,7 @@ function setCheckinState(id,checked,detail,error){{
     var badge=checked===true?'<span class="badge badge-ok">已签到</span>':(checked===false?'<span class="badge badge-active">未签到</span>':'<span class="badge badge-none">未知</span>');
     el.innerHTML=badge;
   }}
-  if(detailEl){{ detailEl.textContent=error||detail||''; detailEl.style.color=error?'#f0a2aa':''; }}
+  if(detailEl){{ detailEl.textContent=error||detail||''; detailEl.style.color=error?'var(--danger)':''; }}
 }}
 function updateAccountRow(account){{
   if(!account||!account.id) return;
@@ -1661,13 +1714,15 @@ function connModes(){{
 }}
 function connRow(model, mode){{
   var tr = document.createElement('tr');
-  tr.style.borderTop = '1px solid var(--border)';
   var label = mode === 'tool' ? '工具调用' : '文本回复';
-  tr.innerHTML = '<td style="padding:6px 4px">' + model + '</td>'
-    + '<td style="padding:6px 4px">' + label + '</td>'
-    + '<td style="padding:6px 4px" class="conn-status">排队中</td>'
-    + '<td style="padding:6px 4px" class="conn-time">-</td>'
-    + '<td style="padding:6px 4px;color:var(--muted)" class="conn-detail">-</td>';
+  [model, label, '排队中', '-', '-'].forEach(function(text, idx){{
+    var td = document.createElement('td');
+    td.textContent = text;
+    if(idx === 2) td.className = 'conn-status pending';
+    if(idx === 3) td.className = 'conn-time';
+    if(idx === 4) td.className = 'conn-detail';
+    tr.appendChild(td);
+  }});
   return tr;
 }}
 async function runConnTest(){{
@@ -1684,7 +1739,7 @@ async function runConnTest(){{
   var thinking = document.getElementById('conn-thinking').checked;
   var maxMode = document.getElementById('conn-max').checked;
   btn.disabled = true;
-  table.style.display = 'table';
+  table.hidden = false;
   tbody.innerHTML = '';
   showMsg('conn-msg','');
   var jobs = [];
@@ -1703,7 +1758,7 @@ async function runConnTest(){{
     var timeCell = job.row.querySelector('.conn-time');
     var detailCell = job.row.querySelector('.conn-detail');
     statusCell.textContent = '测试中...';
-    statusCell.style.color = '#5b6474';
+    statusCell.className = 'conn-status pending';
     try{{
       var d = await postJSON('/api/model-test',
         {{model: job.model, mode: job.mode, timeout: timeout, endpoint: endpoint,
@@ -1712,7 +1767,7 @@ async function runConnTest(){{
       if(d.success){{
         passed++;
         statusCell.textContent = '通过';
-        statusCell.style.color = '#0d8a5f';
+        statusCell.className = 'conn-status ok';
         if(job.mode === 'tool'){{
           var names = (d.tool_calls || []).map(function(c){{ return c.name; }}).join(', ');
           detailCell.textContent = (d.auto_route ? 'auto -> ' : '') + 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
@@ -1737,18 +1792,18 @@ async function runConnTest(){{
         if(extra.length) detailCell.textContent += ' | ' + extra.join(' | ');
         if(d.reasoning){{
           var rd = document.createElement('div');
-          rd.style.cssText = 'margin-top:4px;color:#5b6474;white-space:pre-wrap';
+          rd.className = 'conn-reasoning';
           rd.textContent = '思考: ' + d.reasoning;
           detailCell.appendChild(rd);
         }}
       }} else {{
         statusCell.textContent = '失败';
-        statusCell.style.color = '#dc2626';
+        statusCell.className = 'conn-status fail';
         detailCell.textContent = String(d.error || 'unknown');
       }}
     }}catch(e){{
       statusCell.textContent = '失败';
-      statusCell.style.color = '#dc2626';
+      statusCell.className = 'conn-status fail';
       timeCell.textContent = '-';
       detailCell.textContent = String(e);
     }}
@@ -1961,6 +2016,63 @@ async function checkinClaimAll(){{
   }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
   finally{{ setBusy(false); }}
 }}
+function formatCheckinTime(iso){{
+  if(!iso) return '-';
+  var m=String(iso).match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})T(\\d{{2}}):(\\d{{2}})/);
+  return m ? (m[2]+'-'+m[3]+' '+m[4]+':'+m[5]) : String(iso);
+}}
+function renderAutoCheckin(d){{
+  if(!d||!d.success) return;
+  var toggle=document.getElementById('auto-checkin-toggle');
+  var timeInput=document.getElementById('auto-checkin-time');
+  if(toggle) toggle.checked=!!d.enabled;
+  if(timeInput&&d.time) timeInput.value=d.time;
+  var stateEl=document.getElementById('auto-checkin-state');
+  if(stateEl) stateEl.textContent=d.running?'正在执行...':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭');
+  document.getElementById('auto-checkin-next').textContent=d.enabled?formatCheckinTime(d.next_run):'未启用';
+  document.getElementById('auto-checkin-last').textContent=d.last_run_at
+    ? formatCheckinTime(d.last_run_at)+(d.last_trigger==='manual'?'（手动）':'（定时）') : '-';
+  var s=d.summary;
+  document.getElementById('auto-checkin-result').textContent=s
+    ? ('成功 '+s.ok+' / 跳过 '+s.skipped+' / 失败 '+s.failed+(s.no_token?(' / 无凭证 '+s.no_token):'')) : '-';
+  var runBtn=document.getElementById('auto-checkin-run-btn');
+  if(runBtn) runBtn.disabled=!!d.running;
+}}
+async function loadAutoCheckin(){{
+  try{{
+    var result=await requestJSON('/api/auto-checkin',{{method:'GET'}},15000);
+    renderAutoCheckin(result.data);
+    return result.data;
+  }}catch(e){{ return null; }}
+}}
+async function saveAutoCheckin(){{
+  var toggle=document.getElementById('auto-checkin-toggle');
+  var timeValue=document.getElementById('auto-checkin-time').value;
+  if(!/^\\d{{2}}:\\d{{2}}$/.test(timeValue||'')){{ showMsg('auto-checkin-msg','请填写有效的签到时间（HH:MM）',false); return; }}
+  var d=await postJSON('/api/auto-checkin',{{enabled:toggle.checked,time:timeValue}});
+  if(d.success){{
+    renderAutoCheckin(d);
+    showMsg('auto-checkin-msg',d.enabled?('已开启，每天 '+d.time+' 自动签到所有账号'):'自动签到已关闭',true,3000);
+  }} else showMsg('auto-checkin-msg',d.error||'保存失败',false);
+}}
+var autoCheckinPoll=null;
+async function runAutoCheckinNow(){{
+  if(!confirm('立即按顺序签到所有未签到账号？已签到账号会自动跳过。')) return;
+  var d=await postJSON('/api/auto-checkin/run',{{}});
+  if(!d.success){{ showMsg('auto-checkin-msg',d.error||'启动失败',false); return; }}
+  renderAutoCheckin(d);
+  showMsg('auto-checkin-msg',d.started?'已开始执行，账号之间按签到间隔依次处理':'已有签到任务在执行',true,4000);
+  clearInterval(autoCheckinPoll);
+  autoCheckinPoll=setInterval(async function(){{
+    var latest=await loadAutoCheckin();
+    if(latest&&!latest.running){{
+      clearInterval(autoCheckinPoll);
+      if(typeof checkinRefreshAll==='function'&&latest.summary&&latest.summary.ok) showMsg('auto-checkin-msg','执行完成，可点击“查询签到状态”刷新列表',true,5000);
+    }}
+  }},5000);
+}}
+loadAutoCheckin();
+setInterval(loadAutoCheckin,60000);
 var manualForm=document.getElementById('manual-form');
 if(manualForm) manualForm.addEventListener('submit',async function(e){{
   e.preventDefault();var fd=new FormData(e.target);
@@ -5959,23 +6071,146 @@ async def _checkin_auto_retry_loop():
         await _checkin_auto_retry_cycle()
 
 
+# Scheduled daily check-in.  The loop wakes every few seconds, re-reads the
+# console settings and fires once per business day (UTC+8) after the chosen
+# time.  A relay that starts late still claims that same day.
+AUTO_CHECKIN_POLL_SECONDS = 30.0
+_AUTO_CHECKIN_STATE: dict = {
+    "running": False,
+    "last_run_at": 0.0,
+    "last_run_date": "",
+    "last_trigger": "",
+    "summary": None,
+}
+_AUTO_CHECKIN_LOCK = asyncio.Lock()
+
+
+def _auto_checkin_target(now: Optional[datetime] = None, time_text: str = "08:30") -> datetime:
+    """Return today's scheduled run time in the check-in timezone."""
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    hour, minute = (int(part) for part in time_text.split(":", 1))
+    return current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _auto_checkin_next_run(settings: dict, now: Optional[datetime] = None) -> Optional[datetime]:
+    if not settings.get("enabled"):
+        return None
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    target = _auto_checkin_target(current, settings.get("time") or "08:30")
+    if _AUTO_CHECKIN_STATE.get("last_run_date") == current.date().isoformat():
+        return target + timedelta(days=1)
+    # Past today's time but not run yet: the loop fires on its next tick.
+    return max(target, current)
+
+
+def _auto_checkin_due(settings: dict, now: Optional[datetime] = None) -> bool:
+    if not settings.get("enabled"):
+        return False
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    if _AUTO_CHECKIN_STATE.get("last_run_date") == current.date().isoformat():
+        return False
+    return current >= _auto_checkin_target(current, settings.get("time") or "08:30")
+
+
+async def _auto_checkin_cycle(trigger: str = "schedule") -> dict:
+    """Claim check-in for every account with a token, strictly in order."""
+    summary = {"total": 0, "ok": 0, "skipped": 0, "failed": 0, "no_token": 0}
+    if _AUTO_CHECKIN_LOCK.locked():
+        return {**summary, "busy": True}
+    async with _AUTO_CHECKIN_LOCK:
+        _AUTO_CHECKIN_STATE["running"] = True
+        now = datetime.now(_CHECKIN_TIMEZONE)
+        try:
+            for account_id, record in list(auth.get_accounts_raw()):
+                summary["total"] += 1
+                if not (record.get("token") or ""):
+                    summary["no_token"] += 1
+                    continue
+                checkin = record.get("checkin") or {}
+                if checkin.get("checked_in") is True and _checkin_cache_is_today(record):
+                    summary["skipped"] += 1
+                    continue
+                try:
+                    result = await _claim_checkin_account(account_id)
+                except Exception as exc:
+                    logger.warning("auto checkin account=%s error: %s", account_id, exc)
+                    summary["failed"] += 1
+                    continue
+                if result.get("success"):
+                    summary["skipped" if result.get("skipped") else "ok"] += 1
+                else:
+                    summary["failed"] += 1
+        finally:
+            _AUTO_CHECKIN_STATE.update(
+                running=False,
+                last_run_at=time.time(),
+                last_trigger=trigger,
+                summary=dict(summary),
+            )
+            # Only the scheduler consumes the daily slot; a manual run leaves
+            # the scheduled pass in place (already claimed accounts are skipped).
+            if trigger == "schedule":
+                _AUTO_CHECKIN_STATE["last_run_date"] = now.date().isoformat()
+        logger.info(
+            "auto checkin done trigger=%s total=%d ok=%d skipped=%d failed=%d no_token=%d",
+            trigger,
+            summary["total"],
+            summary["ok"],
+            summary["skipped"],
+            summary["failed"],
+            summary["no_token"],
+        )
+        return summary
+
+
+async def _auto_checkin_loop():
+    while True:
+        await asyncio.sleep(AUTO_CHECKIN_POLL_SECONDS)
+        try:
+            if _auto_checkin_due(auth.get_auto_checkin_settings()):
+                await _auto_checkin_cycle("schedule")
+        except Exception as exc:
+            logger.warning("auto checkin loop error: %s", exc)
+
+
+def _auto_checkin_payload() -> dict:
+    settings = auth.get_auto_checkin_settings()
+    next_run = _auto_checkin_next_run(settings)
+    last_at = float(_AUTO_CHECKIN_STATE.get("last_run_at") or 0)
+    return {
+        "success": True,
+        **settings,
+        "timezone": "Asia/Shanghai",
+        "next_run": next_run.isoformat(timespec="minutes") if next_run else None,
+        "running": bool(_AUTO_CHECKIN_STATE.get("running")),
+        "last_run_at": (
+            datetime.fromtimestamp(last_at, _CHECKIN_TIMEZONE).isoformat(timespec="seconds")
+            if last_at > 0
+            else None
+        ),
+        "last_trigger": _AUTO_CHECKIN_STATE.get("last_trigger") or None,
+        "summary": _AUTO_CHECKIN_STATE.get("summary"),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_app()
     web_reaper = asyncio.create_task(_web_reaper_loop())
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
+    auto_checkin = asyncio.create_task(_auto_checkin_loop())
     try:
         yield
     finally:
-        for reaper in (web_reaper, terminal_reaper, checkin_retry):
+        for reaper in (web_reaper, terminal_reaper, checkin_retry, auto_checkin):
             reaper.cancel()
         await asyncio.gather(web_reaper, terminal_reaper, return_exceptions=True)
-        await asyncio.gather(checkin_retry, return_exceptions=True)
+        await asyncio.gather(checkin_retry, auto_checkin, return_exceptions=True)
         await _cancel_usage_tasks()
 
 
-app = FastAPI(title="Trae CN Relay", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Trae CN Relay", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/api/usage/records")
@@ -7429,6 +7664,35 @@ async def api_set_auto_route(request: Request):
         return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
     settings = auth.set_auto_route_settings(_truthy(body.get("enabled")))
     return JSONResponse({"success": True, **settings})
+
+
+@app.get("/api/auto-checkin")
+async def api_get_auto_checkin():
+    return JSONResponse(_auto_checkin_payload(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/auto-checkin")
+async def api_set_auto_checkin(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or "enabled" not in body:
+        return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
+    try:
+        auth.set_auto_checkin_settings(_truthy(body.get("enabled")), body.get("time"))
+    except ValueError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(_auto_checkin_payload())
+
+
+@app.post("/api/auto-checkin/run")
+async def api_run_auto_checkin():
+    if _AUTO_CHECKIN_LOCK.locked():
+        return JSONResponse({**_auto_checkin_payload(), "started": False, "error": "already running"})
+    asyncio.create_task(_auto_checkin_cycle("manual"))
+    await asyncio.sleep(0)
+    return JSONResponse({**_auto_checkin_payload(), "started": True})
 
 
 @app.get("/api/max-mode")
