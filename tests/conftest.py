@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,22 @@ _TEST_ENV = _TEST_ROOT / ".env"
 _TEST_ACCOUNTS = _TEST_DATA / "accounts.json"
 _TEST_USAGE = _TEST_DATA / "usage_records.json"
 _TEST_USAGE_STATS = _TEST_DATA / "usage_stats.json"
+_FAKE_CLI = Path(__file__).resolve().parent / "fake" / "fake_cli.cmd"
+_FAKE_CLI_SOURCE = _FAKE_CLI.with_name("fake_cli.py")
+_FAKE_CLI_ORIGINAL: tuple[bytes, int] | None = None
+
+# The fixture is intentionally named ``.cmd`` because Windows tests launch it
+# directly.  GitHub Actions runs on Linux, where that file is neither
+# executable nor a valid interpreter script.  Keep the same path used by all
+# test modules, but install a disposable POSIX wrapper during collection.
+if os.name != "nt" and _FAKE_CLI.exists() and _FAKE_CLI_SOURCE.exists():
+    _FAKE_CLI_ORIGINAL = (_FAKE_CLI.read_bytes(), stat.S_IMODE(_FAKE_CLI.stat().st_mode))
+    _FAKE_CLI.write_text(
+        "#!/bin/sh\n"
+        f'exec "{sys.executable}" "{_FAKE_CLI_SOURCE}" "$@"\n',
+        encoding="utf-8",
+    )
+    _FAKE_CLI.chmod(_FAKE_CLI.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 # Prevent src.main's import-time dotenv.load_dotenv() from reading the
 # developer's working-tree .env.  The original callable is restored when the
@@ -73,6 +91,10 @@ _auth._rotation_cursor = 0
 def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
     """Restore process globals and remove disposable test state."""
 
+    if _FAKE_CLI_ORIGINAL is not None:
+        content, mode = _FAKE_CLI_ORIGINAL
+        _FAKE_CLI.write_bytes(content)
+        _FAKE_CLI.chmod(mode)
     _auth.ACCOUNTS_PATH = _ORIGINAL_ACCOUNTS_PATH
     _auth.ENV_PATH = _ORIGINAL_ENV_PATH
     dotenv.load_dotenv = _ORIGINAL_LOAD_DOTENV
