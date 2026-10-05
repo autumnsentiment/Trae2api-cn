@@ -1595,6 +1595,30 @@ class UsageRecordTests(unittest.TestCase):
         self.assertIn("updateAccountCreditsRow", credits_refresh)
         self.assertNotIn("updateAccountCheckinRow", credits_refresh)
 
+    def test_usage_records_render_request_mode_metadata(self):
+        html = main_module._web_login_html()
+        for heading in ("思考强度", "上下文模式", "Tool 参数"):
+            with self.subTest(heading=heading):
+                self.assertIn(f"<th>{heading}</th>", html)
+        # The browser keeps older records readable while accepting the
+        # canonical fields written by the usage tracker.
+        for field in (
+            "reasoning_effort",
+            "context_mode",
+            "tool_used",
+            "requested_reasoning_effort",
+            "reasoning_effort_applied",
+            "未记录上下文模式",
+            "未记录是否携带 tools 参数",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, html)
+        self.assertIn("usageReasoningMeta", html)
+        self.assertIn("usageContextMeta", html)
+        self.assertIn("usageToolMeta", html)
+        self.assertNotIn('text+=\'<span class="usage-sub">', html)
+        self.assertIn("max1m", html)
+
 
 class _FakeUsageTracker:
     def __init__(self):

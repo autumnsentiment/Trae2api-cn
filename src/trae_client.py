@@ -11,6 +11,7 @@ trae_client.py - Trae API 客户端
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator, Mapping, Optional
 
+import anyio
 import httpx
 
 from . import auth, raw_client
@@ -143,6 +145,8 @@ MODEL_ALIASES = {
     "deepseek-r1": "DeepSeek-V4-Pro",
     "gpt-4o-mini": "DeepSeek-V4-Flash",
     "deepseek-v4-flash-official": "DeepSeek-V4-Flash-Official",
+    "deepseek-v4-pro-official": "DeepSeek-V4-Pro-Official",
+    "doubao-seed-evolving": "Doubao-Seed-Evolving",
     "work": "work",
 }
 
@@ -273,7 +277,7 @@ def convert_model_name(model: str) -> str:
     if not model:
         return model
     m = model.strip().lower()
-    return _ALIAS_LOOKUP.get(m, model)
+    return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or model
 
 
 def is_model_supported(model: str) -> bool:
@@ -1021,7 +1025,10 @@ def build_web_content(messages: list[dict]) -> list[dict]:
 
 
 def _messages_with_client_runtime(
-    messages: list[dict], options: Optional[dict] = None
+    messages: list[dict],
+    options: Optional[dict] = None,
+    *,
+    native_tools: bool = False,
 ) -> list[dict]:
     options = options or {}
     if (
@@ -1041,11 +1048,21 @@ def _messages_with_client_runtime(
         if "tools" in options
         else options.get("_inherited_tools")
     )
+    tool_choice = options.get("tool_choice")
+    context_options = options
+    if native_tools:
+        normalized_choice = _ide_native_tool_choice(tool_choice)
+        if normalized_choice in {"none", "auto", "required"}:
+            tool_choice = normalized_choice
+        if normalized_choice == "none":
+            tool_catalog = []
+            context_options = {**options, "tools": []}
     prompt = raw_client.build_runtime_system_prompt(
         tool_catalog,
-        raw_client.build_client_context(options),
-        options.get("tool_choice"),
+        raw_client.build_client_context(context_options),
+        tool_choice,
         options.get("parallel_tool_calls"),
+        native_tools=native_tools,
     )
     return [{"role": "system", "content": prompt}, *messages]
 
@@ -1153,20 +1170,15 @@ async def stop_web_session(
 
 
 async def reap_idle_web_sessions() -> int:
-    count = 0
-    for lease in idle_web_leases():
-        session_id = lease["session_id"]
-        account_id = lease["account_id"]
+    async def cleanup_lease(lease: dict) -> None:
         client = lease.get("client")
-        message_id = lease.get("message_id") or ""
-        logger.warning("trae-client: reaping idle web session %s (account %s)", session_id, account_id)
-        if unregister_web_lease(session_id):
+        try:
             if client is not None:
                 try:
                     await stop_web_session(
                         client,
-                        session_id,
-                        message_id,
+                        lease["session_id"],
+                        lease.get("message_id") or "",
                         options={
                             "_auth_token": lease.get("token") or "",
                             "provider_specific": dict(
@@ -1176,12 +1188,48 @@ async def reap_idle_web_sessions() -> int:
                     )
                 except Exception:
                     pass
-            if client is not None:
+        finally:
+            try:
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+            finally:
+                release_web_slot(lease["account_id"])
+
+    count = 0
+    for lease in idle_web_leases():
+        session_id = lease["session_id"]
+        account_id = lease["account_id"]
+        logger.warning("trae-client: reaping idle web session %s (account %s)", session_id, account_id)
+        if unregister_web_lease(session_id):
+            # Lease ownership has moved to the reaper. The response's close
+            # path will now skip it, so cancellation must drain this cleanup.
+            cleanup_task = asyncio.create_task(cleanup_lease(lease))
+            cancellation = None
+            with anyio.CancelScope(shield=True):
+                while not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError as exc:
+                        if cleanup_task.cancelled():
+                            raise
+                        cancellation = cancellation or exc
+                    except Exception:
+                        break
                 try:
-                    await client.aclose()
-                except Exception:
-                    pass
-            release_web_slot(account_id)
+                    cleanup_task.result()
+                except BaseException:
+                    if cancellation is None:
+                        raise
+                    logger.warning(
+                        "trae-client: idle session cleanup failed while reaper cancelled",
+                        exc_info=True,
+                    )
+            if cancellation is not None:
+                raise cancellation
+            await anyio.lowlevel.checkpoint_if_cancelled()
             count += 1
     return count
 
@@ -1508,6 +1556,174 @@ async def stream_web_events(
                     event = None
 
 
+def _ide_native_content(content: Any) -> Any:
+    """Keep SOLO content blocks intact, normalizing only renderer text."""
+
+    if content is None:
+        return None
+    if not isinstance(content, list):
+        if isinstance(content, Mapping):
+            return [copy.deepcopy(dict(content))]
+        return [{"type": "text", "text": str(content)}]
+    blocks: list[Any] = []
+    for block in content:
+        if isinstance(block, str):
+            blocks.append({"type": "text", "text": block})
+        elif isinstance(block, Mapping):
+            converted = copy.deepcopy(dict(block))
+            if str(block.get("type") or "").lower() in {"text", "input_text"}:
+                converted["type"] = "text"
+                text = block.get("text")
+                if not isinstance(text, str):
+                    text = block.get("content")
+                converted["text"] = (
+                    text if isinstance(text, str) else renderer_block_text(block)
+                )
+                converted.pop("value", None)
+            blocks.append(converted)
+        else:
+            blocks.append(copy.deepcopy(block))
+    return blocks
+
+
+def _ide_native_tool_calls(message: Mapping[str, Any]) -> list[dict]:
+    """Map OpenAI and renderer assistant calls to SOLO's function_call."""
+
+    calls = message.get("tool_calls")
+    calls = list(calls) if isinstance(calls, list) else []
+    content = message.get("content")
+    if isinstance(content, list):
+        calls.extend(
+            block
+            for block in content
+            if isinstance(block, Mapping)
+            and str(block.get("type") or "").lower()
+            in {"tool_use", "tool_call", "function_call"}
+        )
+    prepared = []
+    seen_ids: set[str] = set()
+    for call in calls:
+        if not isinstance(call, Mapping):
+            continue
+        function = call.get("function") or call.get("function_call")
+        function = function if isinstance(function, Mapping) else call
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        call_id = str(
+            call.get("id") or call.get("tool_call_id") or call.get("toolCallId") or ""
+        )
+        if call_id and call_id in seen_ids:
+            continue
+        if call_id:
+            seen_ids.add(call_id)
+        arguments = function.get("arguments")
+        if arguments is None:
+            arguments = function.get("input", function.get("parameters", {}))
+        prepared.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+    return raw_client._native_assistant_tool_calls(prepared)
+
+
+def _convert_ide_native_messages(
+    messages: list[dict], options: Optional[dict] = None
+) -> list[dict]:
+    """Preserve caller-owned tool correlation on llm_utils_chat only."""
+
+    result: list[dict] = []
+    prepared = sanitize_assistant_history_messages(
+        _messages_with_client_runtime(messages, options, native_tools=True)
+    )
+    tool_names = raw_client._tool_call_name_map(messages)
+    for message in prepared:
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        if role == "developer":
+            role = "system"
+        elif role not in {"system", "user", "assistant", "tool", "function"}:
+            role = "user"
+        item: dict[str, Any] = {"role": role}
+        content = message.get("content")
+        if role == "assistant":
+            calls = _ide_native_tool_calls(message)
+            if calls:
+                item["tool_calls"] = calls
+            legacy_call = message.get("function_call")
+            if isinstance(legacy_call, Mapping):
+                converted_call = raw_client._native_function_call(legacy_call)
+                if converted_call:
+                    item["function_call"] = converted_call
+            if isinstance(content, list):
+                content = [
+                    block
+                    for block in content
+                    if not (
+                        isinstance(block, Mapping)
+                        and str(block.get("type") or "").lower()
+                        in {"tool_use", "tool_call", "function_call"}
+                    )
+                ]
+        renderer_results = raw_client._renderer_tool_result_blocks(content)
+        if role in {"tool", "function"}:
+            for key in ("tool_call_id", "name"):
+                if message.get(key) is not None:
+                    item[key] = str(message[key])
+            if not renderer_results and tool_result_is_failed(message):
+                content = "Client tool result status=failed:\n" + _content_to_text(content)
+
+        if renderer_results:
+            # Split renderer user turns at result blocks so a following user
+            # instruction does not hide or precede the native tool response.
+            pending: list[Any] = []
+            for block in content:
+                block_results = raw_client._renderer_tool_result_blocks([block])
+                if not block_results:
+                    pending.append(block)
+                    continue
+                if pending:
+                    result.append({**item, "content": _ide_native_content(pending)})
+                    pending = []
+                tool_result = block_results[0]
+                text = tool_result["content"]
+                if tool_result["failed"]:
+                    text = "Client tool result status=failed:\n" + text
+                native_result = {
+                    "role": "tool",
+                    "tool_call_id": tool_result["id"],
+                    "content": _ide_native_content(text),
+                }
+                name = tool_result["name"] or tool_names.get(tool_result["id"])
+                if name:
+                    native_result["name"] = name
+                result.append(native_result)
+            if pending:
+                result.append({**item, "content": _ide_native_content(pending)})
+            continue
+        if "content" in message:
+            item["content"] = _ide_native_content(content)
+        result.append(item)
+    return result
+
+
+def _ide_native_tool_choice(choice: Any) -> Optional[str]:
+    if isinstance(choice, str):
+        choice = choice.strip()
+        return choice.lower() if choice.lower() in {"none", "auto", "required"} else choice
+    if not isinstance(choice, Mapping):
+        return None
+    choice_type = str(choice.get("type") or "").strip().lower()
+    if choice_type in {"none", "auto", "required"}:
+        return choice_type
+    name = raw_client._named_tool_choice(choice)
+    return name or ("auto" if choice_type == "function" else None)
+
+
 def build_llm_chat_body(
     messages: list[dict],
     model: str,
@@ -1523,17 +1739,11 @@ def build_llm_chat_body(
     non-stream callers aggregate the SSE response in the relay.
     """
     options = options or {}
-    converted = convert_openai_messages(messages, options)
+    converted = _convert_ide_native_messages(messages, options)
     session_id = _requested_session_id(options) or str(uuid.uuid4())
     config_name = convert_model_name(model) or model or "glm-5.2"
     body = {
-        "messages": [
-            {
-                "role": m.get("role", "user"),
-                "content": [{"type": "text", "text": m.get("content", "")}],
-            }
-            for m in converted
-        ],
+        "messages": converted,
         "config_name": config_name,
         "model": config_name,
         "function": "solo_work_lite",
@@ -1544,21 +1754,16 @@ def build_llm_chat_body(
     max_tokens = clamp_max_completion_tokens(max_tokens, model)
     if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
         body["max_tokens"] = int(max_tokens)
-    tools = options.get("tools") or options.get("_inherited_tools")
-    if isinstance(tools, list) and tools:
+    tools = options["tools"] if "tools" in options else options.get("_inherited_tools")
+    choice = _ide_native_tool_choice(options.get("tool_choice"))
+    if isinstance(tools, list) and tools and str(choice or "").lower() != "none":
         native_tools = raw_client._native_tool_definitions(tools)
         if native_tools:
             body["tools"] = native_tools
-        choice = options.get("tool_choice")
-        if isinstance(choice, Mapping):
-            function = choice.get("function")
-            selected = function if isinstance(function, Mapping) else choice
-            name = selected.get("name") if isinstance(selected, Mapping) else ""
-            choice = str(name or "auto")
-        if choice is not None and choice != "none":
-            body["tool_choice"] = choice
-        if options.get("parallel_tool_calls") is not None:
-            body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+            if choice is not None:
+                body["tool_choice"] = choice
+            if options.get("parallel_tool_calls") is not None:
+                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
     return body
 
 
@@ -1935,75 +2140,73 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
 
 _MODEL_LIST_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _MODEL_LIST_CACHE_TTL = float(os.environ.get("TRAE_MODEL_LIST_CACHE_TTL", "300"))
+# Lowercase public id -> exact upstream config name, learned from the live
+# model list (for example ``doubao-seed-code`` -> ``Doubao-Seed-Code``).
+_UPSTREAM_MODEL_CASE: dict[str, str] = {}
+# Routing ids that are not upstream configs but are always accepted.
+_ROUTING_MODEL_IDS = ("auto", "work")
+
+
+def _model_item(model_id: str, created: int) -> dict:
+    return {"id": model_id, "object": "model", "created": created, "owned_by": "trae"}
 
 
 def _static_model_list(created: int) -> list[dict]:
-    """内置模型表；无配置时兜底返回 auto。"""
-    items = [
-        {"id": mid, "object": "model", "created": created, "owned_by": "trae"}
-        for mid in sorted(SUPPORTED_MODELS)
-    ]
-    return items or [{"id": "auto", "object": "model", "created": created, "owned_by": "trae"}]
+    """Offline fallback: lowercase built-in ids only, one entry per spelling."""
+    ids = {mid for mid in SUPPORTED_MODELS if mid and mid == mid.lower()}
+    ids.update(_ROUTING_MODEL_IDS)
+    return [_model_item(mid, created) for mid in sorted(ids)]
 
 
 async def get_models(force: bool = False) -> list[dict]:
     """Return the model list for /v1/models.
 
-    With TRAE_FETCH_MODEL_LIST=true it fetches real upstream model names;
-    otherwise it returns the built-in aliases.  The web upstream model list
-    (config names) is always merged into the built-in list so new models such
-    as DeepSeek-V4-Flash 正式版 / DeepSeek-V4-Flash-Official show up without a
-    code change.
+    Source is the active account's live Trae model list (the same
+    ``/models?functions=solo_agent_remote,solo_work_remote,solo_design_remote``
+    call the web client makes), merged across the Agent / Work / Design tiers.
+    Only config names are listed; display labels such as ``GLM-5.3`` are not.
+    Ids are exposed lowercase: config names that carry capitals appear once in
+    lowercase and ``convert_model_name`` maps them back to the exact config
+    name. The built-in table is used only when the upstream list is empty.
     """
     created = int(time.time())
-    cache_key = auth.get_user_id() or auth.get_token()[:16] or "default"
-
-    # Always include the built-in aliases.
-    items = _static_model_list(created)
-
-    if os.environ.get("TRAE_FETCH_MODEL_LIST", "").lower() != "true":
-        try:
-            configs = await _fetch_web_model_configs()
-        except Exception as e:
-            logger.warning("trae-client: web model list fetch failed: %s", e)
-            configs = {}
-        merged = {m["id"]: m for m in items}
-        for name, cfg in configs.items():
-            if name and name not in merged:
-                merged[name] = {"id": name, "object": "model", "created": created, "owned_by": "trae"}
-            display = cfg.get("display_name") or cfg.get("display_model_name") or ""
-            if display and display not in merged:
-                merged[display] = {"id": display, "object": "model", "created": created, "owned_by": "trae"}
-        return sorted(merged.values(), key=lambda m: m["id"].lower())
+    account_id, record = auth.get_active_account_snapshot()
+    token = str((record or {}).get("token") or "") or auth.get_token()
+    cache_key = account_id or auth.get_user_id() or token[:16] or "default"
 
     cached = _MODEL_LIST_CACHE.get(cache_key)
     if not force and cached and time.time() - cached[0] < _MODEL_LIST_CACHE_TTL:
-        return cached[1]
+        return [dict(item) for item in cached[1]]
 
-    await auth.maybe_refresh()
-    base = os.environ.get("TRAE_API_HOST", "") or auth.get_auth().host or "https://trae-api-cn.mchost.guru"
-    base = base.rstrip("/")
-    url = f"{base}/api/ide/v1/model_list?type=chat"
-    try:
-        async with httpx.AsyncClient(headers=build_headers(), timeout=30) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                raise RuntimeError(f"model_list [{resp.status_code}]: {resp.text[:500]}")
-            data = resp.json()
-        out = []
-        for item in data.get("model_configs", []):
-            name = item.get("name", "")
-            if name == "aws_sdk_claude37_sonnet":
-                name = "claude-3-7-sonnet"
-            elif name == "claude3.5":
-                name = "claude-3-5-sonnet"
-            if name:
-                out.append({"id": name, "object": "model", "created": created, "owned_by": "trae"})
-        items = out or _static_model_list(created)
-        _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
-        return items
-    except Exception as e:
-        logger.warning("trae-client: model_list failed, using static list: %s", e)
-        items = _static_model_list(created)
-        _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
-        return items
+    configs: dict[str, dict] = {}
+    if token:
+        kwargs: dict[str, Any] = {"token_override": token}
+        provider = (record or {}).get("provider_specific") or (record or {}).get(
+            "providerSpecificData"
+        )
+        if isinstance(provider, Mapping):
+            kwargs["provider_specific"] = dict(provider)
+        try:
+            configs = await _fetch_web_model_configs(**kwargs)
+        except Exception as e:
+            logger.warning("trae-client: web model list fetch failed: %s", e)
+            configs = {}
+
+    ids: set[str] = set()
+    for name in configs:
+        exact = str(name or "").strip()
+        if not exact:
+            continue
+        lowered = exact.lower()
+        ids.add(lowered)
+        if lowered != exact:
+            _UPSTREAM_MODEL_CASE[lowered] = exact
+    if not ids:
+        # Not cached, so the next request retries the upstream list.
+        logger.warning("trae-client: upstream model list empty, using built-in list")
+        return _static_model_list(created)
+
+    ids.update(_ROUTING_MODEL_IDS)
+    items = [_model_item(mid, created) for mid in sorted(ids)]
+    _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
+    return [dict(item) for item in items]

@@ -120,6 +120,10 @@ class RepeatedCompletedToolResponse(EmptyUpstreamResponse):
     """Raised when the only upstream output repeats an already completed call."""
 
 
+class InvalidNativeToolArguments(EmptyUpstreamResponse):
+    """Raised when native tool fragments do not form valid final JSON."""
+
+
 class ModelProviderMismatch(RuntimeError):
     """Raised when Trae reports a provider different from the requested model."""
 
@@ -607,7 +611,7 @@ def _ensure_required_tool_call(
 
 
 class ToolCallAccumulator:
-    """Deduplicate full/cumulative calls and emit OpenAI streaming deltas."""
+    """Merge native fragments or cumulative calls into OpenAI tool deltas."""
 
     def __init__(self, max_calls: Optional[int] = None):
         self._calls: dict[str, dict] = {}
@@ -619,6 +623,25 @@ class ToolCallAccumulator:
     def has_calls(self) -> bool:
         return bool(self._calls)
 
+    def _existing_key(self, call: dict) -> Optional[str]:
+        key = call.get("id")
+        if key in self._calls:
+            return key
+        function = call.get("function") or {}
+        requested_index = call.get("index")
+        if isinstance(requested_index, int) and (
+            call.get("_synthetic_id") or not function.get("name")
+        ):
+            for existing_key, existing_index in self._indexes.items():
+                if existing_index != requested_index:
+                    continue
+                existing_name = (self._calls[existing_key].get("function") or {}).get(
+                    "name"
+                )
+                if not function.get("name") or function.get("name") == existing_name:
+                    return existing_key
+        return None
+
     def prepare(self, calls: Any) -> list[dict]:
         if not isinstance(calls, list):
             return []
@@ -628,21 +651,14 @@ class ToolCallAccumulator:
             if not call:
                 continue
             function = call.get("function") or {}
-            if not function.get("name"):
-                existing_key = call.get("id")
-                existing = self._calls.get(existing_key)
-                requested_index = call.get("index")
-                if existing is None and isinstance(requested_index, int):
-                    for key, index in self._indexes.items():
-                        if index == requested_index:
-                            existing_key = key
-                            existing = self._calls.get(key)
-                            break
+            existing_key = self._existing_key(call)
+            if existing_key is not None:
+                existing = self._calls[existing_key]
                 existing_function = existing.get("function") if existing else None
-                if isinstance(existing_function, dict) and existing_function.get("name"):
+                if not function.get("name") and isinstance(existing_function, dict):
                     function["name"] = existing_function["name"]
-                    call["id"] = existing_key
-                    call["_synthetic_id"] = False
+                call["id"] = existing_key
+                call["_synthetic_id"] = existing.get("_synthetic_id") is True
             prepared.append(call)
         return prepared
 
@@ -656,18 +672,12 @@ class ToolCallAccumulator:
                 continue
             function = call["function"]
             call_id = call["id"]
-            key = call_id
+            key = self._existing_key(call) or call_id
+            existing = self._calls.get(key)
+            if existing is not None:
+                call_id = key
+                call["id"] = key
             if not function.get("name"):
-                existing = self._calls.get(key)
-                requested_index = call.get("index")
-                if existing is None and isinstance(requested_index, int):
-                    for existing_key, existing_index in self._indexes.items():
-                        if existing_index == requested_index:
-                            key = existing_key
-                            call_id = existing_key
-                            call["id"] = existing_key
-                            existing = self._calls.get(existing_key)
-                            break
                 existing_function = existing.get("function") if existing else None
                 if not isinstance(existing_function, dict) or not existing_function.get(
                     "name"
@@ -675,7 +685,7 @@ class ToolCallAccumulator:
                     continue
                 function["name"] = existing_function["name"]
             requested_index = call.get("index")
-            if call.get("_synthetic_id"):
+            if key not in self._calls and call.get("_synthetic_id"):
                 for existing_key in self._order:
                     existing = self._calls[existing_key]
                     if not existing.get("_synthetic_id"):
@@ -683,12 +693,13 @@ class ToolCallAccumulator:
                     existing_function = existing.get("function") or {}
                     if existing_function.get("name") != function.get("name"):
                         continue
-                    same_index = (
+                    both_indexed = (
                         existing.get("_explicit_index") is True
                         and call.get("_explicit_index") is True
-                        and existing.get("_source_index")
-                        == call.get("_source_index")
                     )
+                    same_index = both_indexed and self._indexes[existing_key] == requested_index
+                    if both_indexed and not same_index:
+                        continue
                     previous_args = str(existing_function.get("arguments") or "")
                     current_args = str(function.get("arguments") or "")
                     cumulative = current_args.startswith(previous_args) or previous_args.startswith(
@@ -725,7 +736,12 @@ class ToolCallAccumulator:
             if current_name and current_name != previous["name"]:
                 previous["name"] = current_name
                 function_delta["name"] = current_name
-            if current_args != previous_args:
+            if call.get("_arguments_mode") == "delta":
+                argument_delta = current_args
+                previous["arguments"] += current_args
+                if argument_delta:
+                    function_delta["arguments"] = argument_delta
+            elif current_args != previous_args:
                 if current_args.startswith(previous_args):
                     argument_delta = current_args[len(previous_args):]
                     previous["arguments"] = current_args
@@ -747,6 +763,28 @@ class ToolCallAccumulator:
 
     def calls(self) -> list[dict]:
         return [self._calls[key] for key in self._order]
+
+
+def _ensure_native_tool_arguments(calls: list[dict], usage: Any = None) -> None:
+    for call in calls:
+        if call.get("_arguments_mode") != "delta":
+            continue
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        # Preserve the existing zero-argument behavior and the text/snapshot
+        # bridge; only reject malformed nonempty native fragment sequences.
+        if not arguments:
+            continue
+        try:
+            json.loads(arguments)
+        except (TypeError, ValueError) as error:
+            raise InvalidNativeToolArguments(
+                f"Trae native tool call {function.get('name') or 'unknown'} "
+                "ended with invalid JSON arguments",
+                retryable=False,
+                usage=usage,
+                observed_model_event=True,
+            ) from error
 
 
 def _calls_from_payload(data: Any) -> list[dict]:
@@ -1356,6 +1394,7 @@ async def translate_ide_stream(
             usage=final_usage,
             observed_model_event=observed_model_event,
         )
+    _ensure_native_tool_arguments(tool_calls.calls(), final_usage)
     if content_count == 0 and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
@@ -2476,6 +2515,7 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
+    _ensure_native_tool_arguments(tool_calls.calls(), usage)
     if not full and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",

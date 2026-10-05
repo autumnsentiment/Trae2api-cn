@@ -16,9 +16,9 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 - 思考强度：`reasoning_effort` / `thinking.budget_tokens` 映射到 Trae 原生 `light` / `high` / `extra_high`，按模型声明的档位自动钳制
 - 四个可切换上游端点：Remote、IDE Agent、Work Agent、IDE Raw，原生端点失败时可自动回落 Remote
 - 自动路由开关：按请求是否带工具自动选端点（工具走 IDE Agent，纯聊天走 Remote），失败保底回落 Remote
-- 多账号：网页 OAuth 登录、手动添加凭证、顺序轮询 / 积分优先轮询、每账号并发槽位与排队
+- 多账号：网页 OAuth 登录、手动添加凭证、账号模型请求开关（不影响签到）、顺序轮询 / 积分优先轮询、每账号并发槽位与排队
 - 每日签到：一键签到、定时自动签到（控制台开关 + 每日时间，北京时间）、9074 风控自动换设备 ID 并退避重试、后台错峰自动重试
-- 积分与消费记录：统一显示通用积分，按请求记录 tokens、单次积分和状态
+- 积分与消费记录：统一显示通用积分，按请求记录 tokens、单次积分、状态、思考强度、上下文模式及工具调用
 - 网页控制台：账号与签到、消费记录、轮询与设置、模型连通性测试（可选端点、工具探针和思考强度）
 - 1M Max 上下文模式（可选）、自动刷新 Cloud-IDE-JWT、未知模型透传
 - Docker 一键部署，镜像只包含运行所需源码
@@ -60,14 +60,44 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 ## Docker 部署
 
+### 使用 GitHub 发布镜像（推荐）
+
+每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
+GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
+Run workflow** 手动执行，默认会构建 `v1.0.2`。部署机器不需要安装 Python、
+Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
+
+```bash
+cp .env.example .env
+docker pull ghcr.io/autumnsentiment/trae2api-cn:latest
+docker compose -f docker-compose.image.yml up -d
+```
+
+镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
+拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
+版本标签，例如 `:1.0.2`。更新已有部署时执行
+`docker compose -f docker-compose.image.yml pull`，再执行
+`docker compose -f docker-compose.image.yml up -d`。
+
+预构建镜像的 Compose 文件不依赖外部 `new-api` 网络。如果 new-api 也在 Docker
+中，可通过宿主地址访问 relay，或显式把两者加入同一网络。宿主端口由
+`RELAY_PORT` 控制；容器监听端口由 `.env` 的 `PORT` 控制，两者默认都是 `8000`。
+
+### 从源码构建（开发或离线场景）
+
+源码构建仍可用于开发和没有外网的部署环境：
+
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-容器默认监听 `8000` 端口，可通过 `RELAY_PORT` 环境变量修改。
-发布构建可设置 `RELAY_BUILD_REVISION=$(git rev-parse --short HEAD)`；该值会写入
-镜像 label，并由 `/v1/status` 返回，便于确认运行容器与源码版本一致。
+容器默认监听 `8000` 端口。`RELAY_PORT` 修改宿主机发布端口，不修改容器内
+监听端口；调整端口映射后需执行 `docker compose up -d --force-recreate`，
+仅重启旧容器不会改变映射。
+Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 label，并由
+`/v1/status` 返回，便于确认运行容器与源码版本一致。手动源码构建可设置
+`RELAY_BUILD_REVISION=$(git rev-parse --short HEAD)`。
 
 ## 网页授权（推荐：web-login 模式）
 
@@ -140,7 +170,7 @@ docker compose up -d --build
 | `TRAE_WEB_PARALLEL_LIMIT` | `2` | 每账号最大并行会话数 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
-| `TRAE_FETCH_MODEL_LIST` | `false` | `/v1/models` 是否从上游拉取真实模型列表 |
+| `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表实时取自当前账号的 Agent / Work / Design 模型，只返回小写模型名（带大写的 config 名统一转小写去重），外加 `auto`、`work`；上游拉取失败时回落内置列表 |
 | `SSE_HEARTBEAT_SECONDS` | `1` | Chat/Responses 上游空窗时发送标准 SSE 注释心跳；`0` 为关闭 |
 | `TRAE_USAGE_RECORDS_PATH` | `data/usage_records.json` | 消费记录独立持久化文件，不改写 `data/accounts.json` |
 | `TRAE_USAGE_SESSION_QUERY` | `true` | 有上游回合 ID 时异步查询精确积分；失败自动回退账号快照差值 |
@@ -152,7 +182,27 @@ docker compose up -d --build
 | `RELAY_API_KEYS` | 空 | API 密钥鉴权（逗号分隔多个）；公网部署必须设置并配合 TLS |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
-控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态和模型。积分优先级为：上游显式 usage、TraeWork 回合级 `credits_float`、同一账号请求前后的累计积分差值；无法安全归属时显示 `--`，不会把未知值伪装成 0。回合级查询使用上游 `reply_to_message_id/userMessageId`，不会把固定 raw 会话 UUID 当作计费键，也不会阻塞模型首帧。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
+控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态、模型、思考强度、上下文模式和 Tool 参数。工具定义与模型实际返回的工具调用分别记录，Max 请求值与上游应用值分别保存，没有上游证据时不标为已启用，历史记录缺失字段显示 `--`。积分优先级为：上游显式 usage、TraeWork 回合级 `credits_float`、同一账号请求前后的累计积分差值；无法安全归属时显示 `--`，不会把未知值伪装成 0。回合级查询使用上游 `reply_to_message_id/userMessageId`，不会把固定 raw 会话 UUID 当作计费键，也不会阻塞模型首帧。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
+
+### 账号模型请求开关
+
+「账号与签到」中每个账号都有独立的“模型请求”开关，旧账号默认开启，
+开关保存在 `data/accounts.json` 中。关闭后，该账号不会接收新模型请求或
+轮询重试；手动签到、每日定时签到、状态刷新与积分查询照常运行。
+已经输出中的请求不会被强制中断，绑定该账号的会话下一轮请求返回
+`503 model_account_unavailable`，可重新开启账号后继续。全部账号关闭时，
+Chat Completions / Responses 返回明确的 `503`，不会绕回当前管理账号。
+
+也可通过管理 API 设置：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/accounts/model-enabled \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id":"你的账号ID","enabled":false}'
+```
+
+端点模式与自定义 URL 同样持久化在账号存储中，启动后恢复控制台保存的选择，
+优先于容器环境默认值。Relay 服务端口单独保存，不会被端点切换顺带修改。
 
 ## 工具调用
 
@@ -190,6 +240,8 @@ docker compose up -d --build
 
 客户端收到 assistant 的 `tool_calls` 后，在自己的终端执行工具，再把原 assistant 消息和 `role: "tool"`、匹配的 `tool_call_id`（建议同时带 `name`）及执行结果一起发起下一轮请求。relay 本身不会执行请求中声明的外部工具，也不会自动拥有调用方文件系统；`client_context` 只是告诉模型真实环境，不能替代客户端工具实现。
 
+IDE Agent 使用原生工具协议：schema 放入上游 `tools`，`parameters` 按 SOLO 协议编码为 JSON 字符串；历史中的 `assistant.tool_calls`、调用 ID、`role: "tool"` 和 `tool_call_id` 保持关联。Remote / Work Agent 与 Raw 使用文本工具桥接，不代表上游原生支持 OpenAI `tools`。2026-10-03 的独立 IDE 实测中，`glm-5.3` 的流式和非流式两轮调用均完成 Windows 客户端本地读文件、结果回传及内容校验，实际 provider 为 `glm-5.3`，未启用回落。
+
 第二轮请求需带回完整历史，例如：
 
 ```json
@@ -224,7 +276,7 @@ docker compose up -d --build
 }
 ```
 
-路由规则：选中的端点总是第一个尝试。`raw` 失败时按 `IDE Agent -> Remote` 回落，`ide` / `work-agent` 失败时回落 `remote`；请求进入公开流之后不会再跨端点重放，避免重复消费。`TRAE_REMOTE_ONLY_MODELS` 可把指定模型强制送往 remote，`*` 表示全部。
+路由规则：选中的端点总是第一个尝试。`raw` 失败时按 `IDE Agent -> Remote` 回落，`ide` / `work-agent` 失败时回落 `remote`；空响应仅在允许重试且未观察到模型活动时可跨端点回落。已收到输出、provider、usage 或工具事件，或返回不可重试错误时，不重放模型请求，避免重复消费。公开流的初始空 delta / 心跳不是模型输出。`TRAE_REMOTE_ONLY_MODELS` 可把指定模型强制送往 remote，`*` 表示全部。
 
 自动路由：在「轮询与设置 → 自动路由」打开开关（或 `POST /api/auto-route {"enabled":true}`）后，每个请求按内容选端点：请求带 `tools` / `tool_choice` / `parallel_tool_calls`，或历史中有工具调用 / 工具结果时走 IDE Agent，否则走 Remote；IDE Agent 失败时按上面的规则回落 Remote。开关开启时预设端点的模式选择不再生效，关闭后恢复预设端点。本地 CLI / TraeWork native 模式不受影响。模型测试页可选「自动路由」单独验证，不需要打开全局开关。
 
@@ -234,7 +286,7 @@ raw 端点的 HTTP body 固定为 `config_name`、`conversation_id`、`messages`
 
 `remote` 模式复用了 9router Trae executor 的两步会话协议：先 `POST /chat_sessions` 创建回合，再 `GET /chat_sessions/{id}/events?reply_to_message_id=...` 读取 SSE。`plan_item.thought` 按累计快照计算增量，`token_usage`、`done` 和 `error` 会转换为现有 OpenAI Chat/Responses 输出。它只复用 9router 的转发逻辑，不切换到国际版；默认仍使用当前 CN remote 地址。
 
-`ide` 模式保留 trae2api 的 `/api/ide/v1/chat` 请求结构：稳定的 `session_id` / `conversation_id`、`chat_history`、`last_llm_response_info`、设备指纹和 Cloud-IDE-JWT 请求头。两种模式共用现有账号切换、token 快照、SSE 心跳、消费记录和 Responses 会话缓存。
+`ide` 模式调用 `/api/agent/v3/llm_utils_chat`，使用 `function=solo_work_lite`、`config_name`、结构化 `messages`、设备指纹和 Cloud-IDE-JWT 请求头，不再使用旧 `/api/ide/v1/chat` 的 `chat_history` 封装。IDE 与其他模式共用账号绑定、SSE 心跳、消费记录和 Responses 会话缓存。
 
 `work-agent` 模式固定使用 Remote 的 `solo_work_remote` 执行器，并设置 `_trae_mode=work`，避免 Work 请求被默认 provider（例如 Kimi/Agent）接管。它保留调用端 `tools` 定义和工具历史；若 Work Remote 创建或首事件失败，则按配置回退到 Remote 通用路径。
 
@@ -268,7 +320,7 @@ Max 只作用于 Remote 端点的 Agent 会话。带调用端工具的请求默�
 
 ## Codex Responses API
 
-Codex 使用 `POST /v1/responses`，不能只把 `wire_api` 改成 Responses 后继续返回 Chat Completions SSE。relay 会把 Responses 的 `input`、扁平 function、自定义工具和 namespace 工具转换到现有 raw/CLI 工具管线，再返回带类型的 Responses 事件。
+Codex 使用 `POST /v1/responses`，不能只把 `wire_api` 改成 Responses 后继续返回 Chat Completions SSE。relay 会把 Responses 的 `input`、扁平 function、自定义工具和 namespace 工具转换到统一工具管线，再按选定端点使用 IDE 原生协议或文本桥接，返回带类型的 Responses 事件。
 
 流式工具轮次会依次包含完整的 `response.output_item.done` 和 `response.completed`。Codex 收到当前响应完成后，才会在调用方终端执行工具，并用相同 `call_id` 加入 `function_call_output` 或 `custom_tool_call_output`，自动发起下一次 `/v1/responses` 请求。Responses 流不使用 Chat Completions 的 `data: [DONE]` 作为完成信号。
 
@@ -294,7 +346,7 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 
 - **概览**（默认首页）：总 tokens、输入 / 输出 / 缓存 tokens、今日用量、有效账号数；按日期堆叠柱状图（7 / 14 / 30 天）、服务状态（版本、运行时长、上游端点、自动路由、轮询、1M、自动签到、并发中请求）和按日期汇总表。数据来自 `GET /api/overview?days=N`，每日汇总持久化在 `data/usage_stats.json`，不受 100 条消费记录上限影响
 - **账号与签到**：上方是授权登录（网页授权、本机助手下载、手动填写凭证），中间是自动签到（启用开关、每日时间、立即执行，以及下次执行 / 上次执行 / 上次结果），下方是整宽账号列表（账号、用户 ID、状态、有效期、通用积分、签到状态，单账号签到 / 切换 / 删除，以及查询签到状态、查询全部积分、一键轮询签到）
-- **消费记录**：按请求显示模型、tokens、单次积分和状态
+- **消费记录**：按请求显示模型、tokens、单次积分、状态、思考强度、上下文模式，以及是否携带工具参数和本轮是否返回工具调用
 - **轮询与设置**：多账号轮询开关、顺序 / 积分优先模式、上游端点预设与自定义 URL、Relay 端口、1M 上下文（Max 模式）开关与生效模型（可一键检测账号支持 Max 的模型）
 - **模型测试**：批量测试模型连通性，可选文本 / 工具探针、思考强度、thinking 输出和 1M Max，并可指定端点（测试期间禁止跨端点回落）
 

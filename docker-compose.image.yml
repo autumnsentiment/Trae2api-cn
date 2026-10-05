@@ -1,0 +1,13 @@
+services:
+  trae-cn-relay:
+    image: ghcr.io/autumnsentiment/trae2api-cn:latest
+    container_name: trae-cn-relay
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+    ports:
+      - "${RELAY_PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - ./.env:/app/.env
+      - ./data:/app/data

@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from src import main as main_module
+from src.sse import (
+    EmptyUpstreamResponse,
+    InvalidNativeToolArguments,
+    RepeatedCompletedToolResponse,
+)
 
 
 TOOLS = [
@@ -279,6 +285,251 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         fallback_options = remote.await_args.args[3]
         self.assertEqual(fallback_options["tools"], TOOLS)
         self.assertEqual(fallback_options["_remote_agent_type"], "solo_agent_remote")
+
+    async def test_nonstream_model_event_error_does_not_replay_other_routes(self):
+        routes = {
+            "raw": "run_raw_chat",
+            "ide": "run_ide_chat",
+            "traework-native": "run_traework_native_chat",
+        }
+        for mode, route_name in routes.items():
+            for retryable, observed in ((False, True), (False, False), (True, True)):
+                with self.subTest(mode=mode, retryable=retryable, observed=observed):
+                    exc = InvalidNativeToolArguments(
+                        "invalid native tool arguments",
+                        retryable=retryable,
+                        observed_model_event=observed,
+                        usage={"prompt_tokens": 10, "completion_tokens": 3},
+                    )
+                    selected = AsyncMock(side_effect=exc)
+                    remote = AsyncMock(return_value={"route": "remote"})
+                    ide = AsyncMock(return_value={"route": "ide"})
+                    with (
+                        patch.object(main_module, "UPSTREAM_MODE", mode),
+                        patch.object(main_module, "_remote_only_models", return_value=set()),
+                        patch.object(main_module, "_raw_app_config_known_missing", return_value=False),
+                        patch.object(main_module, "run_ide_chat", ide),
+                        patch.object(main_module, route_name, selected),
+                        patch.object(main_module, "_run_remote_with_retry", remote),
+                        patch.object(main_module, "_track_usage_from_result") as usage,
+                    ):
+                        response = await main_module._dispatch_chat(
+                            [{"role": "user", "content": "Read README.md"}],
+                            "auto",
+                            False,
+                            _request_options(),
+                        )
+                    self.assertEqual(response.status_code, 502)
+                    self.assertIn("invalid native tool arguments", response.body.decode())
+                    selected.assert_awaited_once()
+                    remote.assert_not_awaited()
+                    if mode == "raw":
+                        ide.assert_not_awaited()
+                    usage.assert_called_once_with({"usage": exc.usage}, "auto")
+
+    async def test_retryable_truly_empty_nonstream_still_falls_back(self):
+        for mode, route_name in {
+            "raw": "run_raw_chat",
+            "ide": "run_ide_chat",
+            "traework-native": "run_traework_native_chat",
+        }.items():
+            with self.subTest(mode=mode):
+                exc = EmptyUpstreamResponse(
+                    "truly empty",
+                    retryable=True,
+                    observed_model_event=False,
+                    usage={"prompt_tokens": 10},
+                )
+                selected = AsyncMock(side_effect=exc)
+                fallback = AsyncMock(return_value={"route": "fallback"})
+                with (
+                    patch.object(main_module, "UPSTREAM_MODE", mode),
+                    patch.object(main_module, "_remote_only_models", return_value=set()),
+                    patch.object(main_module, "_raw_app_config_known_missing", return_value=False),
+                    patch.object(main_module, "run_ide_chat", fallback),
+                    patch.object(main_module, route_name, selected),
+                    patch.object(main_module, "_run_remote_with_retry", fallback),
+                    patch.object(main_module, "_track_usage_from_result") as usage,
+                ):
+                    response = await main_module._dispatch_chat(
+                        [{"role": "user", "content": "Read README.md"}],
+                        "auto",
+                        False,
+                        _request_options(),
+                    )
+                self.assertEqual(response, {"route": "fallback"})
+                selected.assert_awaited_once()
+                fallback.assert_awaited_once()
+                usage.assert_called_once_with({"usage": exc.usage}, "auto")
+
+    async def test_stream_model_event_error_does_not_fallback_or_double_count_usage(self):
+        for creation_error in (False, True):
+            for retryable, observed in ((False, True), (False, False), (True, True)):
+                with self.subTest(
+                    creation_error=creation_error, retryable=retryable, observed=observed
+                ):
+                    exc = InvalidNativeToolArguments(
+                        "invalid native tool arguments",
+                        retryable=retryable,
+                        observed_model_event=observed,
+                        usage={"prompt_tokens": 10, "completion_tokens": 3},
+                    )
+
+                    async def invalid_body():
+                        raise exc
+                        yield "unreachable"
+
+                    selected = AsyncMock(
+                        side_effect=exc if creation_error else None,
+                        return_value=main_module.StreamingResponse(invalid_body()),
+                    )
+                    remote = AsyncMock(return_value={"route": "remote"})
+                    with (
+                        patch.object(main_module, "UPSTREAM_MODE", "ide"),
+                        patch.object(main_module, "_remote_only_models", return_value=set()),
+                        patch.object(main_module, "run_ide_chat", selected),
+                        patch.object(main_module, "_run_remote_with_retry", remote),
+                        patch.object(main_module, "_track_usage_from_result") as usage,
+                    ):
+                        chunks = [
+                            chunk
+                            async for chunk in main_module._deferred_dispatch_stream(
+                                [{"role": "user", "content": "Read README.md"}],
+                                "auto",
+                                {**_request_options(), "_upstream_mode": "ide"},
+                            )
+                        ]
+                    self.assertIn("invalid native tool arguments", "".join(chunks))
+                    selected.assert_awaited_once()
+                    remote.assert_not_awaited()
+                    usage.assert_called_once_with({"usage": exc.usage}, "auto")
+
+    async def test_retryable_truly_empty_stream_still_falls_back(self):
+        exc = EmptyUpstreamResponse(
+            "truly empty",
+            retryable=True,
+            observed_model_event=False,
+            usage={"prompt_tokens": 10},
+        )
+
+        async def empty_body():
+            raise exc
+            yield "unreachable"
+
+        async def remote_body():
+            yield 'data: {"choices":[{"delta":{"content":"pong"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        selected = AsyncMock(return_value=main_module.StreamingResponse(empty_body()))
+        remote = AsyncMock(return_value=main_module.StreamingResponse(remote_body()))
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+            patch.object(main_module, "_track_usage_from_result") as usage,
+        ):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    [{"role": "user", "content": "Read README.md"}],
+                    "auto",
+                    {**_request_options(), "_upstream_mode": "ide"},
+                )
+            ]
+        self.assertIn('"content":"pong"', "".join(chunks))
+        selected.assert_awaited_once()
+        remote.assert_awaited_once()
+        usage.assert_called_once_with({"usage": exc.usage}, "auto")
+
+    async def test_transport_and_router_record_same_error_usage_only_once(self):
+        exc = InvalidNativeToolArguments(
+            "invalid native tool arguments",
+            retryable=False,
+            observed_model_event=True,
+            usage={"prompt_tokens": 10},
+        )
+
+        async def selected(*_args, **_kwargs):
+            main_module._track_usage_from_exception(exc, "auto")
+            raise exc
+
+        remote = AsyncMock()
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "raw"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "_raw_app_config_known_missing", return_value=False),
+            patch.object(main_module, "run_raw_chat", selected),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+            patch.object(main_module, "_track_usage_from_result") as usage,
+        ):
+            response = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "auto",
+                False,
+                _request_options(),
+            )
+        self.assertEqual(response.status_code, 502)
+        remote.assert_not_awaited()
+        usage.assert_called_once_with({"usage": exc.usage}, "auto")
+
+    async def test_actual_raw_repeated_completed_tool_error_never_replays_routes(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                exc = RepeatedCompletedToolResponse(
+                    "repeated completed tool",
+                    retryable=False,
+                    observed_model_event=True,
+                    usage={"prompt_tokens": 10, "completion_tokens": 3},
+                )
+                owned = SimpleNamespace(response=object(), close=Mock(), auth_token="")
+                send = AsyncMock(return_value=owned)
+                ide = AsyncMock(return_value={"route": "ide"})
+                remote = AsyncMock(return_value={"route": "remote"})
+
+                async def translate(*_args, **_kwargs):
+                    raise exc
+                    yield "unreachable"
+
+                with (
+                    patch.object(main_module, "UPSTREAM_MODE", "raw"),
+                    patch.object(main_module, "_remote_only_models", return_value=set()),
+                    patch.object(main_module, "_raw_app_config_known_missing", return_value=False),
+                    patch.object(main_module.raw_client, "send_raw_chat_request", send),
+                    patch.object(main_module, "translate_ide_stream", translate),
+                    patch.object(
+                        main_module, "collect_nonstream_ide", AsyncMock(side_effect=exc)
+                    ),
+                    patch.object(main_module, "_capture_chat_session_auth"),
+                    patch.object(main_module, "_bind_usage_turn_from_metadata"),
+                    patch.object(main_module, "run_ide_chat", ide),
+                    patch.object(main_module, "_run_remote_with_retry", remote),
+                    patch.object(main_module, "_track_usage_from_result") as usage,
+                ):
+                    if stream:
+                        chunks = [
+                            chunk
+                            async for chunk in main_module._deferred_dispatch_stream(
+                                [{"role": "user", "content": "Read README.md"}],
+                                "auto",
+                                {**_request_options(), "_upstream_mode": "raw"},
+                            )
+                        ]
+                        self.assertIn("repeated completed tool", "".join(chunks))
+                    else:
+                        response = await main_module._dispatch_chat(
+                            [{"role": "user", "content": "Read README.md"}],
+                            "auto",
+                            False,
+                            _request_options(),
+                        )
+                        self.assertEqual(response.status_code, 502)
+                        self.assertIn("repeated completed tool", response.body.decode())
+                send.assert_awaited_once()
+                owned.close.assert_called_once()
+                ide.assert_not_awaited()
+                remote.assert_not_awaited()
+                usage.assert_called_once_with({"usage": exc.usage}, "auto")
 
 
 if __name__ == "__main__":

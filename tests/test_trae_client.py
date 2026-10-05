@@ -988,15 +988,30 @@ class IdeRequestContextTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "web remote"):
             asyncio.run(trae_client.create_web_session(None, "auto", messages))
         body = trae_client.build_llm_chat_body(messages, "auto", False)
-        joined = "\n".join(
-            block["text"]
-            for message in body["messages"]
-            for block in message.get("content", [])
-            if isinstance(block, dict) and block.get("text")
+        assistant = next(
+            message for message in body["messages"] if message["role"] == "assistant"
         )
-        self.assertIn('"id":"call_1"', joined)
-        self.assertIn("Client tool history", joined)
-        self.assertIn("Client tool result [call_1] read_file", joined)
+        self.assertIsNone(assistant["content"])
+        self.assertEqual(
+            assistant["tool_calls"],
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function_call": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        )
+        tool_result = next(
+            message for message in body["messages"] if message["role"] == "tool"
+        )
+        self.assertEqual(tool_result["tool_call_id"], "call_1")
+        self.assertEqual(tool_result["name"], "read_file")
+        self.assertEqual(tool_result["content"], [{"type": "text", "text": "done"}])
+        prompt = body["messages"][0]["content"][0]["text"]
+        self.assertIn("same call id confirms success", prompt)
+        self.assertNotIn("opencode_tool_call", prompt)
+        self.assertNotIn("Client tool history", json.dumps(body))
 
     def test_model_gateway_does_not_reuse_oauth_host(self):
         with patch.dict("os.environ", {"TRAE_MODEL_API_HOST": ""}, clear=False):

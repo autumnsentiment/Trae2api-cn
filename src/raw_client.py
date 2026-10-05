@@ -818,7 +818,7 @@ def build_runtime_system_prompt(
     *,
     native_tools: bool = False,
 ) -> str:
-    """Describe the caller-owned tool runtime and schemas to the raw model."""
+    """Describe the caller-owned runtime using the selected tool protocol."""
 
     tool_defs = _normalized_tools(tools)
     context = dict(client_context)
@@ -839,12 +839,26 @@ def build_runtime_system_prompt(
         "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, patched, or saved unless a later matching client tool result with the same call id confirms success.",
         "A tool request, emitted tool-call block, plan, or assistant narration is not execution proof. If the matching client result reports failure, state the failure or request a corrective client tool; never report the operation as completed.",
         "Never repeat a completed tool call; do not describe that server's Linux filesystem as the caller workspace.",
-        "Client tools are NOT native/server functions: never invoke them through function calling or any built-in tool, and never fall back to server tools (LS, Glob, Read, terminal) to reach the caller's files. The only way to call a client tool is the text block below; a native call reports 'not available' because the tool lives on the client.",
-        "To use tools, emit only one or more JSON blocks and include no prose or final answer in that turn:",
-        '<opencode_tool_call>{"name":"tool_name","input":{}}</opencode_tool_call>',
-        'Do not invent an id field; the client assigns call ids. Keep file paths exactly as the user or tool result gave them.',
-        "Fill input according to the selected tool schema and wait for the client result before continuing.",
     ]
+    if native_tools:
+        lines.extend(
+            [
+                "Use native function calling for the client tools supplied in the request. Their definitions and input schemas are in the tools field.",
+                "Return structured tool calls, not tool-call markup or JSON tool blocks in the response text. Use an exact declared function name and arguments matching its schema.",
+                "The external API client executes these calls. Wait for the matching tool result before continuing; never substitute server-side tools to access the caller's workspace.",
+                "Keep file paths exactly as the user or tool result gave them.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Client tools are NOT native/server functions: never invoke them through function calling or any built-in tool, and never fall back to server tools (LS, Glob, Read, terminal) to reach the caller's files. The only way to call a client tool is the text block below; a native call reports 'not available' because the tool lives on the client.",
+                "To use tools, emit only one or more JSON blocks and include no prose or final answer in that turn:",
+                '<opencode_tool_call>{"name":"tool_name","input":{}}</opencode_tool_call>',
+                "Do not invent an id field; the client assigns call ids. Keep file paths exactly as the user or tool result gave them.",
+                "Fill input according to the selected tool schema and wait for the client result before continuing.",
+            ]
+        )
     if tool_defs and not native_tools:
         tool_payload, compacted, omitted_signatures = _tool_definitions_prompt(
             tool_defs

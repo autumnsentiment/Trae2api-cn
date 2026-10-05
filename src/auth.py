@@ -786,6 +786,32 @@ def _record_model_valid(record: dict) -> bool:
     return _looks_like_cloudide_token(record.get('token') or '')
 
 
+def _record_model_enabled(record: dict) -> bool:
+    """Return whether an account may receive new model-gateway requests.
+
+    ``model_enabled`` is intentionally separate from daily check-in state.
+    Older account stores do not contain the field and remain enabled for
+    backwards compatibility.  A legacy alias is accepted when operators
+    have already written it by hand, but the nested ``checkin.enable`` value
+    is never consulted here.
+    """
+    if not isinstance(record, dict):
+        return True
+    value = record.get('model_enabled')
+    if value is None:
+        value = record.get('model_request_enabled')
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in {'0', 'false', 'no', 'off'}
+    return bool(value)
+
+
+def _record_model_eligible(record: dict) -> bool:
+    """Return whether an account is valid and enabled for model requests."""
+    return _record_model_valid(record) and _record_model_enabled(record)
+
+
 def _save_accounts() -> None:
     try:
         ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -916,6 +942,51 @@ def get_active_account_snapshot() -> tuple[str, dict]:
     with _STORE_LOCK:
         account_id = _active_account
         return account_id, dict(_accounts.get(account_id) or {})
+
+
+def get_model_account_snapshot() -> tuple[str, dict]:
+    """Return one enabled, model-valid account for a new model request.
+
+    The UI may keep a disabled account selected for check-in management.  New
+    model requests must not silently use that credential, so select the first
+    enabled account when the selected account is disabled.  Returning an
+    empty snapshot when every stored account is disabled lets the caller
+    surface a useful error instead of accidentally falling back to the
+    process-global token.
+    """
+    with _STORE_LOCK:
+        if (
+            _active_account
+            and _active_account in _accounts
+            and _record_model_eligible(_accounts[_active_account])
+        ):
+            return _active_account, dict(_accounts[_active_account])
+        for aid, rec in _accounts.items():
+            if _record_model_eligible(rec):
+                return aid, dict(rec)
+        return "", {}
+
+
+def is_account_model_enabled(account_id: str) -> bool:
+    """Read the routing flag without retrieving or replacing credentials."""
+    with _STORE_LOCK:
+        return _record_model_enabled(_accounts.get(str(account_id or "")) or {})
+
+
+def set_account_model_enabled(account_id: str, enabled: bool) -> bool:
+    """Enable or disable one account for model requests only.
+
+    Check-in data, tokens, active selection, and daily scheduling state are
+    deliberately untouched.  The enabled flag is persisted independently so
+    disabling an account never prevents its check-in endpoints from running.
+    """
+    with _STORE_LOCK:
+        rec = _accounts.get(str(account_id or ""))
+        if rec is None:
+            return False
+        rec["model_enabled"] = bool(enabled)
+        _save_accounts()
+        return True
 
 
 def set_account_checkin(account_id: str, data: dict) -> None:
@@ -1059,6 +1130,8 @@ def list_accounts() -> list[dict]:
                 'has_token': bool(rec.get('token')),
                 'is_active': aid == _active_account,
                 'is_valid': _record_valid(rec),
+                'model_enabled': _record_model_enabled(rec),
+                'model_eligible': _record_model_eligible(rec),
                 'expires': rec.get('expired_at', ''),
                 'credits': checkin.get('credits'),
                 'checked_in': checkin.get('checked_in'),
@@ -1109,6 +1182,8 @@ def add_account(creds: dict, label: str = '') -> str:
         'provider_specific': psd,
     }
     with _STORE_LOCK:
+        previous = _accounts.get(aid) or {}
+        record['model_enabled'] = _record_model_enabled(previous)
         _accounts[aid] = record
         _active_account = aid
         _switch_record(record)
@@ -1127,7 +1202,7 @@ def remove_account(account_id: str) -> bool:
         if _active_account == account_id:
             _active_account = ''
             for aid, rec in _accounts.items():
-                if _record_valid(rec):
+                if _record_model_eligible(rec):
                     next_id = aid
                     break
             if next_id:
@@ -1172,7 +1247,7 @@ def logout_active() -> bool:
         _active_account = ''
         next_id = ''
         for account_id, rec in _accounts.items():
-            if _record_valid(rec):
+            if _record_model_eligible(rec):
                 next_id = account_id
                 break
         if next_id:
@@ -1208,7 +1283,10 @@ def next_polling_account() -> None:
     if not _poll_enabled:
         return
     with _STORE_LOCK:
-        ids = [aid for aid, rec in _accounts.items() if _record_valid(rec)]
+        ids = [
+            aid for aid, rec in _accounts.items()
+            if _record_model_eligible(rec)
+        ]
         if not ids:
             return
 
@@ -1257,35 +1335,19 @@ def set_relay_settings(web_base_url: str = '', port: int = 0, upstream_mode: str
             _settings['relay_port'] = port
         _save_accounts()
 
-    try:
-        lines = ENV_PATH.read_text('utf-8').splitlines() if ENV_PATH.exists() else []
-        out = []
-        seen = set()
-        for line in lines:
-            stripped = line.strip()
-            key = ''
-            if stripped and not stripped.startswith('#') and '=' in stripped:
-                key = stripped.split('=', 1)[0].strip()
-            if key in ('TRAE_WEB_BASE_URL', 'RELAY_PORT', 'UPSTREAM_MODE'):
-                if key not in seen:
-                    seen.add(key)
-                    if key == 'TRAE_WEB_BASE_URL' and web_base_url:
-                        out.append(f'TRAE_WEB_BASE_URL={web_base_url}')
-                    elif key == 'UPSTREAM_MODE' and upstream_mode:
-                        out.append(f'UPSTREAM_MODE={upstream_mode}')
-                    elif key == 'RELAY_PORT' and port and port > 0:
-                        out.append(f'RELAY_PORT={port}')
-            else:
-                out.append(line)
-        if 'TRAE_WEB_BASE_URL' not in seen and web_base_url:
-            out.append(f'TRAE_WEB_BASE_URL={web_base_url}')
-        if 'UPSTREAM_MODE' not in seen and upstream_mode:
-            out.append(f'UPSTREAM_MODE={upstream_mode}')
-        if 'RELAY_PORT' not in seen and port and port > 0:
-            out.append(f'RELAY_PORT={port}')
-        ENV_PATH.write_text('\n'.join(out) + '\n', 'utf-8')
-    except Exception as e:
-        logger.warning('auth: could not save relay settings: %s', e)
+    # Only rewrite keys explicitly changed by this call.  The previous
+    # hand-rolled writer dropped unrelated relay keys whenever the UI
+    # submitted an empty mode or port, making the next restart fall back to a
+    # different endpoint.
+    values = {}
+    if web_base_url:
+        values['TRAE_WEB_BASE_URL'] = web_base_url
+    if upstream_mode:
+        values['UPSTREAM_MODE'] = upstream_mode
+    if port and port > 0:
+        values['RELAY_PORT'] = port
+    if values:
+        _write_env_values(values)
 
 
 _MAX_MODE_ENV = 'TRAE_REMOTE_MAX_MODE'

@@ -1124,10 +1124,13 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
     if not isinstance(raw, dict):
         return None
     function = raw.get("function") if isinstance(raw.get("function"), dict) else None
+    native_function = False
     if function is None and isinstance(raw.get("function_call"), dict):
         function = raw["function_call"]
+        native_function = True
     if function is None and isinstance(raw.get("functionCall"), dict):
         function = raw["functionCall"]
+        native_function = True
     if function is None:
         function = raw
     inherited_synthetic_id = raw.get("_synthetic_id") is True
@@ -1171,7 +1174,9 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
             break
     # A tool-call record may put the actual fields at the top level. Remove
     # protocol metadata before treating that record as arguments.
-    if arguments is missing:
+    if arguments is missing and native_function:
+        arguments = ""
+    elif arguments is missing:
         arguments = {
             key: value
             for key, value in raw.items()
@@ -1192,6 +1197,13 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         "_explicit_index": raw.get("_explicit_index") is True
         or isinstance(raw.get("index"), int),
     }
+    arguments_mode = raw.get("_arguments_mode")
+    if arguments_mode in {"delta", "snapshot"}:
+        result["_arguments_mode"] = arguments_mode
+    elif native_function and isinstance(arguments, str):
+        # SOLO function_call arguments are true fragments, unlike the
+        # OpenAI/CLI cumulative function snapshots handled by the same relay.
+        result["_arguments_mode"] = "delta"
     if isinstance(raw.get("index"), int):
         result["index"] = raw["index"]
     return result

@@ -30,6 +30,7 @@ import re
 import threading
 import time
 import secrets
+import sys
 import uuid as uuid_mod
 import zlib
 from collections import OrderedDict
@@ -47,6 +48,7 @@ import dotenv
 # the same configuration order.
 dotenv.load_dotenv()
 
+import anyio
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -95,6 +97,28 @@ def _current_upstream_mode() -> str:
     # env defaults, and runtime preset changes update both env and the module
     # value.  Tests can patch ``src.main.UPSTREAM_MODE`` to isolate scenarios.
     return str(globals().get("UPSTREAM_MODE") or "remote").lower()
+
+
+def _restore_persisted_relay_settings() -> dict:
+    """Apply console settings that live in the account store after startup.
+
+    The container environment is a useful bootstrap/default, but the web
+    console also persists relay settings in ``data/accounts.json``.  Restore
+    those values after ``auth.init_auth()`` so a container recreation does not
+    silently switch the selected upstream back to the image's ``.env``.
+    """
+
+    global UPSTREAM_MODE, WEB_BASE
+    settings = auth.get_settings() or {}
+    mode = str(settings.get("upstream_mode") or "").strip().lower()
+    if mode in _VALID_UPSTREAM_MODES:
+        UPSTREAM_MODE = mode
+        os.environ["UPSTREAM_MODE"] = mode
+    web_base = str(settings.get("web_base_url") or "").strip().rstrip("/")
+    if web_base:
+        WEB_BASE = web_base
+        os.environ["TRAE_WEB_BASE_URL"] = web_base
+    return settings
 
 FORWARD_USAGE = (os.environ.get("FORWARD_USAGE", "true") or "true").lower() == "true"
 CHECKIN_INTERVAL = float(os.environ.get("TRAE_CHECKIN_INTERVAL_SECONDS", "60") or "60")
@@ -319,6 +343,26 @@ class _UpstreamSessionLease:
 
 
 _UPSTREAM_SESSION_LEASES: OrderedDict[str, _UpstreamSessionLease] = OrderedDict()
+
+
+class _ModelAccountUnavailable(RuntimeError):
+    """No enabled credential can receive this model request."""
+
+
+def _ensure_model_account_enabled(account_id: str = "", token: str = "") -> None:
+    identities = {str(account_id or ""), _account_id_from_token(token)} - {""}
+    for identity in identities:
+        if not auth.is_account_model_enabled(identity):
+            raise _ModelAccountUnavailable(
+                "The bound model account is disabled; enable it in 账号与签到 "
+                "or start a new session with an enabled account"
+            )
+    if not identities:
+        accounts = auth.get_accounts_raw()
+        if accounts and all(not auth._record_model_enabled(rec) for _, rec in accounts):
+            raise _ModelAccountUnavailable(
+                "No enabled model account available; enable an account in 账号与签到"
+            )
 
 
 def _credit_settle_seconds() -> float:
@@ -724,7 +768,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -1070,7 +1114,7 @@ a { color: var(--accent); }
 /* Tables */
 .table-wrap { overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
 .acct-table, .usage-table, .conn-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.acct-table { min-width: 760px; }
+.acct-table { min-width: 860px; }
 .acct-table th, .acct-table td, .usage-table th, .usage-table td, .conn-table th, .conn-table td {
   text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: middle;
 }
@@ -1095,16 +1139,30 @@ a { color: var(--accent); }
 .actions-col { width: 120px; }
 .row-actions { white-space: nowrap; }
 .row-actions .icon-btn + .icon-btn { margin-left: 4px; }
+.model-toggle-cell { min-width: 105px; white-space: nowrap; }
+.model-toggle-state { display: inline-flex; vertical-align: middle; margin-right: 8px; }
+.account-model-switch { vertical-align: middle; }
+.switch input:disabled { cursor: wait; }
+.switch input:disabled + .track { opacity: .6; }
 .empty-state { padding: 28px 12px; text-align: center; color: var(--faint); font-size: 13px; border: 1px dashed var(--frame); border-radius: var(--radius); }
 .usage-records-container { max-height: calc(100vh - 220px); min-height: 160px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
-.usage-table { min-width: 720px; table-layout: fixed; }
+.usage-table { min-width: 1120px; table-layout: fixed; }
 .usage-table th:nth-child(1) { width: 170px; }
 .usage-table th:nth-child(2) { width: 130px; }
-.usage-table th:nth-child(4) { width: 190px; }
-.usage-table th:nth-child(5) { width: 100px; }
-.usage-table th:nth-child(6) { width: 90px; }
+.usage-table th:nth-child(3) { width: 150px; }
+.usage-table th:nth-child(4) { width: 105px; }
+.usage-table th:nth-child(5) { width: 105px; }
+.usage-table th:nth-child(6) { width: 145px; }
+.usage-table th:nth-child(7) { width: 190px; }
+.usage-table th:nth-child(8) { width: 100px; }
+.usage-table th:nth-child(9) { width: 90px; }
 .usage-table td { overflow-wrap: anywhere; }
 .usage-table .usage-status { white-space: nowrap; }
+.usage-table .usage-meta { white-space: nowrap; }
+.usage-table .usage-tool { white-space: normal; }
+.usage-table .usage-meta.unknown { color: var(--faint); }
+.usage-table .usage-meta .usage-arrow { color: var(--faint); padding: 0 3px; }
+.usage-table .usage-meta .usage-sub { color: var(--muted); font-size: 11px; }
 .usage-empty { padding: 28px 12px; color: var(--faint); text-align: center; font-size: 13px; }
 .conn-wrap { margin-top: 14px; overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
 .conn-table { min-width: 640px; font-size: 12px; }
@@ -1339,6 +1397,9 @@ def _web_login_html() -> str:
             <th>时间</th>
             <th>账号</th>
             <th>模型</th>
+            <th>思考强度</th>
+            <th>上下文模式</th>
+            <th>Tool 参数</th>
             <th class="numeric">Tokens（入 / 出 / 总）</th>
             <th class="numeric">消耗积分</th>
             <th>状态</th>
@@ -1372,6 +1433,14 @@ def _web_login_html() -> str:
         active_row = "active-row" if acc.get("is_active") else ""
         switch_disabled = " disabled" if acc.get("is_active") else ""
         aid = html_mod.escape(acc.get("id") or "")
+        model_enabled = bool(acc.get("model_enabled", True))
+        model_checked = " checked" if model_enabled else ""
+        model_badge = (
+            '<span class="badge badge-ok" id="model-state-%s">已开启</span>'
+            % aid
+            if model_enabled
+            else '<span class="badge badge-none" id="model-state-%s">已关闭</span>' % aid
+        )
         label = html_mod.escape(acc.get("label") or acc.get("user_id") or acc.get("id") or "")
         uid = html_mod.escape(acc.get("user_id") or acc.get("id") or "")
         expires = html_mod.escape((acc.get("expires") or "")[:16])
@@ -1395,12 +1464,13 @@ def _web_login_html() -> str:
         else:
             checkin_badge = '<span class="badge badge-none">未知</span>'
         valid_flag = "1" if acc.get("is_valid") else "0"
-        rows += f"""<tr id="row-{aid}" class="{active_row}" data-account-id="{aid}" data-valid="{valid_flag}">
+        rows += f"""<tr id="row-{aid}" class="{active_row}" data-account-id="{aid}" data-valid="{valid_flag}" data-model-enabled="{'1' if model_enabled else '0'}">
           <td><div class="acct-cell"><strong id="label-{aid}">{label}</strong><small class="row-subtitle mono">{uid}</small></div></td>
           <td class="status-cell">{st}{act}</td>
           <td class="muted-cell">{expires}</td>
           <td class="numeric"><span id="general-credits-{aid}" class="credit-value">{credits_text}</span></td>
           <td><span id="checkin-{aid}" class="checkin-state">{checkin_badge}</span><small id="checkin-detail-{aid}" class="row-subtitle"></small></td>
+          <td class="model-toggle-cell"><div id="model-state-wrap-{aid}" class="model-toggle-state">{model_badge}</div><label class="switch account-model-switch" title="仅控制模型请求，不影响签到"><input type="checkbox" data-action="model-toggle" onchange="toggleAccountModel('{aid}', this)" aria-label="启用账号模型请求"{model_checked}><span class="track"></span></label></td>
           <td class="row-actions">
             <button class="icon-btn" data-action="checkin" onclick="checkinAccount('{aid}')" title="签到" aria-label="签到">{ic['calendar-check']}</button>
             <button class="icon-btn" data-action="switch-account" onclick="switchAccount('{aid}')" title="切换为当前账号" aria-label="切换为当前账号"{switch_disabled}>{ic['arrow-left-right']}</button>
@@ -1410,7 +1480,7 @@ def _web_login_html() -> str:
     if accounts:
         accounts_html = f"""<div class="table-wrap">
           <table class="acct-table">
-            <thead><tr><th>账号</th><th>状态</th><th>有效期</th><th class="numeric">通用积分</th><th>签到状态</th><th class="actions-col">操作</th></tr></thead>
+            <thead><tr><th>账号</th><th>状态</th><th>有效期</th><th class="numeric">通用积分</th><th>签到状态</th><th>模型请求</th><th class="actions-col">操作</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </div>"""
@@ -1431,16 +1501,32 @@ def _web_login_html() -> str:
     if state.token:
         logout_btn = f'<button class="icon-btn" onclick="logout()" title="登出" aria-label="登出">{ic["log-out"]}</button>'
 
-    settings_web = settings.get("web_base_url") or WEB_BASE
-    settings_port = settings.get("relay_port") or PORT
+    settings_web = (settings.get("web_base_url") or WEB_BASE).rstrip("/")
+    settings_port = settings.get("relay_port") or os.environ.get("RELAY_PORT") or PORT
+    # Remote/Work Agent and IDE Raw/IDE Agent intentionally share upstream
+    # base URLs.  Select by mode as well as URL; URL-only matching silently
+    # turns IDE Agent into the first matching IDE Raw option after a reload.
+    selected_mode = str(
+        settings.get("upstream_mode") or _current_upstream_mode() or ""
+    ).strip().lower()
+    selected_mode = {
+        "direct": "raw",
+        "auto": "raw",
+        "9router": "remote",
+        "trae-remote": "remote",
+        "web": "remote",
+    }.get(selected_mode, selected_mode)
+    url_matches = [
+        item
+        for item in UPSTREAM_ENDPOINT_PRESETS
+        if settings_web == str(item["base_url"]).rstrip("/")
+    ]
     matched_endpoint = next(
-        (
-            item
-            for item in UPSTREAM_ENDPOINT_PRESETS
-            if settings_web == item["base_url"]
-        ),
+        (item for item in url_matches if item["mode"] == selected_mode),
         None,
     )
+    if matched_endpoint is None and len(url_matches) == 1:
+        matched_endpoint = url_matches[0]
     # Custom URLs that aren't in the preset list still appear as saved options.
     custom_is_saved = bool(settings.get("web_base_url")) and not matched_endpoint
     custom_selected = " selected" if not matched_endpoint else ""
@@ -1741,14 +1827,22 @@ def _web_login_html() -> str:
       <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1">
     </div>
   </div>
-  <div class="form-group">
-    <label for="settings-port">Relay 端口（需重启容器生效）</label>
-    <input id="settings-port" type="number" value="{settings_port}" placeholder="8000">
-  </div>
   <div class="btn-group">
     <button class="btn btn-primary btn-sm" onclick="saveSettings()">{ic['save']}保存设置</button>
   </div>
   <div id="settings-msg" class="msg"></div>
+</div>
+<div class="panel-card" id="relay-service-panel">
+  <div class="section-head"><div class="section-title">Relay 服务</div></div>
+  <div class="form-group">
+    <label for="settings-port">宿主机映射端口（RELAY_PORT）</label>
+    <input id="settings-port" type="number" value="{settings_port}" placeholder="8000" min="1" max="65535">
+  </div>
+  <p class="field-note">这是 Docker 对外发布的宿主机端口，容器内监听端口仍由 PORT 控制。修改后必须同步调整端口映射并重启，否则管理页面和 API 可能无法访问。</p>
+  <div class="btn-group">
+    <button class="btn btn-secondary btn-sm" onclick="saveRelayServiceSettings()">{ic['save']}保存服务设置</button>
+  </div>
+  <div id="relay-service-msg" class="msg"></div>
 </div>
 <div class="panel-card" id="auto-route-panel">
   <div class="section-head">
@@ -1847,7 +1941,7 @@ def _web_login_html() -> str:
     <div class="section-title">模型列表</div>
     <button class="btn btn-secondary btn-sm" onclick="refreshModels()">{ic['list']}获取模型列表</button>
   </div>
-  <p class="section-desc">刷新 /v1/models；TRAE_FETCH_MODEL_LIST=true 时从上游拉取，否则返回内置列表。</p>
+  <p class="section-desc">从当前账号的上游模型列表实时获取，只列小写模型名，大小写重复项已合并。</p>
   <pre id="models-out" class="code-out"></pre>
   <div id="models-msg" class="msg"></div>
 </div>
@@ -1998,6 +2092,100 @@ function usageRecordsFromPayload(payload){{
   if(payload.data && typeof payload.data==='object' && Array.isArray(payload.data.records)) return payload.data.records;
   return null;
 }}
+function usageRecordField(record, keys){{
+  if(!record || typeof record!=='object') return null;
+  for(var i=0;i<keys.length;i++){{
+    var value=record[keys[i]];
+    if(value!==undefined && value!==null && value!=='') return value;
+  }}
+  return null;
+}}
+function usageBoolean(value){{
+  if(value===true || value===1) return true;
+  if(value===false || value===0) return false;
+  if(typeof value==='string'){{
+    var text=value.trim().toLowerCase();
+    if(['true','1','yes','on','enabled','是','有'].indexOf(text)>=0) return true;
+    if(['false','0','no','off','disabled','否','无'].indexOf(text)>=0) return false;
+  }}
+  return null;
+}}
+function usageEffortLabel(value){{
+  if(value===undefined || value===null || value==='') return '';
+  var text=String(value).trim().toLowerCase().replace(/[\s-]+/g,'_');
+  if(text==='none' || text==='minimal' || text==='min') return '最低';
+  if(text==='low' || text==='light') return '低';
+  if(text==='medium' || text==='mid' || text==='normal' || text==='default') return '中';
+  if(text==='high') return '高';
+  if(text==='xhigh' || text==='extra_high' || text==='very_high' || text==='max' || text==='maximum') return '极高';
+  return escapeHtml(String(value));
+}}
+function usageReasoningMeta(record){{
+  var requested=usageRecordField(record,[
+    'requested_reasoning_effort','reasoning_effort_requested','thinking_effort',
+    'thinking_level','reasoning_effort'
+  ]);
+  var thinking=record && record.thinking;
+  if(requested===null && thinking && typeof thinking==='object'){{
+    requested=thinking.effort || thinking.level || thinking.budget_tokens || thinking.budgetTokens || null;
+  }}
+  var applied=usageRecordField(record,[
+    'reasoning_effort_applied','applied_reasoning_effort','native_reasoning_effort'
+  ]);
+  var requestedLabel=usageEffortLabel(requested);
+  var appliedLabel=usageEffortLabel(applied);
+  if(requestedLabel && appliedLabel && requestedLabel!==appliedLabel){{
+    return {{
+      text: requestedLabel+'<span class="usage-arrow">→</span>'+appliedLabel,
+      title: '请求: '+String(requested)+'；生效: '+String(applied),
+      unknown: false
+    }};
+  }}
+  var label=appliedLabel || requestedLabel;
+  return {{
+    text: label || '--',
+    title: label ? '思考强度: '+String(applied || requested) : '未记录思考强度',
+    unknown: !label
+  }};
+}}
+function usageContextMeta(record){{
+  var requested=usageRecordField(record,['context_mode_requested','requested_context_mode']);
+  var value=usageRecordField(record,['context_mode_actual','actual_context_mode','context_mode','contextMode','context_window_mode']);
+  var raw=value;
+  var boolMax=usageBoolean(usageRecordField(record,['max_mode_applied','max_mode']));
+  var size=Number(usageRecordField(record,['context_window_tokens','max_context_tokens','prompt_max_tokens']) || 0);
+  if(value===null && boolMax===true) value='max';
+  if(value===null && size>=1000000) value='1m';
+  if(value===null && boolMax===false) value='standard';
+  if(value===null) return {{text:'--',title:'未记录上下文模式'+(requested!==null?'；请求: '+String(requested):''),unknown:true}};
+  var text=String(value).trim().toLowerCase().replace(/[\s_-]+/g,'');
+  var label;
+  if(['max','max1m','1m','1000000','agent','agentmax','maxmode'].indexOf(text)>=0 || size>=1000000) label='1M Max';
+  else if(['standard','default','work','dev','200k','200000','normal'].indexOf(text)>=0) label='标准';
+  else label=String(raw===null?value:raw);
+  var requestedText='';
+  if(requested!==null && String(requested)!==String(value)){{
+    requestedText='请求: '+String(requested)+'；';
+  }}
+  return {{text:label,title:requestedText+'实际上下文模式: '+String(value)+(size?'；窗口: '+size.toLocaleString()+' tokens':''),unknown:false}};
+}}
+function usageToolMeta(record){{
+  var requested=usageBoolean(usageRecordField(record,['tools_requested','tool_protocol_requested']));
+  var used=usageBoolean(usageRecordField(record,['tool_used','tool_calls_returned','tool_call_returned']));
+  if(requested===null && used===true) requested=true;
+  if(requested===null && record && Array.isArray(record.tools)) requested=record.tools.length>0;
+  if(requested===null && record && record.tools!==undefined) requested=!!record.tools;
+  if(requested===null && record && record.tool_choice!==undefined && record.tool_choice!=='none') requested=true;
+  var state=requested;
+  if(state===null) return {{text:'--',title:'未记录是否携带 tools 参数',unknown:true}};
+  var title=state?'请求携带 tools 参数':'请求未携带 tools 参数';
+  if(used===true) title+='；模型返回了工具调用';
+  else if(used===false) title+='；模型未返回工具调用';
+  var text=state?'已携带':'未携带';
+  if(state && used===true) text+=' / 本轮调用';
+  else if(state && used===false) text+=' / 未调用';
+  return {{text:text,title:title,unknown:false}};
+}}
 async function refreshUsage() {{
   if(usageRefreshing) return;
   usageRefreshing=true;
@@ -2020,6 +2208,9 @@ async function refreshUsage() {{
         var when=stamp?new Date(stamp*1000).toLocaleString():'--';
         var account=record.account_id?String(record.account_id).slice(-12):'--';
         var model=record.model||'--';
+         var reasoning=usageReasoningMeta(record);
+         var context=usageContextMeta(record);
+         var tool=usageToolMeta(record);
         var input=Number(record.input_tokens!==undefined?record.input_tokens:(record.prompt_tokens||0));
         var output=Number(record.output_tokens!==undefined?record.output_tokens:(record.completion_tokens||0));
         var total=Number(record.total_tokens!==undefined?record.total_tokens:(input+output));
@@ -2034,6 +2225,9 @@ async function refreshUsage() {{
           + '<td>'+escapeHtml(when)+'</td>'
           + '<td><code>'+escapeHtml(account)+'</code></td>'
           + '<td>'+escapeHtml(model)+'</td>'
+          + '<td class="usage-meta'+(reasoning.unknown?' unknown':'')+'" title="'+escapeHtml(reasoning.title)+'">'+reasoning.text+'</td>'
+          + '<td class="usage-meta'+(context.unknown?' unknown':'')+'" title="'+escapeHtml(context.title)+'">'+escapeHtml(context.text)+'</td>'
+          + '<td class="usage-meta usage-tool'+(tool.unknown?' unknown':'')+'" title="'+escapeHtml(tool.title)+'">'+escapeHtml(tool.text)+'</td>'
           + '<td class="numeric">'+escapeHtml(tokenText)+'</td>'
           + '<td class="numeric" title="'+escapeHtml(source)+'">'+escapeHtml(creditText)+'</td>'
           + '<td class="usage-status"><span class="badge '+badge+'">'+escapeHtml(statusText)+'</span></td>'
@@ -2605,6 +2799,29 @@ async function switchAccount(id){{
     showMsg('account-msg','已切换到账号 '+String((d.account&&(d.account.label||d.account.user_id))||id),true,3000);
   }}finally{{ setSwitchBusy(false); }}
 }}
+async function toggleAccountModel(id,input){{
+  if(!input) return;
+  var wanted=!!input.checked;
+  input.disabled=true;
+  try{{
+    var d=await postJSON('/api/accounts/model-enabled',{{account_id:id,enabled:wanted}},30000);
+    if(!d.success){{
+      input.checked=!wanted;
+      showMsg('account-msg',d.error||'模型请求开关保存失败',false);
+      return;
+    }}
+    var enabled=!!d.model_enabled;
+    input.checked=enabled;
+    var row=document.getElementById('row-'+id);
+    if(row) row.setAttribute('data-model-enabled',enabled?'1':'0');
+    var state=document.getElementById('model-state-'+id);
+    if(state){{
+      state.textContent=enabled?'已开启':'已关闭';
+      state.className='badge '+(enabled?'badge-ok':'badge-none');
+    }}
+    showMsg('account-msg',enabled?'账号模型请求已开启':'账号模型请求已关闭，每日签到不受影响',true,3000);
+  }}finally{{ input.disabled=false; }}
+}}
 async function removeAccount(id){{
   if(!confirm('确定删除该账号？')) return;
   var d=await postJSON('/api/accounts/remove',{{account_id:id}});
@@ -2620,11 +2837,23 @@ async function togglePolling(){{
 }}
 async function saveSettings(){{
   var web=document.getElementById('settings-web').value.trim();
-  var port=document.getElementById('settings-port').value.trim();
   var mode=(typeof ENDPOINT_PRESET_MAP !== 'undefined' && ENDPOINT_PRESET_MAP[document.getElementById('settings-endpoint-preset')?.value || '']) ? ENDPOINT_PRESET_MAP[document.getElementById('settings-endpoint-preset').value].mode : '';
-  var d=await postJSON('/api/settings',{{web_base_url:web,relay_port:port,upstream_mode:mode}});
+  var d=await postJSON('/api/settings',{{web_base_url:web,upstream_mode:mode}});
   if(d.success){{ showMsg('settings-msg',d.note||'设置已保存',true); setTimeout(function(){{ location.reload(); }},800); }}
   else showMsg('settings-msg',d.error||'保存失败',false);
+}}
+async function saveRelayServiceSettings(){{
+  var input=document.getElementById('settings-port');
+  var port=(input&&input.value||'').trim();
+  var value=Number(port);
+  if(!/^\\d+$/.test(port)||value<1||value>65535){{
+    showMsg('relay-service-msg','请输入 1-65535 的端口号',false);
+    return;
+  }}
+  var d=await postJSON('/api/settings',{{relay_port:value}});
+  if(d.success){{
+    showMsg('relay-service-msg',d.note||'服务设置已保存，重启容器后生效',true,6000);
+  }}else showMsg('relay-service-msg',d.error||'保存失败',false);
 }}
 async function saveAutoRoute(){{
   var toggle=document.getElementById('auto-route-toggle');
@@ -3006,9 +3235,7 @@ async def _deferred_dispatch_stream(
     )
     fallback_attempted = False
     task = asyncio.create_task(_dispatch_chat(messages, model, True, options))
-    # Give the task one event-loop turn to enter the selected upstream path
-    # (and, for raw/remote transports, begin opening the provider request).
-    await asyncio.sleep(0)
+    dispatch_claimed = False
     response = None
     iterator = None
     request_id = str((options or {}).get("_relay_request_id") or "")
@@ -3023,6 +3250,8 @@ async def _deferred_dispatch_stream(
         """Close the currently selected response/iterator before a retry."""
 
         nonlocal iterator, response
+        if iterator is None:
+            iterator = getattr(response, "body_iterator", None)
         if iterator is not None:
             close_iterator = getattr(iterator, "aclose", None)
             if close_iterator is not None:
@@ -3042,7 +3271,7 @@ async def _deferred_dispatch_stream(
     async def try_remote_fallback(reason: str):
         """Open one Remote stream after a native path fails before output."""
 
-        nonlocal fallback_attempted
+        nonlocal fallback_attempted, response
         if not fallback_allowed or fallback_attempted:
             return None
         fallback_attempted = True
@@ -3073,12 +3302,8 @@ async def _deferred_dispatch_stream(
                 requested_mode,
                 _upstream_response_error(fallback),
             )
-            close = getattr(fallback, "close", None)
-            if close is not None:
-                try:
-                    close()
-                except Exception:
-                    pass
+            response = fallback
+            await close_current()
             return None
         trace = options.get("_upstream_trace")
         if isinstance(trace, dict):
@@ -3118,7 +3343,27 @@ async def _deferred_dispatch_stream(
                     sent_start_event = True
                 yield chunk
 
+    async def close_dispatch() -> None:
+        nonlocal response, iterator
+        if not task.done():
+            task.cancel()
+        try:
+            dispatched_response = await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        else:
+            # Dispatch may have finished while the public stream was paused
+            # at its initial frame, before it could take response ownership.
+            if not dispatch_claimed:
+                response = dispatched_response
+        if iterator is None and response is not None:
+            iterator = getattr(response, "body_iterator", None)
+        await close_current()
+
     try:
+        # Enter the selected transport before emitting the first keepalive,
+        # while retaining ownership if cancellation occurs in this handoff.
+        await asyncio.sleep(0)
         # The task may still be establishing the Trae request.  Emit one real
         # data frame before comment heartbeats so zcode/OpenCode does not treat
         # the stream as an empty cached response and cancel the task.
@@ -3134,21 +3379,24 @@ async def _deferred_dispatch_stream(
                     )
                 else:
                     response = await task
+                dispatch_claimed = True
                 break
             except asyncio.TimeoutError:
                 yield ": relay-keepalive\n\n"
 
         if getattr(response, "status_code", 200) >= 400:
+            upstream_error = _upstream_response_error(response) or "http error"
+            error_event = _stream_error_event(response)
+            await close_current()
             fallback = await try_remote_fallback(
-                _upstream_response_error(response) or "http error"
+                upstream_error
             )
             if fallback is None:
                 stream_status = "upstream_error"
-                yield _stream_error_event(response)
+                yield error_event
                 yield "data: [DONE]\n\n"
                 saw_done = True
                 return
-            await close_current()
             response = fallback
 
         try:
@@ -3157,6 +3405,10 @@ async def _deferred_dispatch_stream(
         except (asyncio.CancelledError, GeneratorExit):
             raise
         except Exception as exc:
+            if isinstance(exc, EmptyUpstreamResponse):
+                _track_usage_from_exception(exc, model)
+                if not exc.retryable or exc.observed_model_event:
+                    raise
             # A StreamingResponse can be returned with HTTP 200 and fail only
             # when its body iterator starts (empty native SSE, invalid headers,
             # or a provider disconnect).  Retry Remote only before any native
@@ -3193,14 +3445,13 @@ async def _deferred_dispatch_stream(
                 upstream_chunks,
                 int((time.monotonic() - started_at) * 1000),
             )
-        if not task.done():
-            task.cancel()
         raise
     except GeneratorExit:
         stream_status = "client_closed" if not saw_done else "completed"
         raise
     except Exception as exc:
         stream_status = "error"
+        _track_usage_from_exception(exc, model)
         logger.warning("deferred stream dispatch failed: %s", exc)
         yield "data: " + json.dumps(
             {"error": {"message": str(exc), "type": "api_error"}},
@@ -3209,7 +3460,7 @@ async def _deferred_dispatch_stream(
         yield "data: [DONE]\n\n"
         saw_done = True
     finally:
-        await close_current()
+        await _await_session_cleanup(asyncio.create_task(close_dispatch()))
         logger.info(
             "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
             request_id,
@@ -3604,15 +3855,37 @@ def _bind_chat_session(
                 account_id, record = inferred_account_snapshot
             else:
                 account_id, record = auth.get_active_account_snapshot()
+            # A disabled account may remain selected for check-in management.
+            # New sessions can select another enabled account; continuations
+            # keep their credential and are refused while it is disabled.
+            if not account_id or not auth._record_model_enabled(record):
+                account_id, record = auth.get_model_account_snapshot()
             # Keep compatibility with integrations/tests that replace the
             # legacy getters while still preferring the atomic snapshot in
             # normal operation.
             if not account_id:
+                # An account store with no eligible rows must not fall back to
+                # the management-selected (possibly disabled) credential.
+                if auth.get_accounts_raw():
+                    raise _ModelAccountUnavailable(
+                        "No enabled model account available; enable an account in "
+                        "账号与签到"
+                    )
                 account_id = auth.get_active_account_id() or ""
             if account_id and not record:
                 record = auth.get_account_record(account_id)
+            _ensure_model_account_enabled(account_id, str(record.get("token") or ""))
             token = str(record.get("token") or "")
             if not token and not account_id:
+                # Preserve the CLI/env single-credential path when the
+                # account store is empty.  Once accounts are stored, an
+                # all-disabled state must fail explicitly instead of silently
+                # bypassing the per-account switch.
+                if auth.get_accounts_raw():
+                    raise _ModelAccountUnavailable(
+                        "No enabled model account available; enable an account in "
+                        "账号与签到"
+                    )
                 token = str(auth.get_token() or "")
             billing_id = _account_id_from_token(token) or account_id
             lease = _UpstreamSessionLease(
@@ -3630,6 +3903,7 @@ def _bind_chat_session(
         else:
             # A continuation must stay on the credential captured for its first
             # turn. Do not rotate accounts, call refresh, or mutate global auth.
+            _ensure_model_account_enabled(lease.account_id, lease.auth_token)
             lease.last_client_activity = now
             _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
 
@@ -3905,6 +4179,151 @@ def _usage_values(usage: Any) -> dict[str, Any]:
     }
 
 
+def _optional_bool(value: Any) -> bool | None:
+    """Normalize persisted/request metadata without guessing missing values."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled", "是", "有"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled", "否", "无"}:
+            return False
+    return None
+
+
+def _option_flag(value: Any) -> bool:
+    """Return a strict truth value for request flags."""
+
+    return _optional_bool(value) is True
+
+
+def _tool_catalog_has_entries(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, (list, tuple, set)):
+        return bool(value)
+    return value not in (None, "", False)
+
+
+def _tools_requested_from_options(options: Optional[Mapping[str, Any]]) -> bool:
+    """Whether this request carries a caller tool protocol.
+
+    ``_tool_protocol_requested`` can also be set for a continuation that only
+    carries tool history.  An explicit ``tools=[]`` remains false unless an
+    inherited catalog or a tool choice says otherwise.
+    """
+
+    options = options or {}
+    if _tool_catalog_has_entries(options.get("tools")):
+        return True
+    if _tool_catalog_has_entries(options.get("_inherited_tools")):
+        return True
+    if "tools" not in options and "_inherited_tools" not in options:
+        if _option_flag(options.get("_tool_protocol_requested")):
+            return True
+    choice = options.get("tool_choice")
+    if choice not in (None, "", "none", False):
+        return True
+    return False
+
+
+def _requested_reasoning_effort(options: Optional[Mapping[str, Any]]) -> str | None:
+    """Extract the caller-facing thinking strength without normalizing labels."""
+
+    options = options or {}
+    for key in ("reasoning_effort", "reasoningEffort", "thinking_effort"):
+        value = options.get(key)
+        if value not in (None, ""):
+            return str(value).strip() or None
+    reasoning = options.get("reasoning")
+    if isinstance(reasoning, Mapping):
+        value = reasoning.get("effort") or reasoning.get("level")
+        if value not in (None, ""):
+            return str(value).strip() or None
+    thinking = options.get("thinking")
+    if isinstance(thinking, Mapping):
+        value = (
+            thinking.get("effort")
+            or thinking.get("level")
+            or thinking.get("budget_tokens")
+            or thinking.get("budgetTokens")
+        )
+        if value not in (None, ""):
+            return str(value).strip() or None
+        if _option_flag(thinking.get("enabled")) or _option_flag(thinking.get("enable")):
+            return "enabled"
+    elif thinking not in (None, "", False):
+        return "enabled"
+    return None
+
+
+def _context_mode_metadata(
+    options: Optional[Mapping[str, Any]],
+) -> tuple[str | None, str | None, int | float | None, bool | None]:
+    """Return requested/actual context mode and its known token window."""
+
+    options = options or {}
+    trace = options.get("_upstream_trace")
+    trace = trace if isinstance(trace, Mapping) else {}
+    if "trae_max_mode" in options:
+        requested_max = _option_flag(options["trae_max_mode"])
+    elif "max_mode" in options:
+        requested_max = _option_flag(options["max_mode"])
+    else:
+        requested_max = bool(auth.get_max_mode_settings().get("enabled"))
+    applied_marker = trace.get("max_mode_applied") if "max_mode_applied" in trace else None
+    applied_max = _optional_bool(applied_marker)
+    requested = "max_1m" if requested_max else "standard"
+    actual = (
+        "max_1m"
+        if applied_max is True
+        else "standard"
+        if applied_max is False
+        else None
+    )
+    window = _number_value(trace.get("max_context_tokens"))
+    if window is None and applied_max is True:
+        window = 1_000_000
+    return requested, actual, window, applied_max
+
+
+def _tool_call_count(value: Any) -> int:
+    """Count structured tool calls in one translated model payload."""
+
+    if not isinstance(value, Mapping):
+        return 0
+    value_type = str(value.get("type") or "").strip().lower()
+    if value_type in {
+        "function_call",
+        "custom_tool_call",
+        "tool_call",
+        "tool_use",
+    }:
+        return 1
+    count = 0
+    calls = value.get("tool_calls")
+    if isinstance(calls, list):
+        count += sum(1 for item in calls if isinstance(item, Mapping))
+    elif isinstance(calls, Mapping):
+        count += 1
+    if isinstance(value.get("function_call"), Mapping):
+        count += 1
+    for key in ("message", "delta", "output", "response", "item", "items", "content"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            count += _tool_call_count(nested)
+        elif isinstance(nested, list):
+            count += sum(_tool_call_count(item) for item in nested)
+    choices = value.get("choices")
+    if isinstance(choices, list):
+        count += sum(_tool_call_count(item) for item in choices)
+    return count
+
+
 def _request_account_identity() -> tuple[str, str]:
     token = auth.get_token() or ""
     token_identity = _account_id_from_token(token)
@@ -4108,9 +4527,14 @@ class _UsageTracker:
         endpoint: str,
         stream: bool,
         options: Optional[Mapping[str, Any]] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
     ):
         self.request_id = "req-" + uuid_mod.uuid4().hex
-        options = options or {}
+        options = options if isinstance(options, dict) else dict(options or {})
+        if not isinstance(options.get("_upstream_trace"), dict):
+            options["_upstream_trace"] = {}
+        self.options = options
+        self.messages = messages or []
         self.account_id = str(options.get("_account_id") or "")
         self.billing_id = str(options.get("_billing_id") or "")
         self.token = str(options.get("_auth_token") or "")
@@ -4145,6 +4569,21 @@ class _UsageTracker:
         self.usage = _usage_values({})
         self.usage_turn_id = ""
         self.saw_usage = False
+        # Request metadata is captured before dispatch; the trace and tool
+        # return state are updated later as the selected upstream responds.
+        self.reasoning_effort = _requested_reasoning_effort(options)
+        (
+            self.context_mode_requested,
+            self.context_mode_actual,
+            self.context_window_tokens,
+            self.max_mode_applied,
+        ) = _context_mode_metadata(options)
+        # Keep request capability and model behaviour separate.  A non-empty
+        # ``tools`` catalog means the caller offered tools; it does not mean
+        # that this response actually returned a tool call.
+        self.tools_requested = _tools_requested_from_options(options)
+        self.tool_used: bool | None = None
+        self.tool_calls_returned: bool | None = None
         self.status = "in_progress"
         self._finished = False
         self._credit_snapshot_started = bool(
@@ -4177,6 +4616,19 @@ class _UsageTracker:
                 self.usage["credits_consumed"] = explicit_credits
         elif values.get("credits_consumed") is not None:
             self.usage["credits_consumed"] = values["credits_consumed"]
+
+    def mark_tool_calls(self, value: Any) -> None:
+        """Record whether the model actually returned a structured tool call."""
+
+        if value is None:
+            return
+        has_calls = (
+            _tool_call_count(value) > 0
+            if isinstance(value, Mapping)
+            else bool(value)
+        )
+        if has_calls:
+            self.tool_calls_returned = True
 
     def bind_usage_turn(self, usage_turn_id: Any, *, replace: bool = False) -> None:
         value = str(usage_turn_id or "").strip()
@@ -4236,6 +4688,39 @@ class _UsageTracker:
         self._finished = True
         final_status = status or self.status or "completed"
         values = self.usage
+        trace = self.options.get("_upstream_trace")
+        trace = trace if isinstance(trace, Mapping) else {}
+        requested_effort = _requested_reasoning_effort(self.options)
+        if requested_effort:
+            self.reasoning_effort = requested_effort
+        applied_effort = (
+            trace.get("reasoning_effort_applied")
+            or self.options.get("_reasoning_effort_applied")
+        )
+        (
+            context_requested,
+            context_actual,
+            context_window,
+            max_applied,
+        ) = _context_mode_metadata(self.options)
+        self.context_mode_requested = context_requested or self.context_mode_requested
+        self.context_mode_actual = context_actual or self.context_mode_actual
+        self.context_window_tokens = context_window or self.context_window_tokens
+        self.max_mode_applied = (
+            max_applied
+            if max_applied is not None
+            else self.max_mode_applied
+        )
+        if self.tool_calls_returned is None and final_status == "completed":
+            # A completed turn with an offered tool catalog and no structured
+            # call is an explicit negative result.  Failed/cancelled turns
+            # remain unknown because no terminal model decision was observed.
+            self.tool_calls_returned = False
+        if final_status == "completed":
+            self.tool_used = self.tool_calls_returned is True
+        else:
+            self.tool_used = self.tool_calls_returned
+        context_mode = self.context_mode_actual
         explicit_credits = values.get("credits_consumed")
         credits_source = "upstream" if explicit_credits is not None else "unknown"
         _record_usage(
@@ -4252,6 +4737,21 @@ class _UsageTracker:
             duration_ms=round((time.perf_counter() - self.started) * 1000, 1),
             tokens_source="upstream" if self.saw_usage else "unknown",
             cached_tokens=values.get("cached_tokens", 0),
+            reasoning_effort=self.reasoning_effort,
+            requested_reasoning_effort=self.reasoning_effort,
+            reasoning_effort_applied=(
+                str(applied_effort).strip()
+                if applied_effort not in (None, "")
+                else None
+            ),
+            context_mode_requested=self.context_mode_requested,
+            context_mode=context_mode,
+            context_mode_actual=self.context_mode_actual,
+            context_window_tokens=self.context_window_tokens,
+            max_mode_applied=self.max_mode_applied,
+            tools_requested=self.tools_requested,
+            tool_used=self.tool_used,
+            tool_calls_returned=self.tool_calls_returned,
         )
         if explicit_credits is not None:
             try:
@@ -4291,6 +4791,9 @@ def _track_usage_from_result(result: dict, model: str) -> None:
     usage = result.get("usage") or {}
     tracker = _USAGE_TRACKER.get()
     if tracker is not None:
+        mark_tool_calls = getattr(tracker, "mark_tool_calls", None)
+        if callable(mark_tool_calls):
+            mark_tool_calls(result)
         tracker.update(usage)
         return
     values = _usage_values(usage)
@@ -4304,6 +4807,13 @@ def _track_usage_from_result(result: dict, model: str) -> None:
         credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
         cached_tokens=values.get("cached_tokens", 0),
     )
+
+
+def _track_usage_from_exception(exc: BaseException, model: str) -> None:
+    usage = getattr(exc, "usage", None)
+    if usage is not None and not getattr(exc, "_relay_usage_recorded", False):
+        _track_usage_from_result({"usage": usage}, model)
+        exc._relay_usage_recorded = True
 
 
 def _track_usage_from_chunk(chunk: str, model: str) -> None:
@@ -4345,6 +4855,10 @@ def _track_usage_from_chunk(chunk: str, model: str) -> None:
             continue
         if not isinstance(data, Mapping):
             continue
+        if tracker is not None:
+            mark_tool_calls = getattr(tracker, "mark_tool_calls", None)
+            if callable(mark_tool_calls):
+                mark_tool_calls(data)
         usage = data.get("usage")
         if not usage and event_name == "token_usage":
             usage = data
@@ -4731,16 +5245,87 @@ async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = 
     return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
 
 
+async def _await_session_cleanup(task: asyncio.Task) -> None:
+    """Finish owned cleanup before propagating repeated client cancellation."""
+    pending_exception = sys.exception()
+    cancellation = (
+        pending_exception if isinstance(pending_exception, asyncio.CancelledError) else None
+    )
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if task.cancelled():
+                    raise
+                cancellation = cancellation or exc
+            except Exception:
+                break
+        try:
+            task.result()
+        except BaseException:
+            if cancellation is None:
+                raise
+            logger.warning("session cleanup failed while client cancelled", exc_info=True)
+    if cancellation is not None:
+        raise cancellation
+
+
+class _SessionStreamIterator:
+    """Keep cleanup ownership even when a response is closed before iteration."""
+
+    def __init__(self, source, close):
+        self._source = source
+        self._close = close
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await anext(self._source)
+
+    async def aclose(self):
+        try:
+            await self._source.aclose()
+        finally:
+            await self._close()
+
+
+def _chat_response_closer(response, upstream_metadata: dict[str, Any]):
+    cleanup_task = None
+
+    async def cleanup() -> None:
+        try:
+            _bind_usage_turn_from_metadata(upstream_metadata)
+        finally:
+            response.close()
+
+    async def close() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(cleanup())
+        await _await_session_cleanup(cleanup_task)
+
+    return close
+
+
 async def run_web_session(messages, model, stream: bool, options: Optional[dict] = None):
     """OmniRoute 风格网页版 remote 会话，带账号并发槽和空闲回收。"""
     options = dict(options or {})
     token = str(options.get("_auth_token") or "").strip()
     account_id = str(options.get("_account_id") or "").strip()
     record = auth.get_account_record(account_id) if account_id else {}
+    if not account_id and not token:
+        account_id, record = auth.get_model_account_snapshot()
     if not token and account_id:
         token = str((record or {}).get("token") or "").strip()
     if not token and not account_id:
+        if auth.get_accounts_raw():
+            raise _ModelAccountUnavailable(
+                "No enabled model account available; enable an account in 账号与签到"
+            )
         token = str(auth.get_token() or "").strip()
+    _ensure_model_account_enabled(account_id, token)
     token_identity = _account_id_from_token(token)
     if token_identity:
         account_id = token_identity
@@ -4752,9 +5337,6 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
         token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
-    await trae_client.acquire_web_slot(account_id, timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")))
-    client = httpx.AsyncClient(timeout=60)
-    session_id = ""
     translation_options = _tool_translation_options(options, messages)
     bound_options = {**options, "_auth_token": token, "_account_id": account_id}
     provider_specific = bound_options.get("provider_specific")
@@ -4767,7 +5349,40 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     bound_options["provider_specific"] = (
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
+    await trae_client.acquire_web_slot(
+        account_id, timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+    )
+    client = None
+    session_id = ""
+    message_id = ""
+    lease_registered = False
+    cleanup_task = None
+
+    async def cleanup_web_session() -> None:
+        # Claim the registered lease before any await so the idle reaper and
+        # response teardown cannot both close and release the same resources.
+        if lease_registered and not trae_client.unregister_web_lease(session_id):
+            return
+        try:
+            if session_id and client is not None:
+                await trae_client.stop_web_session(
+                    client, session_id, message_id, options=bound_options
+                )
+        finally:
+            try:
+                if client is not None:
+                    await client.aclose()
+            finally:
+                trae_client.release_web_slot(account_id)
+
+    async def close_web_session() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(cleanup_web_session())
+        await _await_session_cleanup(cleanup_task)
+
     try:
+        client = httpx.AsyncClient(timeout=60)
         session_id, message_id = await trae_client.create_web_session(
             client,
             model,
@@ -4783,6 +5398,7 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
             token=token,
             provider_specific=bound_options.get("provider_specific"),
         )
+        lease_registered = True
         event_iter = trae_client.stream_web_events(
             client, session_id, message_id, options=bound_options
         )
@@ -4795,16 +5411,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
                         _track_usage_from_chunk(chunk, model)
                         yield chunk
                 finally:
-                    # Actively interrupt the upstream session so it stops
-                    # occupying a running slot, then close local resources.
-                    await trae_client.stop_web_session(
-                        client, session_id, message_id, options=bound_options
-                    )
-                    await client.aclose()
-                    if trae_client.unregister_web_lease(session_id):
-                        trae_client.release_web_slot(account_id)
+                    await close_web_session()
             return StreamingResponse(
-                gen(),
+                _SessionStreamIterator(gen(), close_web_session),
                 media_type="text/event-stream",
                 headers=_sse_headers(),
             )
@@ -4815,26 +5424,9 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
             _track_usage_from_result(result, model)
             return JSONResponse(content=result)
         finally:
-            await trae_client.stop_web_session(
-                client, session_id, message_id, options=bound_options
-            )
-            await client.aclose()
-            if trae_client.unregister_web_lease(session_id):
-                trae_client.release_web_slot(account_id)
-    except Exception:
-        if session_id:
-            try:
-                await trae_client.stop_web_session(
-                    client, session_id, message_id, options=bound_options
-                )
-            except Exception:
-                pass
-        await client.aclose()
-        if session_id:
-            if trae_client.unregister_web_lease(session_id):
-                trae_client.release_web_slot(account_id)
-        else:
-            trae_client.release_web_slot(account_id)
+            await close_web_session()
+    except BaseException:
+        await close_web_session()
         raise
 
 
@@ -4848,13 +5440,21 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     options = dict(options or {})
     account_id = str(options.get("_account_id") or "").strip()
     token = str(options.get("_auth_token") or "").strip()
+    model_record: dict = {}
+    if not account_id and not token:
+        account_id, model_record = auth.get_model_account_snapshot()
     if not token and account_id:
         # A bound account owns its credential.  Do not fall back to the
         # mutable global token, which may belong to a concurrently selected
         # account.
         token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
     if not token and not account_id:
+        if auth.get_accounts_raw():
+            raise _ModelAccountUnavailable(
+                "No enabled model account available; enable an account in 账号与签到"
+            )
         token = str(auth.get_token() or "").strip()
+    _ensure_model_account_enabled(account_id, token)
     token_identity = _account_id_from_token(token)
     if token_identity:
         # The JWT is the identity Trae bills.  It is authoritative if an old
@@ -4862,7 +5462,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         account_id = token_identity
     if not account_id:
         account_id = str(auth.get_active_account_id() or "default")
-    record = auth.get_account_record(account_id) if account_id else {}
+    record = auth.get_account_record(account_id) if account_id else model_record
     if not token:
         token = str(record.get("token") or "").strip()
     if not token:
@@ -4903,12 +5503,8 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     remote_options["provider_specific"] = (
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
-    await trae_client.acquire_web_slot(
-        account_id,
-        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
-    )
     slot_released = False
-    cleanup_started = False
+    cleanup_task = None
 
     def release_slot_once() -> None:
         """Release the account slot exactly once across all exit paths."""
@@ -4919,19 +5515,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         slot_released = True
         trae_client.release_web_slot(account_id)
 
-    client = httpx.AsyncClient(timeout=None)
+    client = None
     session_id = ""
     message_id = ""
 
-    async def close_remote_session() -> None:
+    async def cleanup_remote_session() -> None:
         """Stop and close one remote attempt without leaking its account slot."""
-
-        nonlocal cleanup_started
-        if cleanup_started:
-            return
-        cleanup_started = True
         try:
-            if session_id:
+            if session_id and client is not None:
                 await trae_remote_client.stop_session(
                     client,
                     token,
@@ -4941,9 +5532,16 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 )
         finally:
             try:
-                await client.aclose()
+                if client is not None:
+                    await client.aclose()
             finally:
                 release_slot_once()
+
+    async def close_remote_session() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(cleanup_remote_session())
+        await _await_session_cleanup(cleanup_task)
 
     translation_options = _tool_translation_options(options, messages)
     explicit_remote_type = str(
@@ -5024,7 +5622,12 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             query_trimmed,
             len(trae_client.flatten_query(prepared_messages)),
         )
+    await trae_client.acquire_web_slot(
+        account_id,
+        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+    )
     try:
+        client = httpx.AsyncClient(timeout=None)
         logger.info(
             "remote create start id=%s account=%s model=%s messages=%d last_chars=%d",
             str(options.get("_relay_request_id") or ""),
@@ -5052,7 +5655,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             )
             # No session id was returned, so the failed create cannot be
             # stopped. Reuse the acquired account slot with a fresh client.
-            await client.aclose()
+            failed_client = client
+            client = None
+            await _await_session_cleanup(asyncio.create_task(failed_client.aclose()))
             client = httpx.AsyncClient(timeout=None)
             remote_options = work_fallback_options(remote_options)
             work_fallback_used = True
@@ -5114,7 +5719,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             getattr(exc, "observed_model_event", False)
                         )
                         if exc_usage is not None:
-                            _track_usage_from_result({"usage": exc_usage}, model)
+                            _track_usage_from_exception(exc, model)
                         polling_retry_enabled = bool(
                             auth.get_polling_status().get("enabled")
                         )
@@ -5145,6 +5750,28 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         retry_session_id = ""
                         retry_message_id = ""
                         retry_account_id = account_id
+
+                        async def cleanup_retry_session() -> None:
+                            try:
+                                if retry_session_id and retry_client is not None:
+                                    try:
+                                        await trae_remote_client.stop_session(
+                                            retry_client,
+                                            retry_token,
+                                            retry_session_id,
+                                            retry_message_id,
+                                            options=retry_options,
+                                        )
+                                    except Exception:
+                                        pass
+                            finally:
+                                try:
+                                    if retry_client is not None:
+                                        await retry_client.aclose()
+                                finally:
+                                    if slot_reacquired:
+                                        trae_client.release_web_slot(retry_account_id)
+
                         try:
                             retry_options = dict(remote_options)
                             retry_model = model
@@ -5233,40 +5860,26 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 retry_message_id,
                                 options=retry_options,
                             )
-                            try:
-                                async for chunk in translate_web_events(
-                                    retry_event_iter,
-                                    model,
-                                    FORWARD_USAGE,
-                                    fail_on_empty=True,
-                                    **translation_options,
-                                ):
-                                    _track_usage_from_chunk(chunk, model)
-                                    chunk_count += 1
-                                    if '"tool_calls"' in chunk:
-                                        tool_chunk_count += 1
-                                    if "data: [DONE]" in chunk:
-                                        saw_done = True
-                                        stream_status = "completed"
-                                    yield chunk
-                                stream_status = "completed"
-                            finally:
-                                if retry_session_id:
-                                    try:
-                                        await trae_remote_client.stop_session(
-                                            retry_client,
-                                            retry_token,
-                                            retry_session_id,
-                                            retry_message_id,
-                                            options=retry_options,
-                                        )
-                                    except Exception:
-                                        pass
+                            async for chunk in translate_web_events(
+                                retry_event_iter,
+                                model,
+                                FORWARD_USAGE,
+                                fail_on_empty=True,
+                                **translation_options,
+                            ):
+                                _track_usage_from_chunk(chunk, model)
+                                chunk_count += 1
+                                if '"tool_calls"' in chunk:
+                                    tool_chunk_count += 1
+                                if "data: [DONE]" in chunk:
+                                    saw_done = True
+                                    stream_status = "completed"
+                                yield chunk
+                            stream_status = "completed"
                         finally:
-                            if slot_reacquired:
-                                trae_client.release_web_slot(retry_account_id)
-                            if retry_client is not None:
-                                await retry_client.aclose()
+                            await _await_session_cleanup(
+                                asyncio.create_task(cleanup_retry_session())
+                            )
                 except asyncio.CancelledError:
                     stream_status = "client_cancelled"
                     raise
@@ -5290,7 +5903,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                     await close_remote_session()
 
             return StreamingResponse(
-                gen(), media_type="text/event-stream", headers=_sse_headers()
+                _SessionStreamIterator(gen(), close_remote_session),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
             )
         try:
             result = await collect_nonstream_web(
@@ -5302,8 +5917,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             _track_usage_from_result(result, model)
             return JSONResponse(content=result)
         except EmptyUpstreamResponse as exc:
-            if exc.usage is not None:
-                _track_usage_from_result({"usage": exc.usage}, model)
+            _track_usage_from_exception(exc, model)
             if not (can_work_fallback and not work_fallback_used and exc.retryable):
                 raise
             logger.warning(
@@ -5313,19 +5927,25 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 model,
             )
             work_fallback_used = True
+            stopped_session_id = session_id
+            stopped_message_id = message_id
+            session_id = ""
+            message_id = ""
             try:
-                if session_id:
-                    await trae_remote_client.stop_session(
-                        client,
-                        token,
-                        session_id,
-                        message_id,
-                        options=remote_options,
+                if stopped_session_id:
+                    await _await_session_cleanup(
+                        asyncio.create_task(
+                            trae_remote_client.stop_session(
+                                client,
+                                token,
+                                stopped_session_id,
+                                stopped_message_id,
+                                options=remote_options,
+                            )
+                        )
                     )
             except Exception:
                 pass
-            session_id = ""
-            message_id = ""
             remote_options = work_fallback_options(remote_options)
             session_id, message_id = await trae_remote_client.create_session(
                 client,
@@ -5354,7 +5974,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             return JSONResponse(content=result)
         finally:
             await close_remote_session()
-    except Exception:
+    except BaseException:
         await close_remote_session()
         raise
 
@@ -5377,10 +5997,11 @@ def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
 
 async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = None):
     """trae2api 风格 IDE chat，流式响应消费完成后关闭 response 和 client。"""
-    ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
-    response = ide_resp.response
     translation_options = _tool_translation_options(options, messages)
     upstream_metadata: dict[str, Any] = {}
+    ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
+    response = ide_resp.response
+    close_response = _chat_response_closer(ide_resp, upstream_metadata)
     if stream:
         async def gen():
             try:
@@ -5396,13 +6017,16 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                     _track_usage_from_chunk(chunk, model)
                     yield chunk
             finally:
-                _bind_usage_turn_from_metadata(upstream_metadata)
-                ide_resp.close()
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-        )
+                await close_response()
+        try:
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_response),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        except BaseException:
+            await close_response()
+            raise
     try:
         result = await collect_nonstream_ide(
             response,
@@ -5415,8 +6039,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
         _track_usage_from_result(result, model)
         return JSONResponse(content=result)
     finally:
-        _bind_usage_turn_from_metadata(upstream_metadata)
-        ide_resp.close()
+        await close_response()
 
 
 async def run_traework_native_chat(
@@ -5429,14 +6052,15 @@ async def run_traework_native_chat(
     to load a Windows PE DLL.
     """
 
+    translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
     native_resp = await traework_native_bridge.send_native_chat_request(
         messages,
         model,
         stream=stream,
         options=options,
     )
-    translation_options = _tool_translation_options(options, messages)
-    upstream_metadata: dict[str, Any] = {}
+    close_response = _chat_response_closer(native_resp, upstream_metadata)
     if stream:
         async def gen():
             try:
@@ -5452,14 +6076,17 @@ async def run_traework_native_chat(
                     _track_usage_from_chunk(chunk, model)
                     yield chunk
             finally:
-                _bind_usage_turn_from_metadata(upstream_metadata)
-                native_resp.close()
+                await close_response()
 
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-        )
+        try:
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_response),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        except BaseException:
+            await close_response()
+            raise
     try:
         result = await collect_nonstream_ide(
             native_resp.response,
@@ -5472,12 +6099,13 @@ async def run_traework_native_chat(
         _track_usage_from_result(result, model)
         return JSONResponse(content=result)
     finally:
-        _bind_usage_turn_from_metadata(upstream_metadata)
-        native_resp.close()
+        await close_response()
 
 
 async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = None):
     """直连 Trae 原生 chat 协议，响应暂复用 IDE SSE 翻译器。"""
+    translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
     logger.info(
         "raw send start id=%s model=%s messages=%d last_chars=%d",
         str((options or {}).get("_relay_request_id") or ""),
@@ -5486,20 +6114,28 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
         len(str(messages[-1].get("content") or "")) if messages else 0,
     )
     raw_resp = await raw_client.send_raw_chat_request(messages, model, options)
-    logger.info(
-        "raw send ok id=%s status=%s",
-        str((options or {}).get("_relay_request_id") or ""),
-        getattr(raw_resp.response, "status_code", 0),
-    )
-    _capture_chat_session_auth(
-        str((options or {}).get("session_id") or ""),
-        str(getattr(raw_resp, "auth_token", "") or ""),
-    )
-    translation_options = _tool_translation_options(options, messages)
-    upstream_metadata: dict[str, Any] = {}
+    current = raw_resp
+    close_current = _chat_response_closer(current, upstream_metadata)
+
+    async def close_response() -> None:
+        await close_current()
+
+    try:
+        logger.info(
+            "raw send ok id=%s status=%s",
+            str((options or {}).get("_relay_request_id") or ""),
+            getattr(raw_resp.response, "status_code", 0),
+        )
+        _capture_chat_session_auth(
+            str((options or {}).get("session_id") or ""),
+            str(getattr(raw_resp, "auth_token", "") or ""),
+        )
+    except BaseException:
+        await close_response()
+        raise
     if stream:
         async def gen():
-            current = raw_resp
+            nonlocal current, close_current
             request_id = str((options or {}).get("_relay_request_id") or "")
             started_at = time.monotonic()
             chunk_count = 0
@@ -5531,17 +6167,15 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                         stream_status = "completed"
                         return
                     except RepeatedCompletedToolResponse as exc:
-                        if exc.usage is not None:
-                            _track_usage_from_result({"usage": exc.usage}, model)
+                        _track_usage_from_exception(exc, model)
                         logger.warning(
                             "raw upstream repeated an already completed tool call; "
                             "automatic replay is disabled to avoid a second billed turn"
                         )
-                        raise RuntimeError(str(exc)) from exc
+                        raise
                     except EmptyUpstreamResponse as exc:
                         _bind_usage_turn_from_metadata(upstream_metadata)
-                        if exc.usage is not None:
-                            _track_usage_from_result({"usage": exc.usage}, model)
+                        _track_usage_from_exception(exc, model)
                         if attempt or not exc.retryable:
                             logger.warning(
                                 "raw upstream response is not safe to retry "
@@ -5555,13 +6189,13 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                         )
                         retry_options = dict(options or {})
                     finally:
-                        _bind_usage_turn_from_metadata(upstream_metadata)
-                        current.close()
+                        await close_response()
 
                     try:
                         current = await raw_client.send_raw_chat_request(
                             messages, model, retry_options
                         )
+                        close_current = _chat_response_closer(current, upstream_metadata)
                         _capture_chat_session_auth(
                             str((options or {}).get("session_id") or ""),
                             str(getattr(current, "auth_token", "") or ""),
@@ -5580,6 +6214,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                 stream_status = "error"
                 raise
             finally:
+                await close_response()
                 logger.info(
                     "raw stream closed id=%s status=%s chunks=%d tool_chunks=%d done=%s elapsed_ms=%d",
                     request_id,
@@ -5589,13 +6224,16 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                     saw_done,
                     int((time.monotonic() - started_at) * 1000),
                 )
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
-            headers=_sse_headers(),
-        )
+        try:
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_response),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        except BaseException:
+            await close_response()
+            raise
 
-    current = raw_resp
     retry_options = dict(options or {})
     for attempt in range(2):
         try:
@@ -5612,17 +6250,15 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
             return JSONResponse(content=result)
         except RepeatedCompletedToolResponse as exc:
             _bind_usage_turn_from_metadata(upstream_metadata)
-            if exc.usage is not None:
-                _track_usage_from_result({"usage": exc.usage}, model)
+            _track_usage_from_exception(exc, model)
             logger.warning(
                 "raw upstream repeated an already completed tool call; "
                 "automatic replay is disabled to avoid a second billed turn"
             )
-            raise RuntimeError(str(exc)) from exc
+            raise
         except EmptyUpstreamResponse as exc:
             _bind_usage_turn_from_metadata(upstream_metadata)
-            if exc.usage is not None:
-                _track_usage_from_result({"usage": exc.usage}, model)
+            _track_usage_from_exception(exc, model)
             if attempt or not exc.retryable:
                 logger.warning(
                     "raw upstream response is not safe to retry "
@@ -5636,17 +6272,18 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
             )
             retry_options = dict(options or {})
         finally:
-            _bind_usage_turn_from_metadata(upstream_metadata)
-            current.close()
+            await close_response()
         try:
             current = await raw_client.send_raw_chat_request(
                 messages, model, retry_options
             )
+            close_current = _chat_response_closer(current, upstream_metadata)
             _capture_chat_session_auth(
                 str((options or {}).get("session_id") or ""),
                 str(getattr(current, "auth_token", "") or ""),
             )
-        except Exception as exc:
+        except BaseException as exc:
+            await close_response()
             logger.warning("raw empty-response retry failed: %s", exc)
             raise
 
@@ -5688,7 +6325,11 @@ def _polling_retry_limit(options: Optional[Mapping[str, Any]]) -> int:
     anonymous_accounts = 0
     for account in auth.list_accounts():
         if isinstance(account, Mapping):
-            if account.get("is_valid") is False:
+            if (
+                account.get("is_valid") is False
+                or account.get("model_enabled") is False
+                or account.get("model_eligible") is False
+            ):
                 continue
             account_id = str(account.get("id") or "")
             if account_id:
@@ -5698,7 +6339,7 @@ def _polling_retry_limit(options: Optional[Mapping[str, Any]]) -> int:
         else:
             anonymous_accounts += 1
     bound_account = str((options or {}).get("_account_id") or "")
-    if bound_account:
+    if bound_account and auth._record_model_enabled(auth.get_account_record(bound_account)):
         account_ids.add(bound_account)
     return max(1, len(account_ids) + anonymous_accounts)
 
@@ -5712,6 +6353,8 @@ def _next_retry_account_snapshot(
         auth.next_polling_account()
         account_id, record = auth.get_active_account_snapshot()
         safe_record = dict(record) if isinstance(record, Mapping) else {}
+        if not auth._record_model_enabled(safe_record):
+            continue
         candidate_options = {
             "_account_id": str(account_id or ""),
             "_auth_token": str(safe_record.get("token") or ""),
@@ -5884,6 +6527,54 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
     completion = values["completion_tokens"]
     total = values["total_tokens"] or prompt + completion
     credits = values.get("credits_consumed")
+    requested_effort = (
+        record.get("reasoning_effort")
+        or record.get("requested_reasoning_effort")
+        or record.get("reasoning_effort_requested")
+        or record.get("thinking_effort")
+    )
+    applied_effort = (
+        record.get("reasoning_effort_applied")
+        or record.get("applied_reasoning_effort")
+        or record.get("native_reasoning_effort")
+    )
+    requested_context = (
+        record.get("context_mode_requested")
+        or record.get("requested_context_mode")
+    )
+    context_mode = (
+        record.get("context_mode")
+        or record.get("contextMode")
+        or record.get("context_window_mode")
+    )
+    actual_context_mode = (
+        record.get("context_mode_actual")
+        or record.get("actual_context_mode")
+    )
+    max_applied = _optional_bool(
+        record.get("max_mode_applied")
+        if "max_mode_applied" in record
+        else record.get("max_mode")
+    )
+    if context_mode in (None, "") and max_applied is not None:
+        context_mode = "max_1m" if max_applied else "standard"
+    if actual_context_mode in (None, "") and max_applied is not None:
+        actual_context_mode = "max_1m" if max_applied else "standard"
+    tool_used = _optional_bool(record.get("tool_used"))
+    tools_requested = _optional_bool(
+        record.get("tools_requested")
+        if "tools_requested" in record
+        else record.get("tool_protocol_requested")
+    )
+    tool_calls_returned = _optional_bool(
+        record.get("tool_calls_returned")
+        if "tool_calls_returned" in record
+        else record.get("tool_call_returned")
+    )
+    context_window_tokens = _number_value(
+        record.get("context_window_tokens")
+        or record.get("max_context_tokens")
+    )
     normalized.update(
         {
             "account_id": str(record.get("account_id") or "default"),
@@ -5922,6 +6613,43 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             "status": str(record.get("status") or "completed"),
             "duration_ms": _number_value(record.get("duration_ms")),
             "timestamp": _number_value(record.get("timestamp")) or 0,
+            # Request metadata is kept separate from token accounting so old
+            # rows can still be rendered with an explicit unknown marker.
+            "reasoning_effort": (
+                str(requested_effort).strip()
+                if requested_effort not in (None, "")
+                else None
+            ),
+            "requested_reasoning_effort": (
+                str(requested_effort).strip()
+                if requested_effort not in (None, "")
+                else None
+            ),
+            "reasoning_effort_applied": (
+                str(applied_effort).strip()
+                if applied_effort not in (None, "")
+                else None
+            ),
+            "context_mode_requested": (
+                str(requested_context).strip()
+                if requested_context not in (None, "")
+                else None
+            ),
+            "context_mode": (
+                str(context_mode).strip()
+                if context_mode not in (None, "")
+                else None
+            ),
+            "context_mode_actual": (
+                str(actual_context_mode).strip()
+                if actual_context_mode not in (None, "")
+                else None
+            ),
+            "context_window_tokens": context_window_tokens,
+            "max_mode_applied": max_applied,
+            "tools_requested": tools_requested,
+            "tool_used": tool_used,
+            "tool_calls_returned": tool_calls_returned,
         }
     )
     return normalized
@@ -6132,6 +6860,17 @@ def _record_usage(
     duration_ms: int | float | None = None,
     tokens_source: str = "upstream",
     cached_tokens: int = 0,
+    reasoning_effort: str | None = None,
+    requested_reasoning_effort: str | None = None,
+    reasoning_effort_applied: str | None = None,
+    context_mode_requested: str | None = None,
+    context_mode: str | None = None,
+    context_mode_actual: str | None = None,
+    context_window_tokens: int | float | None = None,
+    max_mode_applied: bool | None = None,
+    tools_requested: bool | None = None,
+    tool_used: bool | None = None,
+    tool_calls_returned: bool | None = None,
 ) -> dict[str, Any]:
     """Record one API request (newest first) and persist it independently."""
     global _USAGE_HISTORY
@@ -6152,6 +6891,17 @@ def _record_usage(
             "status": status,
             "duration_ms": duration_ms,
             "timestamp": time.time(),
+            "reasoning_effort": reasoning_effort,
+            "requested_reasoning_effort": requested_reasoning_effort,
+            "reasoning_effort_applied": reasoning_effort_applied,
+            "context_mode_requested": context_mode_requested,
+            "context_mode": context_mode,
+            "context_mode_actual": context_mode_actual,
+            "context_window_tokens": context_window_tokens,
+            "max_mode_applied": max_mode_applied,
+            "tools_requested": tools_requested,
+            "tool_used": tool_used,
+            "tool_calls_returned": tool_calls_returned,
         }
     )
     with _USAGE_LOCK:
@@ -6219,7 +6969,6 @@ def _remote_fallback_options(
     ):
         fallback["_remote_agent_type"] = fallback_agent_type
     fallback.setdefault("_session_variant", f"{requested_mode}-fallback")
-    fallback.pop("_upstream_trace", None)
     return fallback
 
 
@@ -6331,6 +7080,13 @@ def _apply_auto_route(
 
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
     options = _apply_auto_route(messages, options)
+    try:
+        _ensure_model_account_enabled(
+            str(options.get("_account_id") or ""),
+            str(options.get("_auth_token") or ""),
+        )
+    except _ModelAccountUnavailable as exc:
+        return _openai_error(503, str(exc), "model_account_unavailable")
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
     trace = options.get("_upstream_trace")
     if isinstance(trace, dict):
@@ -6509,6 +7265,12 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     actual_endpoint=mode,
                     fallback_used=mode != modes[0],
                 )
+                trace.pop("reasoning_effort_applied", None)
+                trace.pop("max_context_tokens", None)
+                if mode in {"raw", "ide", "cli", "traework-native", "web"}:
+                    trace["max_mode_applied"] = False
+                else:
+                    trace.pop("max_mode_applied", None)
             mode_options = dict(options)
             if mode == "raw":
                 result = await run_raw_chat(messages, model, stream, mode_options)
@@ -6523,6 +7285,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 mode_options.pop("_auth_token", None)
                 mode_options.pop("_account_id", None)
             if mode == "cli":
+                mode_options.pop("_upstream_trace", None)
                 result = await run_cli_chat(messages, model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
@@ -6582,6 +7345,14 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
+            if isinstance(e, _ModelAccountUnavailable):
+                return _openai_error(503, str(e), "model_account_unavailable")
+            if isinstance(e, EmptyUpstreamResponse):
+                _track_usage_from_exception(e, model)
+                if not e.retryable or e.observed_model_event:
+                    if stream:
+                        raise
+                    return _openai_error(502, str(e), "api_error")
             errors.append(f"{mode}: {e}")
             if (
                 mode == "raw"
@@ -6656,7 +7427,13 @@ async def _handle_traework_custom(
     # the account/JWT; the custom model's Bearer key must never replace it.
     options["_traework_custom_model"] = True
     options["_relay_request_id"] = request_id
-    tracker = _UsageTracker(descriptor.model, req.url.path, descriptor.stream, options)
+    tracker = _UsageTracker(
+        descriptor.model,
+        req.url.path,
+        descriptor.stream,
+        options,
+        messages,
+    )
     tracker.request_id = request_id
     logger.info(
         "traework custom ingress id=%s path=%s model=%s stream=%s messages=%d tools=%s session=%s",
@@ -6786,7 +7563,7 @@ async def handle_chat(req: Request):
         options,
         requested_session_id=requested_session_id,
     )
-    tracker = _UsageTracker(model, req.url.path, stream, options)
+    tracker = _UsageTracker(model, req.url.path, stream, options, messages)
     tracker.request_id = request_id
     options["_relay_request_id"] = request_id
     logger.info(
@@ -6866,7 +7643,7 @@ async def handle_responses(req: Request):
         requested_session_id=str(options.get("session_id") or options.get("sessionId") or ""),
     )
     stream = bool(body.get("stream", False))
-    tracker = _UsageTracker(context.model, req.url.path, stream, options)
+    tracker = _UsageTracker(context.model, req.url.path, stream, options, messages)
     tracker.request_id = request_id
     options["_relay_request_id"] = request_id
     logger.info(
@@ -6921,6 +7698,7 @@ async def init_app():
     _load_usage_history()
     _load_usage_stats()
     auth.init_auth()
+    _restore_persisted_relay_settings()
     auth.apply_max_mode_settings()
     logger.info(
         "Trae CN relay initialized (auth source=%s edition=%s cli=%s)",
@@ -7154,6 +7932,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Trae CN Relay", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.exception_handler(_ModelAccountUnavailable)
+async def model_account_unavailable_handler(_request: Request, exc: _ModelAccountUnavailable):
+    return _openai_error(503, str(exc), "model_account_unavailable")
 
 
 @app.get("/api/overview")
@@ -8598,6 +9381,62 @@ async def api_accounts_switch(request: Request):
     )
 
 
+@app.post("/api/accounts/model-enabled")
+async def api_accounts_model_enabled(request: Request):
+    """Toggle whether one account receives new model requests.
+
+    This endpoint intentionally does not touch check-in state.  Disabled
+    accounts remain visible and continue to participate in all daily
+    check-in/status/credits operations.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"success": False, "error": "Invalid JSON body"}, status_code=400
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"success": False, "error": "JSON body must be an object"}, status_code=400
+        )
+    account_id = body.get("account_id") or body.get("id") or ""
+    if not isinstance(account_id, str) or not account_id.strip():
+        return JSONResponse(
+            {"success": False, "error": "account_id is required"}, status_code=400
+        )
+    if "enabled" not in body and "model_enabled" not in body:
+        return JSONResponse(
+            {"success": False, "error": "enabled is required"}, status_code=400
+        )
+    value = body.get("enabled", body.get("model_enabled"))
+    if isinstance(value, bool):
+        enabled = value
+    elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        enabled = value.strip().lower() == "true"
+    else:
+        return JSONResponse(
+            {"success": False, "error": "enabled must be a boolean"}, status_code=400
+        )
+    account_id = account_id.strip()
+    if not auth.set_account_model_enabled(account_id, enabled):
+        return JSONResponse(
+            {"success": False, "error": "account not found"}, status_code=404
+        )
+    account = next(
+        (item for item in auth.list_accounts() if item.get("id") == account_id),
+        None,
+    )
+    return JSONResponse(
+        {
+            "success": True,
+            "account": account,
+            "account_id": account_id,
+            "model_enabled": bool(account and account.get("model_enabled", enabled)),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.post("/api/accounts/remove")
 async def api_accounts_remove(request: Request):
     try:
@@ -8619,18 +9458,31 @@ async def api_settings(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
-    web_base_url = (body.get("web_base_url") or "").strip()
-    relay_port = body.get("relay_port") or body.get("port") or 0
-    upstream_mode = (body.get("upstream_mode") or "").strip().lower()
+    if not isinstance(body, dict):
+        return JSONResponse({"success": False, "error": "JSON body must be an object"}, status_code=400)
+    web_base_url = body.get("web_base_url") or ""
+    upstream_mode = body.get("upstream_mode") or ""
+    if not isinstance(web_base_url, str) or not isinstance(upstream_mode, str):
+        return JSONResponse({"success": False, "error": "URL and mode must be strings"}, status_code=400)
+    web_base_url = web_base_url.strip().rstrip("/")
+    upstream_mode = upstream_mode.strip().lower()
+    relay_port = body.get("relay_port", body.get("port", 0))
+    port_requested = "relay_port" in body or "port" in body
     if upstream_mode and upstream_mode not in _VALID_UPSTREAM_MODES:
         return JSONResponse(
             {"success": False, "error": f"Unsupported upstream mode: {upstream_mode}"},
             status_code=400,
         )
-    try:
+    if port_requested:
+        if (
+            isinstance(relay_port, bool)
+            or not isinstance(relay_port, (int, str))
+            or not str(relay_port).strip().isdigit()
+        ):
+            return JSONResponse({"success": False, "error": "relay_port must be an integer between 1 and 65535"}, status_code=400)
         relay_port = int(relay_port)
-    except (TypeError, ValueError):
-        relay_port = 0
+        if not 1 <= relay_port <= 65535:
+            return JSONResponse({"success": False, "error": "relay_port must be between 1 and 65535"}, status_code=400)
     if not web_base_url and not relay_port and not upstream_mode:
         return JSONResponse({"success": False, "error": "nothing to update"}, status_code=400)
     auth.set_relay_settings(web_base_url=web_base_url, port=relay_port, upstream_mode=upstream_mode)
@@ -8640,7 +9492,12 @@ async def api_settings(request: Request):
         global UPSTREAM_MODE
         UPSTREAM_MODE = upstream_mode
         os.environ["UPSTREAM_MODE"] = upstream_mode
-    return JSONResponse({"success": True, "note": "端口变更需重启容器生效"})
+    note = (
+        "Relay 端口已保存；需同步 Docker 端口映射并重启容器生效"
+        if relay_port
+        else "上游端点设置已保存"
+    )
+    return JSONResponse({"success": True, "note": note})
 
 
 def _truthy(value: Any) -> bool:
