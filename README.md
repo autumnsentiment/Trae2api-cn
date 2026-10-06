@@ -72,7 +72,7 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
 GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
-Run workflow** 手动执行，默认会构建 `v1.0.2`。部署机器不需要安装 Python、
+Run workflow** 手动执行，默认会构建 `v1.0.3`。部署机器不需要安装 Python、
 Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
 
 ```bash
@@ -83,7 +83,7 @@ docker compose -f docker-compose.image.yml up -d
 
 镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
 拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
-版本标签，例如 `:1.0.2`。更新已有部署时执行
+版本标签，例如 `:1.0.3`。更新已有部署时执行
 `docker compose -f docker-compose.image.yml pull`，再执行
 `docker compose -f docker-compose.image.yml up -d`。
 

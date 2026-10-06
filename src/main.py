@@ -830,7 +830,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
