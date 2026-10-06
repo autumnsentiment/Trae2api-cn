@@ -55,6 +55,49 @@ class UsageValuesTests(unittest.TestCase):
         self.assertEqual(responses["cached_tokens"], 3)
         self.assertEqual(main_module._usage_values({})["cached_tokens"], 0)
 
+    def test_explicit_empty_tools_does_not_restore_inherited_catalog(self):
+        inherited = [
+            {
+                "type": "function",
+                "function": {"name": "read_file"},
+            }
+        ]
+        self.assertFalse(
+            main_module._tools_requested_from_options(
+                {
+                    "tools": [],
+                    "_inherited_tools": inherited,
+                    "_tool_protocol_requested": True,
+                }
+            )
+        )
+        self.assertTrue(
+            main_module._tools_requested_from_options(
+                {
+                    "_inherited_tools": inherited,
+                    "_tool_protocol_requested": True,
+                }
+            )
+        )
+
+    def test_context_mode_defaults_to_standard_for_a_plain_request(self):
+        with _UsageSandbox():
+            tracker = main_module._UsageTracker(
+                "glm-5.3",
+                "/v1/chat/completions",
+                False,
+                {},
+            )
+            tracker.request_id = "standard-context-request"
+            tracker.update({"prompt_tokens": 1, "completion_tokens": 1})
+            asyncio.run(tracker.finish("completed"))
+            record = main_module._USAGE_HISTORY[0]
+            self.assertEqual(record["context_mode_requested"], "standard")
+            self.assertEqual(record["context_mode_actual"], "standard")
+            self.assertEqual(record["context_mode"], "standard")
+            self.assertIs(record["max_mode_requested"], False)
+            self.assertIs(record["max_mode_enabled"], False)
+
     def test_request_metadata_is_normalized_and_old_rows_stay_unknown(self):
         current = main_module._normalize_usage_record(
             {
@@ -69,9 +112,12 @@ class UsageValuesTests(unittest.TestCase):
                 "context_mode_actual": "max_1m",
                 "context_window_tokens": 1_000_000,
                 "max_mode_applied": True,
+                "max_mode_requested": True,
+                "max_mode_enabled": True,
                 "tools_requested": True,
                 "tool_used": False,
                 "tool_calls_returned": False,
+                "tool_called": False,
             }
         )
         self.assertEqual(current["reasoning_effort"], "high")
@@ -81,6 +127,11 @@ class UsageValuesTests(unittest.TestCase):
         self.assertIs(current["tools_requested"], True)
         self.assertIs(current["tool_used"], False)
         self.assertIs(current["tool_calls_returned"], False)
+        self.assertIs(current["max_mode_requested"], True)
+        self.assertIs(current["max_mode_enabled"], True)
+        self.assertIs(current["tool_called"], False)
+        self.assertIs(current["max_mode"], True)
+        self.assertIs(current["tool"], False)
 
         historical = main_module._normalize_usage_record(
             {"account_id": "old", "model": "m", "prompt_tokens": 1, "completion_tokens": 1}
@@ -94,12 +145,51 @@ class UsageValuesTests(unittest.TestCase):
             "tool_used",
         ):
             self.assertIsNone(historical[key], key)
+        unknown_context = main_module._normalize_usage_record(
+            {
+                "account_id": "old",
+                "model": "m",
+                "context_mode_requested": "vendor_custom",
+                "context_mode_actual": "vendor_custom",
+            }
+        )
+        self.assertIsNone(unknown_context["max_mode_requested"])
+        self.assertIsNone(unknown_context["max_mode_enabled"])
+
+    def test_legacy_standard_request_exposes_explicit_non_max_state(self):
+        record = main_module._normalize_usage_record(
+            {
+                "account_id": "old",
+                "model": "m",
+                "context_mode_requested": "standard",
+                "tools_requested": False,
+                "tool_used": False,
+            }
+        )
+        self.assertEqual(record["context_mode"], "standard")
+        self.assertEqual(record["context_mode_actual"], "standard")
+        self.assertIs(record["max_mode_requested"], False)
+        self.assertIs(record["max_mode_enabled"], False)
+        self.assertIs(record["max_mode"], False)
+        self.assertIs(record["tool"], False)
 
 
 class DailyStatsTests(unittest.TestCase):
     def test_records_aggregate_into_today_and_persist(self):
         with _UsageSandbox() as box:
-            main_module._record_usage("a", "glm-5.3", 100, 20, cached_tokens=40, request_id="r1")
+            main_module._record_usage(
+                "a",
+                "glm-5.3",
+                100,
+                20,
+                cached_tokens=40,
+                request_id="r1",
+                context_mode_requested="max_1m",
+                max_mode_requested=True,
+                max_mode_enabled=True,
+                tools_requested=True,
+                tool_called=True,
+            )
             main_module._record_usage("a", "kimi", 50, 5, status="error", request_id="r2")
             overview = main_module._usage_overview(7)
             today = overview["today"]
@@ -110,11 +200,38 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual(today["output_tokens"], 25)
             self.assertEqual(today["cached_tokens"], 40)
             self.assertEqual(today["total_tokens"], 175)
+            self.assertEqual(today["max_mode_requests"], 1)
+            self.assertEqual(today["max_mode_enabled_requests"], 1)
+            self.assertEqual(today["tool_requests"], 1)
+            self.assertEqual(today["tool_calls"], 1)
             self.assertEqual(overview["totals"]["total_tokens"], 175)
             self.assertEqual(len(overview["daily"]), 7)
             self.assertEqual({m["model"] for m in today["models"]}, {"glm-5.3", "kimi"})
             saved = json.loads(box.stats_path.read_text("utf-8"))
             self.assertIn(today["date"], saved["days"])
+
+    def test_old_record_context_and_tool_aliases_feed_canonical_metadata(self):
+        with _UsageSandbox():
+            main_module._record_usage(
+                "a",
+                "glm-5.3",
+                1,
+                1,
+                context_mode_requested="max_1m",
+                max_mode_applied=True,
+                tools_requested=True,
+                tool_calls_returned=True,
+                request_id="canonical-fallback",
+            )
+            record = main_module._USAGE_HISTORY[0]
+            self.assertIs(record["max_mode_requested"], True)
+            self.assertIs(record["max_mode_enabled"], True)
+            self.assertIs(record["tool_called"], True)
+            today = main_module._usage_overview(1)["today"]
+            self.assertEqual(today["max_mode_requests"], 1)
+            self.assertEqual(today["max_mode_enabled_requests"], 1)
+            self.assertEqual(today["tool_requests"], 1)
+            self.assertEqual(today["tool_calls"], 1)
 
     def test_tracker_persists_request_metadata_and_actual_tool_result(self):
         with _UsageSandbox():
@@ -167,6 +284,9 @@ class DailyStatsTests(unittest.TestCase):
             self.assertIs(record["tools_requested"], True)
             self.assertIs(record["tool_used"], True)
             self.assertIs(record["tool_calls_returned"], True)
+            self.assertIs(record["max_mode_requested"], True)
+            self.assertIs(record["max_mode_enabled"], True)
+            self.assertIs(record["tool_called"], True)
 
     def test_requested_max_without_upstream_evidence_is_not_marked_applied(self):
         with _UsageSandbox():
@@ -178,6 +298,9 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual(record["context_mode_requested"], "max_1m")
             self.assertIsNone(record["context_mode_actual"])
             self.assertIsNone(record["max_mode_applied"])
+            self.assertIs(record["max_mode_requested"], True)
+            self.assertIsNone(record["max_mode_enabled"])
+            self.assertIsNone(record["tool_called"])
             self.assertIsNone(record["context_window_tokens"])
 
     def test_remote_fallback_keeps_shared_trace_for_actual_context_metadata(self):
@@ -220,6 +343,7 @@ class DailyStatsTests(unittest.TestCase):
             self.assertIs(record["tools_requested"], True)
             self.assertIs(record["tool_used"], False)
             self.assertIs(record["tool_calls_returned"], False)
+            self.assertIs(record["tool_called"], False)
 
     def test_stream_tool_delta_marks_actual_tool_call(self):
         class FakeTracker:
@@ -285,6 +409,77 @@ class DailyStatsTests(unittest.TestCase):
 
 
 class OverviewEndpointTests(unittest.TestCase):
+    def test_usage_records_endpoint_exposes_request_capability_metadata(self):
+        with _UsageSandbox():
+            main_module._record_usage(
+                "acct",
+                "glm-5.3",
+                7,
+                5,
+                request_id="api-metadata",
+                reasoning_effort="high",
+                reasoning_effort_applied="extra_high",
+                context_mode_requested="max_1m",
+                context_mode_actual="max_1m",
+                context_window_tokens=1_000_000,
+                max_mode_requested=True,
+                max_mode_enabled=True,
+                tools_requested=True,
+                tool_used=True,
+                tool_called=True,
+                tool_calls_returned=True,
+            )
+            body = TestClient(main_module.app).get("/api/usage/records")
+            self.assertEqual(body.status_code, 200)
+            record = next(
+                item for item in body.json() if item["request_id"] == "api-metadata"
+            )
+            expected = {
+                "reasoning_effort": "high",
+                "requested_reasoning_effort": "high",
+                "reasoning_effort_applied": "extra_high",
+                "context_mode_requested": "max_1m",
+                "context_mode": "max_1m",
+                "context_mode_actual": "max_1m",
+                "context_window_tokens": 1_000_000,
+                "max_mode_applied": True,
+                "max_mode_requested": True,
+                "max_mode_enabled": True,
+                "tools_requested": True,
+                "tool_used": True,
+                "tool_called": True,
+                "tool_calls_returned": True,
+            }
+            for key, value in expected.items():
+                with self.subTest(key=key):
+                    self.assertEqual(record[key], value)
+
+    def test_usage_records_endpoint_normalizes_legacy_rows_with_unknown_metadata(self):
+        with _UsageSandbox():
+            main_module._USAGE_HISTORY.append(
+                {
+                    "request_id": "legacy",
+                    "model": "glm-5.3",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "timestamp": time.time(),
+                }
+            )
+            body = TestClient(main_module.app).get("/api/usage/records")
+            self.assertEqual(body.status_code, 200)
+            record = body.json()[0]
+            self.assertEqual(record["request_id"], "legacy")
+            for key in (
+                "reasoning_effort",
+                "context_mode",
+                "context_mode_actual",
+                "tools_requested",
+                "tool_used",
+                "tool_called",
+            ):
+                with self.subTest(key=key):
+                    self.assertIsNone(record[key])
+
     def test_overview_endpoint_and_home_page(self):
         with _UsageSandbox():
             main_module._record_usage("a", "glm-5.3", 12, 3, cached_tokens=2, request_id="x")

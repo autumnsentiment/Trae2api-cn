@@ -21,6 +21,7 @@ import random
 import string
 import time
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator, Mapping, Optional
@@ -79,6 +80,10 @@ SOLO_GATEWAY_VERSION_CODE = os.environ.get(
 )
 SOLO_DEVICE_BRAND = os.environ.get("TRAE_SOLO_DEVICE_BRAND", "83DG")
 SOLO_OS_VERSION = os.environ.get("TRAE_SOLO_OS_VERSION", "Windows 11 Pro")
+SOLO_DEVICE_TYPE = os.environ.get("TRAE_SOLO_DEVICE_TYPE", "windows")
+SOLO_PACKAGE_TYPE = os.environ.get("TRAE_SOLO_PACKAGE_TYPE", "stable_cn")
+SOLO_PLATFORM = os.environ.get("TRAE_SOLO_PLATFORM", "windows")
+SOLO_LSCBD_AID = os.environ.get("TRAE_SOLO_LSCBD_AID", "787976")
 
 # 外部模型名 -> Trae CN 内部模型名（基于最新 Trae CN 模型映射）
 MODEL_ALIASES = {
@@ -406,6 +411,21 @@ def _model_gateway_base(*candidates: Any) -> str:
             "oauth",
         )) and "mchost.guru" not in lowered and "trae-api-" not in lowered:
             continue
+        # Account snapshots sometimes persist the Remote API URL as the
+        # account host (``.../api/remote/v1``).  IDE/SOLO routes are rooted at
+        # the same gateway host, so retaining that path would generate
+        # ``/api/remote/v1/api/agent/...`` and yield a misleading 404/502.
+        # Keep an explicit custom path only when it is not a known Trae API
+        # prefix; this preserves custom gateways while repairing stale account
+        # records.
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            parsed = None
+        if parsed and parsed.scheme and parsed.netloc:
+            path = (parsed.path or "").rstrip("/")
+            if path.startswith(("/api/remote/", "/api/agent/", "/api/ide/")):
+                value = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
         return value
     return DEFAULT_MODEL_GATEWAY
 
@@ -2073,7 +2093,27 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                 "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
                 "x-ide-version-type": "stable",
                 "x-device-brand": SOLO_DEVICE_BRAND,
+                "x-device-type": SOLO_DEVICE_TYPE,
+                "x-device-platform": SOLO_PLATFORM,
+                "x-version-code": SOLO_GATEWAY_VERSION_CODE,
                 "x-os-version": SOLO_OS_VERSION,
+                # These CN/SOLO routing headers are present on the native
+                # Trae client requests.  They are deliberately kept
+                # configurable because account snapshots may come from a
+                # different desktop build, while the defaults match the
+                # current Trae CN stable client.
+                "package-type": SOLO_PACKAGE_TYPE,
+                "x-lscbd-aid": SOLO_LSCBD_AID,
+                "x-lscbd-platform": SOLO_PLATFORM,
+                "x-ss-dp": SOLO_LSCBD_AID,
+                "x-plugin-channel": "icube-ai",
+                "app-version": SOLO_GATEWAY_VERSION,
+                "x-bridge-transport": "aha",
+                "x-ahanet-timeout": "86400",
+                "x-lgw-req-sdk-type": "3",
+                "x-net-sdk-domain-dispatch": "1",
+                "x-ttnet-bypass-decompression": "1",
+                "x-ttnet-bypass-cookie": "0",
                 "request-traffic-type": "prod",
                 "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
             }
@@ -2120,6 +2160,11 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                     options,
                 )
             request_base = WORK_AGENT_HOST if endpoint == "/api/agent/v3/create_agent_task" else base
+            # The native client sends a route-specific referer.  Supplying it
+            # also makes account records that carry ``/api/remote/v1`` behave
+            # like a host-only gateway after _model_gateway_base() normalizes
+            # the stale path.
+            endpoint_headers["Referer"] = request_base + endpoint
             logger.info("trae-client: POST %s%s model=%s tools=%s", request_base, endpoint, model_name, _tool_protocol_requested(options, messages))
             request = client.build_request("POST", request_base + endpoint, json=trae_req)
             resp = await asyncio.to_thread(client.send, request, stream=True)

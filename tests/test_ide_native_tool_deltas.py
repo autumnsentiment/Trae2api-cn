@@ -251,18 +251,18 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
                 calls = await self._calls(frames, stream)
                 self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "README.md"})
 
-    async def test_invalid_final_native_json_does_not_emit_success(self):
+    async def test_invalid_final_native_json_is_dropped_without_tool_success(self):
         frames = [
             [_call("", name="read_file", call_id="call_native")],
             [_call('{"path":')],
         ]
-        with self.assertRaises(sse.InvalidNativeToolArguments) as nonstream:
+        with self.assertRaises(sse.EmptyUpstreamResponse) as nonstream:
             await self._calls(frames, False)
         self.assertFalse(nonstream.exception.retryable)
         self.assertTrue(nonstream.exception.observed_model_event)
         self.assertEqual(nonstream.exception.usage["total_tokens"], 8)
         chunks: list[str] = []
-        with self.assertRaises(sse.InvalidNativeToolArguments):
+        with self.assertRaises(sse.EmptyUpstreamResponse):
             async for chunk in sse.translate_ide_stream(
                 _response(frames), "m", allowed_tools=TOOLS, fail_on_empty=True
             ):
@@ -311,8 +311,23 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
         tail = cli_client.extract_tool_calls({"tool_calls": [_call("{")]})
         accumulator.add(accumulator.prepare(tail))
         self.assertEqual(accumulator.calls()[0]["function"]["arguments"], "{")
-        with self.assertRaises(sse.InvalidNativeToolArguments):
-            sse._ensure_native_tool_arguments(accumulator.calls())
+        repaired = sse._ensure_native_tool_arguments(accumulator.calls())
+        self.assertEqual(repaired[0]["function"]["arguments"], "{}")
+
+    def test_stacked_native_json_arguments_are_split_into_calls(self):
+        call = cli_client.normalize_tool_call(
+            _call('{"path":"a.txt"}{"path":"b.txt"}', name="read_file")
+        )
+        repaired = sse._ensure_native_tool_arguments([call])
+        self.assertEqual(
+            [item["function"]["arguments"] for item in repaired],
+            ['{"path": "a.txt"}', '{"path": "b.txt"}'],
+        )
+        self.assertEqual(repaired[1]["id"], f"{call['id']}:1")
+
+    def test_orphan_native_closing_fragment_is_dropped(self):
+        call = cli_client.normalize_tool_call(_call("}", name="read_file"))
+        self.assertEqual(sse._ensure_native_tool_arguments([call]), [])
 
     async def test_zero_argument_native_call_still_returns_a_json_object(self):
         frames = [[_call("{}", name="read_file", call_id="call_native")]]

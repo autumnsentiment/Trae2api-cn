@@ -833,6 +833,22 @@ class IdeRequestContextTests(unittest.TestCase):
         self.assertEqual(calls[0].headers["Authorization"], "Cloud-IDE-JWT bound-token")
         self.assertEqual(calls[0].headers["x-uid"], "charged-account")
         self.assertEqual(calls[0].request[1], "https://charged.example/api/agent/v3/llm_utils_chat")
+        self.assertEqual(calls[0].headers["x-device-type"], trae_client.SOLO_DEVICE_TYPE)
+        self.assertEqual(
+            calls[0].headers["x-device-platform"],
+            trae_client.SOLO_PLATFORM,
+        )
+        self.assertEqual(
+            calls[0].headers["x-version-code"],
+            trae_client.SOLO_GATEWAY_VERSION_CODE,
+        )
+        self.assertEqual(calls[0].headers["package-type"], trae_client.SOLO_PACKAGE_TYPE)
+        self.assertEqual(calls[0].headers["x-lscbd-aid"], trae_client.SOLO_LSCBD_AID)
+        self.assertEqual(calls[0].headers["x-lscbd-platform"], trae_client.SOLO_PLATFORM)
+        self.assertEqual(
+            calls[0].headers["Referer"],
+            "https://charged.example/api/agent/v3/llm_utils_chat",
+        )
         build_headers.assert_called_once_with(
             token_override="bound-token",
             user_id_override="charged-account",
@@ -933,6 +949,57 @@ class IdeRequestContextTests(unittest.TestCase):
         self.assertEqual(body["max_tokens"], 64000)
         self.assertEqual(ide_request["max_output_tokens"], 64000)
 
+    def test_solo_llm_utils_body_uses_native_solo_function_and_model_lock(self):
+        body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "glm-5.3",
+            True,
+            options={"session_id": "solo-session"},
+        )
+
+        self.assertEqual(body["function"], "solo_work_lite")
+        self.assertEqual(body["config_name"], "glm-5.3")
+        self.assertEqual(body["model"], "glm-5.3")
+        self.assertEqual(body["session_id"], "solo-session")
+        self.assertEqual(body["request_id"], "solo-session")
+        self.assertTrue(body["stream"])
+
+    def test_solo_body_serializes_tool_schema_and_normalizes_choice(self):
+        body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "call read_file"}],
+            "glm-5.3",
+            True,
+            options={
+                "session_id": "solo-tool-session",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read a caller file",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "read_file"},
+                },
+                "parallel_tool_calls": False,
+            },
+        )
+
+        self.assertEqual(body["function"], "solo_work_lite")
+        self.assertEqual(body["tool_choice"], "read_file")
+        self.assertFalse(body["parallel_tool_calls"])
+        schema = body["tools"][0]["function"]["parameters"]
+        self.assertIsInstance(schema, str)
+        self.assertEqual(json.loads(schema)["required"], ["path"])
+
     def test_implicit_sessions_do_not_collide_on_same_prompt(self):
         first = trae_client.generate_session_id_from_messages(
             [{"role": "user", "content": "same"}]
@@ -1022,6 +1089,12 @@ class IdeRequestContextTests(unittest.TestCase):
             self.assertEqual(
                 trae_client._model_gateway_base("https://custom.example"),
                 "https://custom.example",
+            )
+            self.assertEqual(
+                trae_client._model_gateway_base(
+                    "https://trae-api-cn.mchost.guru/api/remote/v1"
+                ),
+                "https://trae-api-cn.mchost.guru",
             )
 
     def test_work_agent_body_carries_native_tools(self):

@@ -44,6 +44,7 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         routes = {
             "raw": "run_raw_chat",
             "ide": "run_ide_chat",
+            "solo": "run_ide_chat",
             "traework-native": "run_traework_native_chat",
         }
 
@@ -76,6 +77,11 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(called_options["tools"], TOOLS)
                 self.assertEqual(called_options["tool_choice"], "auto")
                 self.assertFalse(called_options["parallel_tool_calls"])
+                if mode == "solo":
+                    self.assertEqual(
+                        called_options["_ide_endpoint"],
+                        "/api/agent/v3/llm_utils_chat",
+                    )
                 remote.assert_not_awaited()
 
     async def test_explicit_ide_and_native_failures_fallback_to_remote(self):
@@ -138,7 +144,38 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ide.await_args.args[3]["tools"], TOOLS)
         self.assertEqual(trace["actual_endpoint"], "ide")
         self.assertTrue(trace["fallback_used"])
+        self.assertEqual(trace["fallback_target"], "ide")
+        self.assertIn("raw:", trace["fallback_reason"])
+        self.assertEqual(trace["failed_endpoint"], "raw")
         remote.assert_not_awaited()
+
+    async def test_cached_raw_app_config_skip_reports_fallback_diagnostic(self):
+        raw = AsyncMock(side_effect=AssertionError("cached raw path must be skipped"))
+        ide = AsyncMock(return_value={"route": "ide"})
+        remote = AsyncMock(side_effect=AssertionError("IDE path was available"))
+        trace = {}
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "raw"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "_raw_app_config_known_missing", return_value=True),
+            patch.object(main_module, "run_raw_chat", raw),
+            patch.object(main_module, "run_ide_chat", ide),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            result = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "glm-5.3",
+                False,
+                {**_request_options(), "_upstream_trace": trace},
+            )
+
+        self.assertEqual(result, {"route": "ide"})
+        raw.assert_not_awaited()
+        remote.assert_not_awaited()
+        self.assertTrue(trace["fallback_used"])
+        self.assertEqual(trace["fallback_target"], "ide")
+        self.assertEqual(trace["failed_endpoint"], "raw")
+        self.assertIn("app config record not found", trace["fallback_reason"])
 
     async def test_raw_falls_back_to_remote_after_ide_error(self):
         raw = AsyncMock(side_effect=RuntimeError("app config missing"))
@@ -185,6 +222,44 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trace["actual_endpoint"], "remote-work")
         self.assertFalse(trace["fallback_used"])
         ide.assert_not_awaited()
+
+    async def test_work_agent_fallback_switches_to_ordinary_remote_tier(self):
+        """A Work failure must not issue a second Work-tier request as fallback."""
+
+        work_failure = RuntimeError("work model unavailable")
+        remote = AsyncMock(return_value={"route": "remote"})
+        trace = {}
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "work-agent"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(
+                main_module,
+                "_run_remote_with_retry",
+                AsyncMock(side_effect=[work_failure, {"route": "remote"}]),
+            ) as dispatch_remote,
+        ):
+            result = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Use the workspace tool"}],
+                "auto",
+                False,
+                {**_request_options(), "_upstream_trace": trace},
+            )
+
+        self.assertEqual(result, {"route": "remote"})
+        self.assertEqual(dispatch_remote.await_count, 2)
+        work_options = dispatch_remote.await_args_list[0].args[3]
+        fallback_options = dispatch_remote.await_args_list[1].args[3]
+        self.assertEqual(work_options["_trae_mode"], "work")
+        self.assertEqual(work_options["_remote_agent_type"], "solo_work_remote")
+        self.assertNotIn("_trae_mode", fallback_options)
+        self.assertEqual(fallback_options["_remote_agent_type"], "solo_agent_remote")
+        self.assertEqual(fallback_options["_upstream_fallback_from"], "work-agent")
+        self.assertEqual(trace["requested_endpoint"], "work-agent")
+        self.assertEqual(trace["actual_endpoint"], "remote")
+        self.assertTrue(trace["fallback_used"])
+        self.assertEqual(trace["fallback_target"], "remote")
+        self.assertEqual(trace["failed_endpoint"], "work-agent")
+        self.assertIn("work-agent: work model unavailable", trace["fallback_reason"])
 
     async def test_tool_request_falls_back_without_dropping_tool_schema(self):
         selected = AsyncMock(side_effect=RuntimeError("ide unavailable"))

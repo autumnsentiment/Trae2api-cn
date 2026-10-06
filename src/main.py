@@ -11,7 +11,8 @@ main.py - Trae CN Relay 中转站
   UPSTREAM_MODE=raw  - 直连 Trae 原生 chat 协议（direct 为别名）
   UPSTREAM_MODE=remote/9router - 只用 9router 风格 remote 会话
   UPSTREAM_MODE=web  - 只用旧版 CN remote 会话（兼容保留）
-  UPSTREAM_MODE=ide  - 只用 trae2api 风格 /api/ide/v1/chat
+  UPSTREAM_MODE=ide  - 只用 IDE Agent /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=solo - 只用 Trae SOLO /api/agent/v3/llm_utils_chat
   UPSTREAM_MODE=traework-native - Windows helper 承载 TraeWork ai-agent.dll
 """
 
@@ -85,7 +86,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 API_KEYS = [k.strip() for k in os.environ.get("RELAY_API_KEYS", "").split(",") if k.strip()]
 UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "remote") or "remote").lower()
 _VALID_UPSTREAM_MODES = (
-    "remote", "raw", "direct", "auto", "web", "ide", "work-agent",
+    "remote", "raw", "direct", "auto", "web", "ide", "solo", "work-agent",
     "9router", "trae-remote", "cli", "traework-native",
     "native", "traework",
 )
@@ -110,14 +111,63 @@ def _restore_persisted_relay_settings() -> dict:
 
     global UPSTREAM_MODE, WEB_BASE
     settings = auth.get_settings() or {}
-    mode = str(settings.get("upstream_mode") or "").strip().lower()
+    # The IDE Raw/IDE Agent and Remote/Work Agent presets intentionally share
+    # base URLs.  ``endpoint_id`` is therefore the authoritative persisted
+    # identity when present; URL-only restoration is retained for stores
+    # written by older releases.
+    endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
+    endpoint = next(
+        (
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if str(item.get("id") or "").strip().lower() == endpoint_id
+        ),
+        None,
+    ) if endpoint_id else None
+    mode = str(
+        (endpoint or {}).get("mode")
+        or settings.get("upstream_mode")
+        or ""
+    ).strip().lower()
     if mode in _VALID_UPSTREAM_MODES:
         UPSTREAM_MODE = mode
         os.environ["UPSTREAM_MODE"] = mode
-    web_base = str(settings.get("web_base_url") or "").strip().rstrip("/")
+    web_base = str(
+        (endpoint or {}).get("base_url")
+        or settings.get("web_base_url")
+        or ""
+    ).strip().rstrip("/")
     if web_base:
         WEB_BASE = web_base
         os.environ["TRAE_WEB_BASE_URL"] = web_base
+    # Repair partially migrated stores once at startup.  This also makes the
+    # settings API/UI observe the same canonical mode and URL as dispatch.
+    if endpoint is not None and (
+        settings.get("upstream_mode") != endpoint["mode"]
+        or str(settings.get("web_base_url") or "").strip().rstrip("/")
+        != str(endpoint["base_url"]).rstrip("/")
+    ):
+        try:
+            auth.set_relay_settings(
+                web_base_url=str(endpoint["base_url"]),
+                upstream_mode=str(endpoint["mode"]),
+                endpoint_id=str(endpoint["id"]),
+            )
+            # ``auth.set_relay_settings`` persists the canonical values, but
+            # an older/custom store adapter may return a stale snapshot from
+            # ``get_settings`` immediately afterwards.  Return the same
+            # canonical state that was applied to the running process so the
+            # settings page cannot rehydrate the shared URL as Raw/Remote.
+            settings = dict(settings)
+            settings.update(
+                {
+                    "web_base_url": str(endpoint["base_url"]).rstrip("/"),
+                    "upstream_mode": str(endpoint["mode"]).strip().lower(),
+                    "endpoint_id": str(endpoint["id"]).strip().lower(),
+                }
+            )
+        except Exception:
+            logger.debug("could not repair persisted endpoint preset", exc_info=True)
     return settings
 
 FORWARD_USAGE = (os.environ.get("FORWARD_USAGE", "true") or "true").lower() == "true"
@@ -145,16 +195,21 @@ UPSTREAM_ENDPOINT_PRESETS = (
         "mode": "remote",
     },
     {
-        "id": "raw",
-        "label": "IDE Raw / llm_raw_chat",
-        "base_url": "https://trae-api-cn.mchost.guru",
-        "mode": "raw",
-    },
-    {
         "id": "ide",
         "label": "IDE Agent / llm_utils_chat",
         "base_url": "https://trae-api-cn.mchost.guru",
         "mode": "ide",
+    },
+    {
+        "id": "solo",
+        "label": "Solo / api/agent/v3/llm_utils_chat",
+        "base_url": "https://trae-api-cn.mchost.guru",
+        "endpoint_url": "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
+        "endpoint_path": "/api/agent/v3/llm_utils_chat",
+        # The Solo transport is implemented by the existing IDE client.  The
+        # distinct mode keeps the selected protocol visible and persistent
+        # while reusing its headers, SSE parser and fallback behavior.
+        "mode": "solo",
     },
     {
         "id": "agent",
@@ -265,6 +320,13 @@ _USAGE_STATS_FIELDS = (
     "cached_tokens",
     "total_tokens",
     "credits",
+    # Request capability metadata is aggregated separately from token
+    # accounting so the dashboard can answer "how many requests used Max or
+    # tools?" without scanning the capped request history.
+    "max_mode_requests",
+    "max_mode_enabled_requests",
+    "tool_requests",
+    "tool_calls",
 )
 _USAGE_STATS_MAX_DAYS = 400
 _PROCESS_STARTED_AT = time.time()
@@ -1146,7 +1208,7 @@ a { color: var(--accent); }
 .switch input:disabled + .track { opacity: .6; }
 .empty-state { padding: 28px 12px; text-align: center; color: var(--faint); font-size: 13px; border: 1px dashed var(--frame); border-radius: var(--radius); }
 .usage-records-container { max-height: calc(100vh - 220px); min-height: 160px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
-.usage-table { min-width: 1120px; table-layout: fixed; }
+.usage-table { min-width: 1280px; table-layout: fixed; }
 .usage-table th:nth-child(1) { width: 170px; }
 .usage-table th:nth-child(2) { width: 130px; }
 .usage-table th:nth-child(3) { width: 150px; }
@@ -1156,6 +1218,7 @@ a { color: var(--accent); }
 .usage-table th:nth-child(7) { width: 190px; }
 .usage-table th:nth-child(8) { width: 100px; }
 .usage-table th:nth-child(9) { width: 90px; }
+.usage-table th:nth-child(10) { width: 90px; }
 .usage-table td { overflow-wrap: anywhere; }
 .usage-table .usage-status { white-space: nowrap; }
 .usage-table .usage-meta { white-space: nowrap; }
@@ -1163,6 +1226,17 @@ a { color: var(--accent); }
 .usage-table .usage-meta.unknown { color: var(--faint); }
 .usage-table .usage-meta .usage-arrow { color: var(--faint); padding: 0 3px; }
 .usage-table .usage-meta .usage-sub { color: var(--muted); font-size: 11px; }
+.usage-model-cell { min-width: 0; }
+.usage-model-cell > div:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-model-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.usage-flag {
+  display: inline-flex; align-items: center; min-height: 18px; padding: 0 5px;
+  border-radius: 4px; border: 1px solid var(--line-strong); background: var(--surface-2);
+  color: var(--muted); font-size: 10px; line-height: 16px; white-space: nowrap;
+}
+.usage-flag.max { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.usage-flag.tool { color: var(--ok); border-color: var(--ok-line); background: var(--ok-soft); }
+.usage-flag.unknown { color: var(--faint); border-style: dashed; }
 .usage-empty { padding: 28px 12px; color: var(--faint); text-align: center; font-size: 13px; }
 .conn-wrap { margin-top: 14px; overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
 .conn-table { min-width: 640px; font-size: 12px; }
@@ -1201,6 +1275,7 @@ pre.code-out { margin-top: 12px; padding: 12px; background: var(--side-bg); colo
 .msg { margin-top: 12px; padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; display: none; line-height: 1.45; white-space: pre-wrap; }
 .msg-ok { background: var(--ok-soft); color: var(--ok); display: block; border: 1px solid var(--ok-line); }
 .msg-err { background: var(--danger-soft); color: var(--danger); display: block; border: 1px solid var(--danger-line); }
+.msg-pending { background: var(--warn-soft); color: var(--warn); display: block; border: 1px solid var(--warn-line); }
 .inline-msg { margin-top: 0; }
 .account-msgs .msg { margin-top: 10px; }
 .loading { margin-top: 12px; display: none; font-size: 13px; color: var(--muted); }
@@ -1399,6 +1474,7 @@ def _web_login_html() -> str:
             <th>模型</th>
             <th>思考强度</th>
             <th>上下文模式</th>
+            <th>Max 模式</th>
             <th>Tool 参数</th>
             <th class="numeric">Tokens（入 / 出 / 总）</th>
             <th class="numeric">消耗积分</th>
@@ -1470,7 +1546,7 @@ def _web_login_html() -> str:
           <td class="muted-cell">{expires}</td>
           <td class="numeric"><span id="general-credits-{aid}" class="credit-value">{credits_text}</span></td>
           <td><span id="checkin-{aid}" class="checkin-state">{checkin_badge}</span><small id="checkin-detail-{aid}" class="row-subtitle"></small></td>
-          <td class="model-toggle-cell"><div id="model-state-wrap-{aid}" class="model-toggle-state">{model_badge}</div><label class="switch account-model-switch" title="仅控制模型请求，不影响签到"><input type="checkbox" data-action="model-toggle" onchange="toggleAccountModel('{aid}', this)" aria-label="启用账号模型请求"{model_checked}><span class="track"></span></label></td>
+          <td class="model-toggle-cell"><div id="model-state-wrap-{aid}" class="model-toggle-state">{model_badge}</div><label class="switch account-model-switch" title="仅控制模型请求，不影响签到"><input type="checkbox" data-action="model-toggle" onchange="markAccountModelDirty('{aid}', this)" aria-label="启用账号模型请求"{model_checked}><span class="track"></span></label></td>
           <td class="row-actions">
             <button class="icon-btn" data-action="checkin" onclick="checkinAccount('{aid}')" title="签到" aria-label="签到">{ic['calendar-check']}</button>
             <button class="icon-btn" data-action="switch-account" onclick="switchAccount('{aid}')" title="切换为当前账号" aria-label="切换为当前账号"{switch_disabled}>{ic['arrow-left-right']}</button>
@@ -1503,13 +1579,21 @@ def _web_login_html() -> str:
 
     settings_web = (settings.get("web_base_url") or WEB_BASE).rstrip("/")
     settings_port = settings.get("relay_port") or os.environ.get("RELAY_PORT") or PORT
-    # Remote/Work Agent and IDE Raw/IDE Agent intentionally share upstream
-    # base URLs.  Select by mode as well as URL; URL-only matching silently
-    # turns IDE Agent into the first matching IDE Raw option after a reload.
+    # Remote/Work Agent and IDE Agent intentionally share upstream base URLs.
+    # Select by mode as well as URL; URL-only matching can otherwise render a
+    # different protocol after a reload.  IDE Raw is deliberately absent from
+    # the public preset list because personal accounts consistently receive
+    # ``2001 failed to get app config: record not found``; the raw transport
+    # remains available only for internal protocol diagnostics.
+    selected_endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
     selected_mode = str(
         settings.get("upstream_mode") or _current_upstream_mode() or ""
     ).strip().lower()
     selected_mode = {
+        # Legacy values are kept readable in the settings store, but the
+        # public UI no longer exposes the unsupported personal-account Raw
+        # preset.  A stale raw selection is shown as custom until the user
+        # explicitly chooses a supported endpoint.
         "direct": "raw",
         "auto": "raw",
         "9router": "remote",
@@ -1521,10 +1605,23 @@ def _web_login_html() -> str:
         for item in UPSTREAM_ENDPOINT_PRESETS
         if settings_web == str(item["base_url"]).rstrip("/")
     ]
+    # Prefer the persisted preset identity.  Raw/IDE Agent and Remote/Work
+    # Agent deliberately share URLs, so selecting by URL or by the first
+    # matching mode can silently render the wrong option after a reload.
     matched_endpoint = next(
-        (item for item in url_matches if item["mode"] == selected_mode),
+        (
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if str(item.get("id") or "").strip().lower() == selected_endpoint_id
+            and settings_web == str(item.get("base_url") or "").rstrip("/")
+        ),
         None,
     )
+    if matched_endpoint is None:
+        matched_endpoint = next(
+            (item for item in url_matches if item["mode"] == selected_mode),
+            None,
+        )
     if matched_endpoint is None and len(url_matches) == 1:
         matched_endpoint = url_matches[0]
     # Custom URLs that aren't in the preset list still appear as saved options.
@@ -1543,7 +1640,12 @@ def _web_login_html() -> str:
     endpoint_options_html = "".join(endpoint_options)
     endpoint_map_json = json.dumps(
         {
-            item["id"]: {"base_url": item["base_url"], "mode": item["mode"]}
+            item["id"]: {
+                "base_url": item["base_url"],
+                "mode": item["mode"],
+                "endpoint_url": item.get("endpoint_url") or item["base_url"],
+                "endpoint_path": item.get("endpoint_path") or "",
+            }
             for item in UPSTREAM_ENDPOINT_PRESETS
         },
         ensure_ascii=False,
@@ -1674,7 +1776,7 @@ def _web_login_html() -> str:
   </div>
   <div class="day-wrap">
     <table class="day-table">
-      <thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>缓存</th><th>总计</th><th>积分</th></tr></thead>
+      <thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>缓存</th><th>总计</th><th>Max 请求/生效</th><th>Tool 请求/调用</th><th>积分</th></tr></thead>
       <tbody id="ov-days-body"></tbody>
       <tfoot><tr id="ov-days-foot"></tr></tfoot>
     </table>
@@ -1699,6 +1801,7 @@ def _web_login_html() -> str:
       <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">{ic['refresh-cw']}查询签到状态</button>
       <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">{ic['coins']}查询全部积分</button>
       <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">{ic['calendar-check']}一键轮询签到</button>
+      <button class="btn btn-secondary btn-sm" id="account-model-save-btn" onclick="saveAccountModelSettings()" disabled>{ic['save']}保存模型开关</button>
     </div>
   </div>
   {accounts_html}
@@ -1761,15 +1864,15 @@ def _web_login_html() -> str:
   <div class="switch-row">
     <div class="switch-text"><strong>定时签到</strong><span>每天按设定时间依次签到所有账号，已签到账号自动跳过</span></div>
     <label class="switch" title="启用定时签到">
-      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked} aria-label="启用定时签到"><span class="track"></span>
+      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked} onchange="markAutoCheckinDirty()" aria-label="启用定时签到"><span class="track"></span>
     </label>
   </div>
   <div class="schedule-row">
     <label class="time-field" for="auto-checkin-time">每天（北京时间）
-      <input class="control" type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required>
+      <input class="control" type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required oninput="markAutoCheckinDirty()">
     </label>
     <div class="toolbar">
-      <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()">{ic['save']}保存</button>
+      <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()" disabled>{ic['save']}保存</button>
       <button class="btn btn-secondary btn-sm" id="auto-checkin-run-btn" onclick="runAutoCheckinNow()" title="立即按顺序签到所有未签到账号，已签到账号自动跳过">{ic['play']}立即执行</button>
     </div>
   </div>
@@ -1801,17 +1904,21 @@ def _web_login_html() -> str:
   <div class="switch-row">
     <div class="switch-text"><strong>启用轮询</strong><span>每次请求自动切换到下一个有效账号</span></div>
     <label class="switch" title="启用轮询">
-      <input type="checkbox" id="poll-toggle" {poll_checked} onchange="togglePolling()" aria-label="启用轮询"><span class="track"></span>
+      <input type="checkbox" id="poll-toggle" {poll_checked} onchange="markPollingDirty()" aria-label="启用轮询"><span class="track"></span>
     </label>
   </div>
   <div class="switch-row">
     <div class="switch-text"><strong>轮询模式</strong></div>
     <div class="segmented" role="radiogroup" aria-label="轮询模式">
-      <label><input type="radio" name="poll-mode" value="round-robin" onchange="togglePolling()" {poll_mode_rr}><span>顺序轮询</span></label>
-      <label><input type="radio" name="poll-mode" value="credit-priority" onchange="togglePolling()" {poll_mode_cp}><span>积分优先</span></label>
+      <label><input type="radio" name="poll-mode" value="round-robin" onchange="markPollingDirty()" {poll_mode_rr}><span>顺序轮询</span></label>
+      <label><input type="radio" name="poll-mode" value="credit-priority" onchange="markPollingDirty()" {poll_mode_cp}><span>积分优先</span></label>
     </div>
   </div>
   <p id="poll-status" class="field-note">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="poll-save-btn" onclick="savePollingSettings()" disabled>{ic['save']}保存轮询设置</button>
+  </div>
+  <div id="poll-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
 <div class="panel-card">
   <div class="section-head"><div class="section-title">上游端点</div></div>
@@ -1824,11 +1931,11 @@ def _web_login_html() -> str:
   <div class="form-row">
     <div class="form-group">
       <label for="settings-web">自定义 Web Base URL</label>
-      <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1">
+    <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1" oninput="markEndpointDirty()">
     </div>
   </div>
   <div class="btn-group">
-    <button class="btn btn-primary btn-sm" onclick="saveSettings()">{ic['save']}保存设置</button>
+    <button class="btn btn-primary btn-sm" id="settings-save-btn" onclick="saveSettings()" disabled>{ic['save']}保存设置</button>
   </div>
   <div id="settings-msg" class="msg"></div>
 </div>
@@ -1836,11 +1943,11 @@ def _web_login_html() -> str:
   <div class="section-head"><div class="section-title">Relay 服务</div></div>
   <div class="form-group">
     <label for="settings-port">宿主机映射端口（RELAY_PORT）</label>
-    <input id="settings-port" type="number" value="{settings_port}" placeholder="8000" min="1" max="65535">
+      <input id="settings-port" type="number" value="{settings_port}" placeholder="8000" min="1" max="65535" oninput="markRelayServiceDirty()">
   </div>
   <p class="field-note">这是 Docker 对外发布的宿主机端口，容器内监听端口仍由 PORT 控制。修改后必须同步调整端口映射并重启，否则管理页面和 API 可能无法访问。</p>
   <div class="btn-group">
-    <button class="btn btn-secondary btn-sm" onclick="saveRelayServiceSettings()">{ic['save']}保存服务设置</button>
+      <button class="btn btn-secondary btn-sm" id="relay-service-save-btn" onclick="saveRelayServiceSettings()" disabled>{ic['save']}保存服务设置</button>
   </div>
   <div id="relay-service-msg" class="msg"></div>
 </div>
@@ -1852,8 +1959,11 @@ def _web_login_html() -> str:
   <div class="switch-row">
     <div class="switch-text"><strong>启用自动路由</strong><span>工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
     <label class="switch" title="启用自动路由">
-      <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="saveAutoRoute()" aria-label="启用自动路由"><span class="track"></span>
+      <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="markAutoRouteDirty()" aria-label="启用自动路由"><span class="track"></span>
     </label>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="auto-route-save-btn" onclick="saveAutoRoute()" disabled>{ic['save']}保存自动路由</button>
   </div>
   <div id="auto-route-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
@@ -1865,15 +1975,15 @@ def _web_login_html() -> str:
   <div class="switch-row">
     <div class="switch-text"><strong>启用 Max 模式</strong><span>Remote Agent 会话使用 1M 上下文；带调用端工具的请求走 Work，不使用 Max</span></div>
     <label class="switch" title="启用 Max 模式">
-      <input type="checkbox" id="max-mode-toggle" {max_checked} aria-label="启用 Max 模式"><span class="track"></span>
+      <input type="checkbox" id="max-mode-toggle" {max_checked} onchange="markMaxModeDirty()" aria-label="启用 Max 模式"><span class="track"></span>
     </label>
   </div>
   <div class="form-group">
     <label for="max-mode-models">生效模型（逗号分隔，留空表示账号中所有支持 Max 的模型）</label>
-    <input id="max-mode-models" value="{max_models}" placeholder="glm-5.3, deepseek-v4-pro">
+    <input id="max-mode-models" value="{max_models}" placeholder="glm-5.3, deepseek-v4-pro" oninput="markMaxModeDirty()">
   </div>
   <div class="btn-group">
-    <button class="btn btn-primary btn-sm" onclick="saveMaxMode()">{ic['save']}保存</button>
+    <button class="btn btn-primary btn-sm" id="max-mode-save-btn" onclick="saveMaxMode()" disabled>{ic['save']}保存</button>
     <button class="btn btn-secondary btn-sm" id="max-mode-detect-btn" onclick="detectMaxModels()">{ic['search']}检测支持的模型</button>
   </div>
   <div id="max-mode-models-out" class="max-models" hidden></div>
@@ -1896,11 +2006,11 @@ def _web_login_html() -> str:
     </div>
     <div class="form-group">
       <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
-      <select id="conn-endpoint">
+    <select id="conn-endpoint">
         <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
         <option value="remote">Remote / chat_sessions</option>
-        <option value="raw">IDE Raw / llm_raw_chat</option>
         <option value="ide">IDE Agent / llm_utils_chat</option>
+        <option value="solo">Solo / api/agent/v3/llm_utils_chat</option>
         <option value="work-agent">Work Agent / solo_work_remote</option>
       </select>
     </div>
@@ -2157,6 +2267,10 @@ function usageContextMeta(record){{
   if(value===null && boolMax===true) value='max';
   if(value===null && size>=1000000) value='1m';
   if(value===null && boolMax===false) value='standard';
+  // Older rows often persisted only the requested context.  Treat an
+  // explicit standard request as the visible context label while preserving
+  // the separate Max column for actual activation evidence.
+  if(value===null && requested!==null) value=requested;
   if(value===null) return {{text:'--',title:'未记录上下文模式'+(requested!==null?'；请求: '+String(requested):''),unknown:true}};
   var text=String(value).trim().toLowerCase().replace(/[\s_-]+/g,'');
   var label;
@@ -2169,22 +2283,54 @@ function usageContextMeta(record){{
   }}
   return {{text:label,title:requestedText+'实际上下文模式: '+String(value)+(size?'；窗口: '+size.toLocaleString()+' tokens':''),unknown:false}};
 }}
+function usageMaxMeta(record){{
+  var requested=usageBoolean(usageRecordField(record,['max_mode_requested','requested_max_mode']));
+  var enabled=usageBoolean(usageRecordField(record,['max_mode_enabled','max_mode_applied','max_mode']));
+  if(requested===null){{
+    var requestedContext=usageRecordField(record,['context_mode_requested','requested_context_mode']);
+    if(requestedContext!==null){{
+      var normalized=String(requestedContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      requested=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(normalized)>=0;
+    }}
+  }}
+  if(enabled===null){{
+    var actualContext=usageRecordField(record,['context_mode_actual','actual_context_mode','context_mode']);
+    if(actualContext!==null){{
+      var actual=String(actualContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      enabled=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(actual)>=0;
+    }}
+  }}
+  if(enabled===null && requested===false) enabled=false;
+  if(enabled===true) return {{text:'已开启',title:'本次请求实际启用 1M Max',unknown:false,requested:requested,enabled:true}};
+  if(enabled===false && requested===true) return {{text:'未生效',title:'请求开启 Max，但上游本次未实际启用',unknown:false,requested:requested,enabled:false}};
+  if(enabled===false) return {{text:'未开启',title:'本次请求未启用 1M Max',unknown:false,requested:requested,enabled:false}};
+  if(requested===true) return {{text:'请求 / 未知',title:'请求开启 Max，但没有上游实际生效证据',unknown:true,requested:requested,enabled:null}};
+  return {{text:'--',title:'未记录 Max 模式',unknown:true,requested:requested,enabled:enabled}};
+}}
 function usageToolMeta(record){{
   var requested=usageBoolean(usageRecordField(record,['tools_requested','tool_protocol_requested']));
-  var used=usageBoolean(usageRecordField(record,['tool_used','tool_calls_returned','tool_call_returned']));
+  var used=usageBoolean(usageRecordField(record,['tool_called','tool_used','tool_calls_returned','tool_call_returned','tool']));
   if(requested===null && used===true) requested=true;
   if(requested===null && record && Array.isArray(record.tools)) requested=record.tools.length>0;
   if(requested===null && record && record.tools!==undefined) requested=!!record.tools;
   if(requested===null && record && record.tool_choice!==undefined && record.tool_choice!=='none') requested=true;
   var state=requested;
-  if(state===null) return {{text:'--',title:'未记录是否携带 tools 参数',unknown:true}};
+  if(state===null) return {{text:'--',title:'未记录是否携带 tools 参数',unknown:true,requested:null,called:used}};
   var title=state?'请求携带 tools 参数':'请求未携带 tools 参数';
   if(used===true) title+='；模型返回了工具调用';
   else if(used===false) title+='；模型未返回工具调用';
   var text=state?'已携带':'未携带';
   if(state && used===true) text+=' / 本轮调用';
   else if(state && used===false) text+=' / 未调用';
-  return {{text:text,title:title,unknown:false}};
+  return {{text:text,title:title,unknown:false,requested:state,called:used}};
+}}
+function usageModelFlags(maxMode,tool){{
+  var maxText=maxMode.enabled===true?'1M':(maxMode.enabled===false?'标准':(maxMode.requested===true?'请求':'--'));
+  var maxClass=maxMode.enabled===true?' max':(maxMode.unknown?' unknown':'');
+  var toolText=tool.requested===true?'是':(tool.requested===false?'否':'--');
+  var toolClass=tool.requested===true?' tool':(tool.unknown?' unknown':'');
+  return '<span class="usage-flag'+maxClass+'" title="'+escapeHtml(maxMode.title)+'">Max: '+maxText+'</span>'
+    + '<span class="usage-flag'+toolClass+'" title="'+escapeHtml(tool.title)+'">Tool: '+toolText+'</span>';
 }}
 async function refreshUsage() {{
   if(usageRefreshing) return;
@@ -2210,6 +2356,7 @@ async function refreshUsage() {{
         var model=record.model||'--';
          var reasoning=usageReasoningMeta(record);
          var context=usageContextMeta(record);
+         var maxMode=usageMaxMeta(record);
          var tool=usageToolMeta(record);
         var input=Number(record.input_tokens!==undefined?record.input_tokens:(record.prompt_tokens||0));
         var output=Number(record.output_tokens!==undefined?record.output_tokens:(record.completion_tokens||0));
@@ -2224,9 +2371,10 @@ async function refreshUsage() {{
         return '<tr>'
           + '<td>'+escapeHtml(when)+'</td>'
           + '<td><code>'+escapeHtml(account)+'</code></td>'
-          + '<td>'+escapeHtml(model)+'</td>'
+          + '<td class="usage-model-cell"><div title="'+escapeHtml(model)+'">'+escapeHtml(model)+'</div><div class="usage-model-flags">'+usageModelFlags(maxMode,tool)+'</div></td>'
           + '<td class="usage-meta'+(reasoning.unknown?' unknown':'')+'" title="'+escapeHtml(reasoning.title)+'">'+reasoning.text+'</td>'
           + '<td class="usage-meta'+(context.unknown?' unknown':'')+'" title="'+escapeHtml(context.title)+'">'+escapeHtml(context.text)+'</td>'
+          + '<td class="usage-meta'+(maxMode.unknown?' unknown':'')+'" title="'+escapeHtml(maxMode.title)+'">'+escapeHtml(maxMode.text)+'</td>'
           + '<td class="usage-meta usage-tool'+(tool.unknown?' unknown':'')+'" title="'+escapeHtml(tool.title)+'">'+escapeHtml(tool.text)+'</td>'
           + '<td class="numeric">'+escapeHtml(tokenText)+'</td>'
           + '<td class="numeric" title="'+escapeHtml(source)+'">'+escapeHtml(creditText)+'</td>'
@@ -2369,7 +2517,7 @@ function renderOverviewDays(){{
   var hide=document.getElementById('ov-hide-empty');
   var today=ovData.usage.today.date;
   var rows=ovData.usage.daily.slice(0,ovRange);
-  var sum={{requests:0,failed:0,input_tokens:0,output_tokens:0,cached_tokens:0,total_tokens:0,credits:0}};
+  var sum={{requests:0,failed:0,input_tokens:0,output_tokens:0,cached_tokens:0,total_tokens:0,max_mode_requests:0,max_mode_enabled_requests:0,tool_requests:0,tool_calls:0,credits:0}};
   rows.forEach(function(r){{ for(var k in sum) sum[k]+=Number(r[k]||0); }});
   var shown=rows.filter(function(r){{ return !(hide&&hide.checked&&!r.requests); }});
   body.innerHTML=shown.length?shown.map(function(r){{
@@ -2383,13 +2531,17 @@ function renderOverviewDays(){{
       +'<td>'+fmtInt(r.output_tokens)+'</td>'
       +'<td>'+fmtInt(r.cached_tokens)+'</td>'
       +'<td>'+fmtInt(r.total_tokens)+'</td>'
+      +'<td>'+fmtInt(r.max_mode_requests||0)+' / '+fmtInt(r.max_mode_enabled_requests||0)+'</td>'
+      +'<td>'+fmtInt(r.tool_requests||0)+' / '+fmtInt(r.tool_calls||0)+'</td>'
       +'<td>'+Number(r.credits||0).toFixed(2)+'</td>'
       +'</tr>';
-  }}).join(''):'<tr class="zero"><td colspan="8">所选范围内没有请求</td></tr>';
+  }}).join(''):'<tr class="zero"><td colspan="10">所选范围内没有请求</td></tr>';
   foot.innerHTML='<td>合计 '+ovRange+' 天</td>'
     +'<td>'+fmtInt(sum.requests)+'</td><td>'+fmtInt(sum.failed)+'</td>'
     +'<td>'+fmtInt(sum.input_tokens)+'</td><td>'+fmtInt(sum.output_tokens)+'</td>'
     +'<td>'+fmtInt(sum.cached_tokens)+'</td><td>'+fmtInt(sum.total_tokens)+'</td>'
+    +'<td>'+fmtInt(sum.max_mode_requests)+' / '+fmtInt(sum.max_mode_enabled_requests)+'</td>'
+    +'<td>'+fmtInt(sum.tool_requests)+' / '+fmtInt(sum.tool_calls)+'</td>'
     +'<td>'+sum.credits.toFixed(2)+'</td>';
   var active=rows.filter(function(r){{ return r.requests; }}).length;
   setOv('ov-days-meta',active+' / '+ovRange+' 天有请求');
@@ -2481,6 +2633,30 @@ function showMsg(id,text,ok,timeout){{
   var delay=timeout===undefined?(ok?3000:9000):timeout;
   if(delay>0) messageTimers[id]=setTimeout(function(){{ el.textContent=''; el.className='msg'; }},delay);
   showToast(ok?'成功':'操作失败',text,ok,delay);
+}}
+function endpointDiagnosticText(data){{
+  if(!data||(!data.fallback_used&&!data.fallback_reason&&!data.failed_endpoint)) return '';
+  var requested=String(data.requested_endpoint||data.requested_mode||'').trim();
+  var actual=String(data.actual_endpoint||data.actual_mode||'').trim();
+  var target=String(data.fallback_target||actual||'').trim();
+  var failed=String(data.failed_endpoint||requested||'').trim();
+  var reason=String(data.fallback_reason||'').trim();
+  var parts=[];
+  if(failed) parts.push('失败端点='+failed);
+  if(target) parts.push('回落目标='+target);
+  if(reason) parts.push('原因='+reason);
+  return parts.join(' | ');
+}}
+function showEndpointDiagnostic(data,title){{
+  var text=endpointDiagnosticText(data);
+  if(!text) return '';
+  showToast(
+    title||'端点诊断',
+    text,
+    !data.fallback_used&&!data.fallback_reason,
+    9000
+  );
+  return text;
 }}
 function escapeHtml(value){{
   return String(value===undefined||value===null?'':value).replace(/[&<>"']/g,function(ch){{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]; }});
@@ -2703,7 +2879,7 @@ async function runConnTest(){{
       jobs.push({{model: model, mode: mode, row: tr}});
     }});
   }});
-  var passed = 0, done = 0;
+  var passed = 0, done = 0, endpointWarnings = [];
   summary.textContent = '0/' + jobs.length + ' 完成';
   for(var i = 0; i < jobs.length; i++){{
     var job = jobs[i];
@@ -2715,12 +2891,16 @@ async function runConnTest(){{
     try{{
       var d = await postJSON('/api/model-test',
         {{model: job.model, mode: job.mode, timeout: timeout, endpoint: endpoint,
-          reasoning_effort: effort, thinking: thinking, max_mode: maxMode}}, (timeout + 20) * 1000);
+          reasoning_effort: effort, thinking: thinking, max_mode: maxMode,
+          // This page compares one endpoint at a time.  Do not hide a native
+          // endpoint failure behind the API runtime's production fallback.
+          disable_fallback: true}}, (timeout + 20) * 1000);
       timeCell.textContent = (d.elapsed_ms !== undefined ? d.elapsed_ms + ' ms' : '-');
       if(d.success){{
         passed++;
         statusCell.textContent = '通过';
         statusCell.className = 'conn-status ok';
+        var endpointDiagnostic=endpointDiagnosticText(d);
         if(job.mode === 'tool'){{
           var names = (d.tool_calls || []).map(function(c){{ return c.name; }}).join(', ');
           detailCell.textContent = (d.auto_route ? 'auto -> ' : '') + 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
@@ -2731,6 +2911,8 @@ async function runConnTest(){{
             + (d.fallback_used ? ' (fallback)' : '') + ' | ' + JSON.stringify(d.reply || '')
             + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
         }}
+        if(endpointDiagnostic) detailCell.textContent += ' | ' + endpointDiagnostic;
+        if(endpointDiagnostic) endpointWarnings.push(endpointDiagnostic);
         var extra = [];
         if(d.requested_reasoning_effort){{
           extra.push('强度=' + d.requested_reasoning_effort + ' -> '
@@ -2752,7 +2934,10 @@ async function runConnTest(){{
       }} else {{
         statusCell.textContent = '失败';
         statusCell.className = 'conn-status fail';
-        detailCell.textContent = String(d.error || 'unknown');
+        var endpointDiagnostic=endpointDiagnosticText(d);
+        detailCell.textContent = String(d.error || 'unknown')
+          + (endpointDiagnostic ? ' | ' + endpointDiagnostic : '');
+        if(endpointDiagnostic) endpointWarnings.push(endpointDiagnostic);
       }}
     }}catch(e){{
       statusCell.textContent = '失败';
@@ -2766,6 +2951,8 @@ async function runConnTest(){{
   btn.disabled = false;
   var allOk = passed === jobs.length;
   showMsg('conn-msg', '测试结束：' + passed + '/' + jobs.length + ' 通过', allOk);
+  if(endpointWarnings.length) showToast('端点回落/失败诊断',
+    endpointWarnings.slice(0,3).join('\\n'),false,12000);
 }}
 async function refreshModels(){{
   var el=document.getElementById('models-out');
@@ -2799,48 +2986,185 @@ async function switchAccount(id){{
     showMsg('account-msg','已切换到账号 '+String((d.account&&(d.account.label||d.account.user_id))||id),true,3000);
   }}finally{{ setSwitchBusy(false); }}
 }}
-async function toggleAccountModel(id,input){{
+var accountModelDraft={{}};
+function setAccountModelVisual(id,enabled){{
+  var row=document.getElementById('row-'+id);
+  var input=row&&row.querySelector('input[data-action="model-toggle"]');
+  if(input) input.checked=!!enabled;
+  var state=document.getElementById('model-state-wrap-'+id);
+  if(state){{
+    state.innerHTML='<span class="badge '+(enabled?'badge-ok':'badge-none')+'">'+(enabled?'已开启':'已关闭')+'</span>';
+  }}
+}}
+function updateAccountModelSaveButton(){{
+  var btn=document.getElementById('account-model-save-btn');
+  if(btn) btn.disabled=Object.keys(accountModelDraft).length===0;
+}}
+function toggleAccountModel(id,input){{
   if(!input) return;
+  var row=document.getElementById('row-'+id);
+  var baseline=row&&row.getAttribute('data-model-enabled')==='1';
   var wanted=!!input.checked;
-  input.disabled=true;
+  if(wanted===baseline) delete accountModelDraft[String(id)];
+  else accountModelDraft[String(id)]=wanted;
+  setAccountModelVisual(id,wanted);
+  updateAccountModelSaveButton();
+  showMsg('account-msg',Object.keys(accountModelDraft).length
+    ? '账号模型开关已修改，请点击“保存模型开关”后生效'
+    : '',true,4000);
+}}
+function markAccountModelDirty(id,input){{
+  // Account model switches are drafts; the toolbar Save button performs the
+  // actual writes in one batch so changing a switch never changes the server.
+  toggleAccountModel(id,input);
+}}
+async function saveAccountModelSettings(){{
+  var ids=Object.keys(accountModelDraft);
+  if(!ids.length) return;
+  var btn=document.getElementById('account-model-save-btn');
+  if(btn) btn.disabled=true;
+  var failed=[];
   try{{
-    var d=await postJSON('/api/accounts/model-enabled',{{account_id:id,enabled:wanted}},30000);
-    if(!d.success){{
-      input.checked=!wanted;
-      showMsg('account-msg',d.error||'模型请求开关保存失败',false);
-      return;
+    for(var i=0;i<ids.length;i++){{
+      var id=ids[i], wanted=!!accountModelDraft[id];
+      var d=await postJSON('/api/accounts/model-enabled',{{account_id:id,enabled:wanted}},30000);
+      if(!d.success){{ failed.push(id); continue; }}
+      setAccountModelVisual(id,!!d.model_enabled);
+      var savedRow=document.getElementById('row-'+id);
+      if(savedRow) savedRow.setAttribute('data-model-enabled',!!d.model_enabled?'1':'0');
+      delete accountModelDraft[id];
     }}
-    var enabled=!!d.model_enabled;
-    input.checked=enabled;
-    var row=document.getElementById('row-'+id);
-    if(row) row.setAttribute('data-model-enabled',enabled?'1':'0');
-    var state=document.getElementById('model-state-'+id);
-    if(state){{
-      state.textContent=enabled?'已开启':'已关闭';
-      state.className='badge '+(enabled?'badge-ok':'badge-none');
-    }}
-    showMsg('account-msg',enabled?'账号模型请求已开启':'账号模型请求已关闭，每日签到不受影响',true,3000);
-  }}finally{{ input.disabled=false; }}
+    if(failed.length){{
+      failed.forEach(function(id){{
+        var row=document.getElementById('row-'+id);
+        setAccountModelVisual(id,row&&row.getAttribute('data-model-enabled')==='1');
+      }});
+      showMsg('account-msg','部分账号保存失败：'+failed.join(', '),false,8000);
+    }}else showMsg('account-msg','账号模型请求开关已保存，每日签到不受影响',true,4000);
+  }}finally{{
+    updateAccountModelSaveButton();
+  }}
 }}
 async function removeAccount(id){{
   if(!confirm('确定删除该账号？')) return;
   var d=await postJSON('/api/accounts/remove',{{account_id:id}});
   if(d.success) location.reload(); else showMsg('auth-msg',d.error||'删除失败',false);
 }}
-async function togglePolling(){{
-  var on=document.getElementById('poll-toggle').checked;
+function markPollingDirty(){{
+  var btn=document.getElementById('poll-save-btn');
+  if(btn) btn.disabled=false;
+  showMsg('poll-msg','轮询设置已修改，点击“保存轮询设置”后生效',true,0);
+}}
+async function savePollingSettings(){{
+  var on=!!document.getElementById('poll-toggle').checked;
   var mode=document.querySelector('input[name=poll-mode]:checked');
   var modeVal=mode?mode.value:'round-robin';
   var d=await postJSON('/api/polling',{{enabled:on,mode:modeVal}});
-  if(d.success) location.reload();
-  else showMsg('auth-msg',d.error||'操作失败',false);
+  if(d.success){{
+    var btn=document.getElementById('poll-save-btn'); if(btn) btn.disabled=true;
+    var status=document.getElementById('poll-status');
+    var countMatch=status&&status.textContent.match(/当前账号数:\\s*(\\d+)/);
+    var accountCount=countMatch?countMatch[1]:'0';
+    if(status) status.textContent='当前账号数: '+(d.account_count||accountCount)+'，轮询: '+(d.enabled?'开':'关')+'（'+(d.mode||modeVal)+'）';
+    showMsg('poll-msg','轮询设置已保存',true,3000);
+  }}else showMsg('poll-msg',d.error||'保存失败',false);
+}}
+// Kept as a compatibility wrapper for older inline callers; changing a
+// setting must never persist it implicitly.
+function togglePolling(){{ markPollingDirty(); }}
+// Endpoint changes stay in the browser draft until the explicit Save button.
+// Serialize explicit writes so a slower, older request cannot finish after a
+// newer save and overwrite the current selection.
+let endpointSaveSerial=0;
+let endpointSaveQueue=Promise.resolve();
+let endpointLastGoodState=null;
+let endpointDirty=false;
+function markEndpointDirty(){{
+  endpointDirty=true;
+  var btn=document.getElementById('settings-save-btn'); if(btn) btn.disabled=false;
+  var msg=document.getElementById('settings-msg');
+  if(msg){{ msg.textContent='端点设置已修改，点击“保存设置”后生效'; msg.className='msg msg-pending'; }}
+}}
+function readEndpointSelection(){{
+  var selector=document.getElementById('settings-endpoint-preset');
+  var input=document.getElementById('settings-web');
+  var preset=selector?selector.value:'';
+  var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+  var entry=map[preset]||null;
+  return {{
+    preset:preset,
+    endpoint_id:(entry&&preset)?preset:'',
+    web_base_url:input?(input.value||'').trim():'',
+    upstream_mode:entry?entry.mode:''
+  }};
+}}
+function restoreEndpointSelection(state){{
+  state=state||{{}};
+  var selector=document.getElementById('settings-endpoint-preset');
+  var input=document.getElementById('settings-web');
+  var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+  var endpointId=String(state.endpoint_id||'').toLowerCase();
+  if(selector){{
+    if(endpointId&&map[endpointId]) selector.value=endpointId;
+    else if(state.preset==='__saved') selector.value='__saved';
+    else selector.value='';
+  }}
+  if(input&&state.web_base_url!==undefined&&state.web_base_url!==null){{
+    input.value=String(state.web_base_url);
+  }}
 }}
 async function saveSettings(){{
-  var web=document.getElementById('settings-web').value.trim();
-  var mode=(typeof ENDPOINT_PRESET_MAP !== 'undefined' && ENDPOINT_PRESET_MAP[document.getElementById('settings-endpoint-preset')?.value || '']) ? ENDPOINT_PRESET_MAP[document.getElementById('settings-endpoint-preset').value].mode : '';
-  var d=await postJSON('/api/settings',{{web_base_url:web,upstream_mode:mode}});
-  if(d.success){{ showMsg('settings-msg',d.note||'设置已保存',true); setTimeout(function(){{ location.reload(); }},800); }}
-  else showMsg('settings-msg',d.error||'保存失败',false);
+  var serial=++endpointSaveSerial;
+  var state=readEndpointSelection();
+  var payload={{
+    web_base_url:state.web_base_url,
+    upstream_mode:state.upstream_mode,
+    endpoint_id:state.endpoint_id
+  }};
+  var task=endpointSaveQueue.then(async function(){{
+    var d=await postJSON('/api/settings',payload);
+    // A newer selection happened while this request was in flight.  The
+    // queued newer write owns the UI.
+    if(serial!==endpointSaveSerial) return d;
+    if(d&&d.success){{
+      var canonical=(d.settings&&typeof d.settings==='object')?d.settings:{{}};
+      var canonicalId=String(canonical.endpoint_id||state.endpoint_id||'').toLowerCase();
+      var canonicalUrl=canonical.web_base_url;
+      var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+      if(canonicalId&&map[canonicalId]) canonicalUrl=map[canonicalId].base_url;
+      restoreEndpointSelection({{
+        preset:canonicalId?canonicalId:state.preset,
+        endpoint_id:canonicalId,
+        web_base_url:(canonicalUrl===undefined||canonicalUrl===null)?state.web_base_url:canonicalUrl
+      }});
+      endpointLastGoodState=readEndpointSelection();
+      endpointDirty=false;
+      var saveButton=document.getElementById('settings-save-btn'); if(saveButton) saveButton.disabled=true;
+      var endpointDiagnostic=endpointDiagnosticText(d);
+      showMsg('settings-msg',(d.note||'设置已保存')
+        + (endpointDiagnostic ? '\\n'+endpointDiagnostic : ''),true);
+      if(endpointDiagnostic) showEndpointDiagnostic(d,'端点设置');
+    }}else{{
+      restoreEndpointSelection(endpointLastGoodState||state);
+      var endpointDiagnostic=endpointDiagnosticText(d);
+      showMsg('settings-msg',((d&&d.error)||'保存失败')
+        + (endpointDiagnostic ? '\\n'+endpointDiagnostic : ''),false);
+      if(endpointDiagnostic) showEndpointDiagnostic(d,'端点设置失败');
+    }}
+    return d;
+  }}).catch(function(error){{
+    if(serial===endpointSaveSerial){{
+      restoreEndpointSelection(endpointLastGoodState||state);
+      endpointDirty=false;
+      var saveButton=document.getElementById('settings-save-btn'); if(saveButton) saveButton.disabled=true;
+      showMsg('settings-msg',String(error||'保存失败'),false);
+    }}
+    return {{success:false,error:String(error||'保存失败')}};
+  }});
+  // Keep the queue alive after a failed request, while still returning this
+  // request's result to the caller that initiated the save.
+  endpointSaveQueue=task.catch(function(){{}});
+  return task;
 }}
 async function saveRelayServiceSettings(){{
   var input=document.getElementById('settings-port');
@@ -2852,20 +3176,38 @@ async function saveRelayServiceSettings(){{
   }}
   var d=await postJSON('/api/settings',{{relay_port:value}});
   if(d.success){{
+    var saveButton=document.getElementById('relay-service-save-btn');
+    if(saveButton) saveButton.disabled=true;
     showMsg('relay-service-msg',d.note||'服务设置已保存，重启容器后生效',true,6000);
   }}else showMsg('relay-service-msg',d.error||'保存失败',false);
+}}
+function markRelayServiceDirty(){{
+  var button=document.getElementById('relay-service-save-btn');
+  if(button) button.disabled=false;
+  showMsg('relay-service-msg','服务设置已修改，点击“保存服务设置”后生效',true,0);
+}}
+function markAutoRouteDirty(){{
+  var button=document.getElementById('auto-route-save-btn');
+  if(button) button.disabled=false;
+  showMsg('auto-route-msg','自动路由设置已修改，点击“保存自动路由”后生效',true,0);
 }}
 async function saveAutoRoute(){{
   var toggle=document.getElementById('auto-route-toggle');
   var d=await postJSON('/api/auto-route',{{enabled:toggle.checked}});
   if(d.success){{
     toggle.checked=!!d.enabled;
+    var button=document.getElementById('auto-route-save-btn');
+    if(button) button.disabled=true;
     setStatePill('auto-route-state',d.enabled?'已开启':'已关闭',d.enabled);
     showMsg('auto-route-msg',d.enabled?'自动路由已开启，下一个请求生效':'自动路由已关闭，使用预设端点',true,3000);
   }} else {{
-    toggle.checked=!toggle.checked;
     showMsg('auto-route-msg',d.error||'保存失败',false);
   }}
+}}
+function markMaxModeDirty(){{
+  var button=document.getElementById('max-mode-save-btn');
+  if(button) button.disabled=false;
+  showMsg('max-mode-msg','Max 模式设置已修改，点击“保存”后生效',true,0);
 }}
 async function saveMaxMode(){{
   var enabled=document.getElementById('max-mode-toggle').checked;
@@ -2874,6 +3216,8 @@ async function saveMaxMode(){{
   if(d.success){{
     document.getElementById('max-mode-toggle').checked=!!d.enabled;
     document.getElementById('max-mode-models').value=d.models||'';
+    var button=document.getElementById('max-mode-save-btn');
+    if(button) button.disabled=true;
     setStatePill('max-mode-state',d.enabled?'已开启':'已关闭',d.enabled);
     showMsg('max-mode-msg',d.enabled?'Max 模式已开启，新会话生效':'Max 模式已关闭',true,3000);
   }} else showMsg('max-mode-msg',d.error||'保存失败',false);
@@ -2886,8 +3230,11 @@ function addMaxModel(name){{
   var input=document.getElementById('max-mode-models');
   var items=input.value.split(',').map(function(s){{ return s.trim(); }}).filter(Boolean);
   var lower=items.map(function(s){{ return s.toLowerCase(); }});
-  if(lower.indexOf(name.toLowerCase())<0) items.push(name);
-  input.value=items.join(', ');
+  if(lower.indexOf(name.toLowerCase())<0){{
+    items.push(name);
+    input.value=items.join(', ');
+    markMaxModeDirty();
+  }}
 }}
 async function detectMaxModels(){{
   var btn=document.getElementById('max-mode-detect-btn');
@@ -2914,7 +3261,8 @@ async function detectMaxModels(){{
   finally{{ btn.disabled=false; }}
 }}
 const ENDPOINT_PRESET_MAP = {endpoint_map_json};
-async function applyEndpointPreset(){{
+endpointLastGoodState=readEndpointSelection();
+function applyEndpointPreset(){{
   var selector=document.getElementById('settings-endpoint-preset');
   var input=document.getElementById('settings-web');
   if(!selector||!input) return;
@@ -2922,12 +3270,9 @@ async function applyEndpointPreset(){{
   var entry=map[selector.value]||null;
   var value=entry?entry.base_url:'';
   if(value) input.value=value;
-  // Custom saved URL just selects, doesn't need save.
-  if (selector.value === '__saved') return;
-  // Auto-save on preset change (unless switching to custom).
-  if (selector.value) {{
-    await saveSettings();
-  }}
+  // Selecting a preset only updates the draft URL.  The explicit Save button
+  // is the sole path that persists endpoint settings.
+  markEndpointDirty();
 }}
 async function checkinRefreshAll(){{
   setBusy(true);
@@ -3009,12 +3354,23 @@ function formatCheckinTime(iso){{
   var m=String(iso).match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})T(\\d{{2}}):(\\d{{2}})/);
   return m ? (m[2]+'-'+m[3]+' '+m[4]+':'+m[5]) : String(iso);
 }}
+let autoCheckinDirty=false;
+function markAutoCheckinDirty(){{
+  autoCheckinDirty=true;
+  var button=document.getElementById('auto-checkin-save-btn');
+  if(button) button.disabled=false;
+  showMsg('auto-checkin-msg','自动签到设置已修改，点击“保存”后生效',true,0);
+}}
 function renderAutoCheckin(d){{
   if(!d||!d.success) return;
   var toggle=document.getElementById('auto-checkin-toggle');
   var timeInput=document.getElementById('auto-checkin-time');
-  if(toggle) toggle.checked=!!d.enabled;
-  if(timeInput&&d.time) timeInput.value=d.time;
+  // A background status refresh must not overwrite edits that have not been
+  // saved yet.  It may still update the read-only execution status below.
+  if(!autoCheckinDirty){{
+    if(toggle) toggle.checked=!!d.enabled;
+    if(timeInput&&d.time) timeInput.value=d.time;
+  }}
   setStatePill('auto-checkin-state',d.running?'正在执行...':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭'),d.enabled||d.running);
   document.getElementById('auto-checkin-next').textContent=d.enabled?formatCheckinTime(d.next_run):'未启用';
   document.getElementById('auto-checkin-last').textContent=d.last_run_at
@@ -3038,6 +3394,9 @@ async function saveAutoCheckin(){{
   if(!/^\\d{{2}}:\\d{{2}}$/.test(timeValue||'')){{ showMsg('auto-checkin-msg','请填写有效的签到时间（HH:MM）',false); return; }}
   var d=await postJSON('/api/auto-checkin',{{enabled:toggle.checked,time:timeValue}});
   if(d.success){{
+    autoCheckinDirty=false;
+    var button=document.getElementById('auto-checkin-save-btn');
+    if(button) button.disabled=true;
     renderAutoCheckin(d);
     showMsg('auto-checkin-msg',d.enabled?('已开启，每天 '+d.time+' 自动签到所有账号'):'自动签到已关闭',true,3000);
   }} else showMsg('auto-checkin-msg',d.error||'保存失败',false);
@@ -3227,6 +3586,7 @@ async def _deferred_dispatch_stream(
             "direct",
             "auto",
             "ide",
+            "solo",
             "work-agent",
             "traework-native",
             "native",
@@ -3275,6 +3635,13 @@ async def _deferred_dispatch_stream(
         if not fallback_allowed or fallback_attempted:
             return None
         fallback_attempted = True
+        trace = options.get("_upstream_trace")
+        _trace_append_failure(trace, requested_mode, reason)
+        if isinstance(trace, dict):
+            trace.update(
+                fallback_used=True,
+                fallback_target="remote",
+            )
         fallback_options = _remote_fallback_options(options, requested_mode)
         logger.warning(
             "stream endpoint failed before output; falling back to remote "
@@ -3305,12 +3672,12 @@ async def _deferred_dispatch_stream(
             response = fallback
             await close_current()
             return None
-        trace = options.get("_upstream_trace")
         if isinstance(trace, dict):
             trace.update(
                 actual_mode="remote",
                 actual_endpoint="remote",
                 fallback_used=True,
+                fallback_target="remote",
             )
         return fallback
 
@@ -3844,6 +4211,9 @@ def _bind_chat_session(
                 "9router",
                 "trae-remote",
                 "auto",
+                "ide",
+                "solo",
+                "work-agent",
             ):
                 auth.next_polling_account()
             # Read the selected id and its credential record as one snapshot.
@@ -4195,6 +4565,31 @@ def _optional_bool(value: Any) -> bool | None:
     return None
 
 
+def _context_mode_bool(value: Any) -> bool | None:
+    """Map known context labels to a Max-enabled boolean.
+
+    Unknown labels stay ``None`` instead of being guessed as standard.  This
+    matters when normalizing old records written by a custom adapter.
+    """
+
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "")
+    if normalized in {"max", "max_1m", "max1m", "1m", "1000000", "agent_max", "max_mode"}:
+        return True
+    if normalized in {
+        "standard",
+        "default",
+        "work",
+        "dev",
+        "200k",
+        "200000",
+        "normal",
+    }:
+        return False
+    return None
+
+
 def _option_flag(value: Any) -> bool:
     """Return a strict truth value for request flags."""
 
@@ -4218,11 +4613,14 @@ def _tools_requested_from_options(options: Optional[Mapping[str, Any]]) -> bool:
     """
 
     options = options or {}
-    if _tool_catalog_has_entries(options.get("tools")):
-        return True
+    # An explicit catalog, including ``tools=[]``, owns this turn.  Do not
+    # revive a previous Responses catalog from ``_inherited_tools`` when the
+    # caller intentionally supplied an empty tools array.
+    if "tools" in options:
+        return _tool_catalog_has_entries(options.get("tools"))
     if _tool_catalog_has_entries(options.get("_inherited_tools")):
         return True
-    if "tools" not in options and "_inherited_tools" not in options:
+    if "_inherited_tools" not in options:
         if _option_flag(options.get("_tool_protocol_requested")):
             return True
     choice = options.get("tool_choice")
@@ -4283,6 +4681,12 @@ def _context_mode_metadata(
         if applied_max is True
         else "standard"
         if applied_max is False
+        # A request that explicitly/defaults to standard has no separate
+        # upstream max acknowledgement to wait for.  Keep ordinary requests
+        # useful in the console while preserving "unknown" for a requested
+        # Max turn whose upstream trace never confirmed the mode.
+        else "standard"
+        if not requested_max
         else None
     )
     window = _number_value(trace.get("max_context_tokens"))
@@ -4749,9 +5153,12 @@ class _UsageTracker:
             context_mode_actual=self.context_mode_actual,
             context_window_tokens=self.context_window_tokens,
             max_mode_applied=self.max_mode_applied,
+            max_mode_requested=self.context_mode_requested == "max_1m",
+            max_mode_enabled=self.max_mode_applied,
             tools_requested=self.tools_requested,
             tool_used=self.tool_used,
             tool_calls_returned=self.tool_calls_returned,
+            tool_called=self.tool_used,
         )
         if explicit_credits is not None:
             try:
@@ -5985,8 +6392,8 @@ def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
     if not effort or trace.get("reasoning_effort_applied"):
         return None
     mode = str(trace.get("actual_mode") or trace.get("actual_endpoint") or "")
-    if mode == "ide":
-        # llm_utils_chat is the IDE utility route (titles/prompt tools); the
+    if mode in {"ide", "solo"}:
+        # llm_utils_chat is the IDE/Solo utility route (titles/prompt tools); the
         # real IDE sends strength only via the ai-agent task, so the field is
         # ignored here.
         return "llm_utils_chat 端点不接受强度字段"
@@ -6551,15 +6958,49 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         record.get("context_mode_actual")
         or record.get("actual_context_mode")
     )
-    max_applied = _optional_bool(
-        record.get("max_mode_applied")
-        if "max_mode_applied" in record
-        else record.get("max_mode")
-    )
+    # Older rows recorded the requested standard profile but did not persist
+    # an explicit actual/max result.  Standard is deterministic in that case:
+    # expose it as an actual non-Max request instead of rendering ``--`` in
+    # the console.  Unknown/custom profiles remain unknown.
+    requested_context_bool = _context_mode_bool(requested_context)
+    if context_mode in (None, "") and requested_context_bool is False:
+        context_mode = "standard"
+    if actual_context_mode in (None, "") and requested_context_bool is False:
+        actual_context_mode = "standard"
+    max_applied = _optional_bool(record.get("max_mode_applied"))
+    if max_applied is None:
+        max_applied = _optional_bool(record.get("max_mode_enabled"))
+    if max_applied is None:
+        max_applied = _optional_bool(record.get("max_mode"))
     if context_mode in (None, "") and max_applied is not None:
         context_mode = "max_1m" if max_applied else "standard"
+    if context_mode in (None, "") and actual_context_mode not in (None, ""):
+        context_mode = actual_context_mode
     if actual_context_mode in (None, "") and max_applied is not None:
         actual_context_mode = "max_1m" if max_applied else "standard"
+    if actual_context_mode in (None, "") and context_mode not in (None, ""):
+        actual_context_mode = context_mode
+    # Keep explicit boolean metadata alongside the human-readable context
+    # fields.  The booleans are easier for API clients and daily aggregation
+    # to consume, while the legacy fields remain available for old consoles.
+    max_mode_requested = _optional_bool(
+        record.get("max_mode_requested")
+        if "max_mode_requested" in record
+        else None
+    )
+    if max_mode_requested is None and requested_context not in (None, ""):
+        max_mode_requested = _context_mode_bool(requested_context)
+    if max_mode_requested is None and "max_mode" in record:
+        max_mode_requested = _optional_bool(record.get("max_mode"))
+    max_mode_enabled = _optional_bool(
+        record.get("max_mode_enabled")
+        if "max_mode_enabled" in record
+        else None
+    )
+    if max_mode_enabled is None:
+        max_mode_enabled = max_applied
+    if max_mode_enabled is None and actual_context_mode not in (None, ""):
+        max_mode_enabled = _context_mode_bool(actual_context_mode)
     tool_used = _optional_bool(record.get("tool_used"))
     tools_requested = _optional_bool(
         record.get("tools_requested")
@@ -6571,6 +7012,16 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         if "tool_calls_returned" in record
         else record.get("tool_call_returned")
     )
+    tool_called = _optional_bool(
+        record.get("tool_called") if "tool_called" in record else None
+    )
+    if tool_called is None:
+        # ``tool_used`` is the canonical actual-result marker in v1.0.2;
+        # ``tool_calls_returned`` is retained for compatibility with rows
+        # written by the stream parser.
+        tool_called = tool_used
+    if tool_called is None:
+        tool_called = tool_calls_returned
     context_window_tokens = _number_value(
         record.get("context_window_tokens")
         or record.get("max_context_tokens")
@@ -6647,9 +7098,18 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             ),
             "context_window_tokens": context_window_tokens,
             "max_mode_applied": max_applied,
+            "max_mode_requested": max_mode_requested,
+            "max_mode_enabled": max_mode_enabled,
+            # Stable aliases for API clients and older frontends.  The
+            # canonical fields above retain the requested-vs-actual
+            # distinction; these aliases represent the actual observed
+            # capability when it is known.
+            "max_mode": max_mode_enabled,
             "tools_requested": tools_requested,
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
+            "tool_called": tool_called,
+            "tool": tool_called,
         }
     )
     return normalized
@@ -6718,6 +7178,18 @@ def _usage_contribution(record: Mapping[str, Any]) -> dict[str, Any]:
         "cached_tokens": int(record.get("cached_tokens") or 0),
         "total_tokens": int(record.get("total_tokens") or 0),
         "credits": float(credits or 0),
+        "max_mode_requests": 1
+        if _optional_bool(record.get("max_mode_requested")) is True
+        else 0,
+        "max_mode_enabled_requests": 1
+        if _optional_bool(record.get("max_mode_enabled")) is True
+        else 0,
+        "tool_requests": 1
+        if _optional_bool(record.get("tools_requested")) is True
+        else 0,
+        "tool_calls": 1
+        if _optional_bool(record.get("tool_called")) is True
+        else 0,
     }
 
 
@@ -6868,9 +7340,12 @@ def _record_usage(
     context_mode_actual: str | None = None,
     context_window_tokens: int | float | None = None,
     max_mode_applied: bool | None = None,
+    max_mode_requested: bool | None = None,
+    max_mode_enabled: bool | None = None,
     tools_requested: bool | None = None,
     tool_used: bool | None = None,
     tool_calls_returned: bool | None = None,
+    tool_called: bool | None = None,
 ) -> dict[str, Any]:
     """Record one API request (newest first) and persist it independently."""
     global _USAGE_HISTORY
@@ -6899,9 +7374,12 @@ def _record_usage(
             "context_mode_actual": context_mode_actual,
             "context_window_tokens": context_window_tokens,
             "max_mode_applied": max_mode_applied,
+            "max_mode_requested": max_mode_requested,
+            "max_mode_enabled": max_mode_enabled,
             "tools_requested": tools_requested,
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
+            "tool_called": tool_called,
         }
     )
     with _USAGE_LOCK:
@@ -6953,20 +7431,31 @@ def _remote_fallback_options(
     fallback = dict(options or {})
     fallback["_upstream_mode"] = "remote"
     fallback["_upstream_fallback_from"] = requested_mode
-    fallback_agent_type = (
-        "solo_work_remote"
-        if requested_mode in {
-            "work-agent",
-            "traework-native",
-            "native",
-            "traework",
-        }
-        else "solo_agent_remote"
-    )
-    if not (
+    # ``work-agent`` is a selectable Work tier, but its fallback must be the
+    # ordinary Remote/Agent tier.  Carrying ``solo_work_remote`` (or
+    # ``_trae_mode=work``) here only changes the log label while issuing a
+    # second Work request, which is why the UI appeared to "fall back to
+    # Remote" without ever leaving Work.  Native TraeWork compatibility modes
+    # retain their historical Work-tier fallback because they are separate
+    # helper transports.
+    if requested_mode == "work-agent":
+        fallback.pop("_trae_mode", None)
+        fallback.pop("_remote_agent_type", None)
+        fallback.pop("remote_agent_type", None)
+        fallback["_remote_agent_type"] = "solo_agent_remote"
+    elif not (
         fallback.get("_remote_agent_type")
         or fallback.get("remote_agent_type")
     ):
+        fallback_agent_type = (
+            "solo_work_remote"
+            if requested_mode in {
+                "traework-native",
+                "native",
+                "traework",
+            }
+            else "solo_agent_remote"
+        )
         fallback["_remote_agent_type"] = fallback_agent_type
     fallback.setdefault("_session_variant", f"{requested_mode}-fallback")
     return fallback
@@ -7078,6 +7567,33 @@ def _apply_auto_route(
     return options
 
 
+def _trace_failure_reason(endpoint: str, error: Any) -> str:
+    """Return a bounded, readable endpoint failure diagnostic."""
+
+    detail = str(error or "upstream request failed").strip().replace("\r", " ").replace("\n", " ")
+    if len(detail) > 400:
+        detail = detail[:397] + "..."
+    return f"{endpoint}: {detail}" if endpoint else detail
+
+
+def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
+    """Append one endpoint failure to the request trace without duplication."""
+
+    if not isinstance(trace, dict):
+        return
+    item = _trace_failure_reason(endpoint, error)
+    previous = str(trace.get("fallback_reason") or "").strip()
+    parts = [part.strip() for part in previous.split(";") if part.strip()]
+    if item not in parts:
+        parts.append(item)
+    trace["fallback_reason"] = "; ".join(parts)[:1200]
+    if endpoint:
+        failed = [part.strip() for part in str(trace.get("failed_endpoint") or "").split(",") if part.strip()]
+        if endpoint not in failed:
+            failed.append(endpoint)
+        trace["failed_endpoint"] = ",".join(failed)
+
+
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
     options = _apply_auto_route(messages, options)
     try:
@@ -7089,14 +7605,31 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         return _openai_error(503, str(exc), "model_account_unavailable")
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
     trace = options.get("_upstream_trace")
+    fallback_from = str(options.get("_upstream_fallback_from") or "").strip().lower()
     if isinstance(trace, dict):
-        trace.update(
-            requested_mode=active_mode,
-            requested_endpoint=active_mode,
-            actual_mode="",
-            actual_endpoint="",
-            fallback_used=False,
-        )
+        if fallback_from:
+            # A streaming/native fallback re-enters this dispatcher with the
+            # same trace object. Preserve the original requested endpoint and
+            # reason while updating the current target.
+            trace.setdefault("requested_mode", fallback_from)
+            trace.setdefault("requested_endpoint", fallback_from)
+            trace.update(
+                actual_mode="",
+                actual_endpoint="",
+                fallback_used=True,
+                fallback_target=active_mode,
+            )
+        else:
+            trace.update(
+                requested_mode=active_mode,
+                requested_endpoint=active_mode,
+                actual_mode="",
+                actual_endpoint="",
+                fallback_used=False,
+                fallback_reason="",
+                fallback_target="",
+                failed_endpoint="",
+            )
     logger.info(
         "dispatch start model=%s stream=%s messages=%d last_role=%s last_chars=%d "
         "tools=%s session=%s",
@@ -7173,6 +7706,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         "direct",
         "auto",
         "ide",
+        "solo",
     ):
         logger.info(
             "dispatch remote-only model id=%s model=%s account=%s",
@@ -7186,9 +7720,16 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     actual_mode="remote",
                     actual_endpoint="remote",
                     fallback_used=True,
+                    fallback_target="remote",
+                )
+                _trace_append_failure(
+                    trace,
+                    active_mode,
+                    "model is configured for the Remote executor",
                 )
             return await _run_remote_with_retry(messages, model, stream, options)
         except ModelProviderMismatch as exc:
+            _trace_append_failure(trace, "remote", exc)
             logger.error(
                 "remote provider model mismatch id=%s requested=%s error=%s",
                 str(options.get("_relay_request_id") or ""),
@@ -7201,6 +7742,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     # native llm_utils_chat endpoint. Legacy modes remain explicit opt-ins for
     # diagnostics, but they are never silent fallbacks for API traffic.
     errors = []
+    fallback_reasons: list[str] = []
     modes = []
     if active_mode == "cli":
         modes = ["cli"]
@@ -7210,8 +7752,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         modes = ["remote"]
     elif active_mode == "web":
         modes = ["web"]
-    elif active_mode == "ide":
-        modes = ["ide"]
+    elif active_mode in ("ide", "solo"):
+        modes = [active_mode]
     elif active_mode == "work-agent":
         modes = ["work-agent"]
     elif active_mode in ("traework-native", "native", "traework"):
@@ -7231,6 +7773,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         "direct",
         "auto",
         "ide",
+        "solo",
         "work-agent",
         "traework-native",
         "native",
@@ -7240,13 +7783,20 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         modes.append("ide")
     if fallback_enabled and active_mode in fallback_modes and "remote" not in modes:
         modes.append("remote")
+    route_initial_mode = modes[0] if modes else active_mode
+    raw_skipped = False
     if (
         fallback_enabled
         and modes[:1] == ["raw"]
         and len(modes) > 1
         and _raw_app_config_known_missing(model, options)
     ):
-        errors.append("raw: skipped (app config record not found, cached)")
+        skip_detail = "skipped (app config record not found, cached)"
+        skip_reason = f"raw: {skip_detail}"
+        errors.append(skip_reason)
+        fallback_reasons.append(skip_reason)
+        _trace_append_failure(trace, "raw", skip_detail)
+        raw_skipped = True
         modes = modes[1:]
 
     logger.info(
@@ -7260,14 +7810,26 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     for mode in modes:
         try:
             if isinstance(trace, dict):
+                route_fallback = (
+                    bool(fallback_from)
+                    or bool(fallback_reasons)
+                    or raw_skipped
+                    or mode != route_initial_mode
+                )
                 trace.update(
                     actual_mode=mode,
                     actual_endpoint=mode,
-                    fallback_used=mode != modes[0],
+                    fallback_used=route_fallback,
                 )
+                if route_fallback:
+                    trace["fallback_target"] = (
+                        "remote-work" if mode == "work-agent" else mode
+                    )
+                    if fallback_reasons:
+                        trace["fallback_reason"] = "; ".join(fallback_reasons)[:1200]
                 trace.pop("reasoning_effort_applied", None)
                 trace.pop("max_context_tokens", None)
-                if mode in {"raw", "ide", "cli", "traework-native", "web"}:
+                if mode in {"raw", "ide", "solo", "cli", "traework-native", "web"}:
                     trace["max_mode_applied"] = False
                 else:
                     trace.pop("max_mode_applied", None)
@@ -7277,11 +7839,20 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"raw returned {error}")
+                if isinstance(trace, dict) and (fallback_reasons or raw_skipped):
+                    trace["fallback_target"] = "raw"
                 return result
             # Web and remote routes must receive the lease-bound credential;
             # otherwise a concurrent account switch can make the upstream bill
             # one token while the usage tracker records another.
-            if mode not in ("remote", "web", "ide", "work-agent", "traework-native"):
+            if mode not in (
+                "remote",
+                "web",
+                "ide",
+                "solo",
+                "work-agent",
+                "traework-native",
+            ):
                 mode_options.pop("_auth_token", None)
                 mode_options.pop("_account_id", None)
             if mode == "cli":
@@ -7328,7 +7899,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 if error:
                     raise RuntimeError(f"traework-native returned {error}")
                 return result
-            if mode == "ide":
+            if mode in ("ide", "solo"):
                 mode_options["_ide_endpoint"] = "/api/agent/v3/llm_utils_chat"
             result = await run_ide_chat(messages, model, stream, mode_options)
             if getattr(result, "status_code", 200) >= 400:
@@ -7345,6 +7916,9 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
+            reason = _trace_failure_reason(mode, e)
+            fallback_reasons.append(reason)
+            _trace_append_failure(trace, mode, e)
             if isinstance(e, _ModelAccountUnavailable):
                 return _openai_error(503, str(e), "model_account_unavailable")
             if isinstance(e, EmptyUpstreamResponse):
@@ -9462,10 +10036,69 @@ async def api_settings(request: Request):
         return JSONResponse({"success": False, "error": "JSON body must be an object"}, status_code=400)
     web_base_url = body.get("web_base_url") or ""
     upstream_mode = body.get("upstream_mode") or ""
+    endpoint_id = body.get("endpoint_id")
+    # Older clients only know URL/mode and do not send the newer preset
+    # identity.  Keep ``None`` for a port-only update, where the existing
+    # endpoint must remain untouched; endpoint-field updates are migrated below.
+    endpoint_fields_present = (
+        "web_base_url" in body or "upstream_mode" in body or "endpoint_id" in body
+    )
+    legacy_endpoint_update = endpoint_id is None and endpoint_fields_present
     if not isinstance(web_base_url, str) or not isinstance(upstream_mode, str):
         return JSONResponse({"success": False, "error": "URL and mode must be strings"}, status_code=400)
+    if endpoint_id is not None and not isinstance(endpoint_id, str):
+        return JSONResponse({"success": False, "error": "endpoint_id must be a string"}, status_code=400)
     web_base_url = web_base_url.strip().rstrip("/")
     upstream_mode = upstream_mode.strip().lower()
+    endpoint_id = endpoint_id.strip().lower() if isinstance(endpoint_id, str) else None
+    if endpoint_id:
+        endpoint = next(
+            (
+                item
+                for item in UPSTREAM_ENDPOINT_PRESETS
+                if str(item.get("id") or "").strip().lower() == endpoint_id
+            ),
+            None,
+        )
+        if endpoint is None:
+            return JSONResponse(
+                {"success": False, "error": f"Unsupported endpoint preset: {endpoint_id}"},
+                status_code=400,
+            )
+        # The preset id is authoritative.  This prevents a stale client URL or
+        # mode field from turning Work Agent into Remote (or IDE Agent into Raw).
+        if not web_base_url:
+            web_base_url = str(endpoint["base_url"]).rstrip("/")
+        if not upstream_mode:
+            upstream_mode = str(endpoint["mode"]).strip().lower()
+        if web_base_url != str(endpoint["base_url"]).rstrip("/") or upstream_mode != str(endpoint["mode"]).strip().lower():
+            return JSONResponse(
+                {"success": False, "error": "endpoint_id does not match URL/mode"},
+                status_code=400,
+            )
+    elif legacy_endpoint_update and (web_base_url or upstream_mode):
+        # Older clients only sent URL/mode.  Migrate those updates to the
+        # unique preset when possible, and clear a stale shared-URL identity
+        # when the update is custom or ambiguous.  Without this step a prior
+        # ``raw``/``remote`` id can survive a legacy update and overwrite the
+        # newly selected mode after the next restart.
+        matches = [
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if (
+                not web_base_url
+                or web_base_url == str(item.get("base_url") or "").rstrip("/")
+            )
+            and (
+                not upstream_mode
+                or upstream_mode == str(item.get("mode") or "").strip().lower()
+            )
+        ]
+        endpoint_id = (
+            str(matches[0].get("id") or "").strip().lower()
+            if len(matches) == 1
+            else ""
+        )
     relay_port = body.get("relay_port", body.get("port", 0))
     port_requested = "relay_port" in body or "port" in body
     if upstream_mode and upstream_mode not in _VALID_UPSTREAM_MODES:
@@ -9483,9 +10116,19 @@ async def api_settings(request: Request):
         relay_port = int(relay_port)
         if not 1 <= relay_port <= 65535:
             return JSONResponse({"success": False, "error": "relay_port must be between 1 and 65535"}, status_code=400)
-    if not web_base_url and not relay_port and not upstream_mode:
+    if not web_base_url and not relay_port and not upstream_mode and endpoint_id is None:
         return JSONResponse({"success": False, "error": "nothing to update"}, status_code=400)
-    auth.set_relay_settings(web_base_url=web_base_url, port=relay_port, upstream_mode=upstream_mode)
+    relay_settings = {
+        "web_base_url": web_base_url,
+        "port": relay_port,
+        "upstream_mode": upstream_mode,
+    }
+    # Keep the new keyword out of port-only calls for compatibility with
+    # older store adapters.  Passing ``None`` is semantically equivalent in
+    # the current adapter, but legacy wrappers may treat it as an overwrite.
+    if endpoint_id is not None:
+        relay_settings["endpoint_id"] = endpoint_id
+    auth.set_relay_settings(**relay_settings)
     if upstream_mode:
         # Synchronise the running module so _current_upstream_mode() reflects
         # the new preset immediately without a container restart.
@@ -9497,7 +10140,13 @@ async def api_settings(request: Request):
         if relay_port
         else "上游端点设置已保存"
     )
-    return JSONResponse({"success": True, "note": note})
+    return JSONResponse(
+        {
+            "success": True,
+            "note": note,
+            "settings": auth.get_settings(),
+        }
+    )
 
 
 def _truthy(value: Any) -> bool:

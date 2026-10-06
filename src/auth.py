@@ -1317,12 +1317,22 @@ def get_settings() -> dict:
         return {
             'web_base_url': _settings.get('web_base_url', ''),
             'upstream_mode': _settings.get('upstream_mode', ''),
+            # ``web_base_url`` is shared by the IDE Raw/IDE Agent pair and by
+            # Remote/Work Agent.  Keep the selected preset id separately so a
+            # restart cannot reconstruct the first URL match and silently
+            # switch the endpoint tier.
+            'endpoint_id': _settings.get('endpoint_id', ''),
             'relay_port': _settings.get('relay_port', 0),
             'poll_enabled': _poll_enabled,
         }
 
 
-def set_relay_settings(web_base_url: str = '', port: int = 0, upstream_mode: str = '') -> None:
+def set_relay_settings(
+    web_base_url: str = '',
+    port: int = 0,
+    upstream_mode: str = '',
+    endpoint_id: str | None = None,
+) -> None:
     with _STORE_LOCK:
         if web_base_url:
             _settings['web_base_url'] = web_base_url
@@ -1331,6 +1341,12 @@ def set_relay_settings(web_base_url: str = '', port: int = 0, upstream_mode: str
         if upstream_mode:
             _settings['upstream_mode'] = upstream_mode
             os.environ['UPSTREAM_MODE'] = upstream_mode
+        # ``None`` means this is a partial update (for example the relay port
+        # form) and the existing preset identity must be retained.  An empty
+        # string explicitly selects the custom URL entry and clears a stale
+        # preset id.
+        if endpoint_id is not None:
+            _settings['endpoint_id'] = str(endpoint_id).strip()
         if port and port > 0:
             _settings['relay_port'] = port
         _save_accounts()

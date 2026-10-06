@@ -11,6 +11,10 @@
 - 更新实时模型列表，规范化小写模型名并去重。
 - IDE Agent 保留原生工具定义、调用 ID 和结果关联；修复工具增量拼装、空响应回退边界及流式取消时的会话资源回收。
 - 新增 GitHub Actions 发布流水线：自动测试、源码包与 SHA256 校验文件，以及 linux/amd64、linux/arm64 的 GHCR 镜像。
+- 根据 Issue #8 的实测结论，IDE Raw 不再作为正式控制台/模型测试预设发布。
+  个人账号调用 `/api/ide/v2/llm_raw_chat` 会固定返回
+  `2001 failed to get app config: record not found`；该路径需要企业版
+  app config/PAT。内部 `UPSTREAM_MODE=raw` 与 `raw_client.py` 仍保留用于协议诊断。
 
 ## 直接拉取镜像
 
@@ -26,6 +30,6 @@ docker compose -f docker-compose.image.yml up -d
 ## 使用注意
 
 - 模型输出工具调用后，必须由调用端执行并回传工具结果。Relay 不会访问调用端的本地文件系统。
-- 个人账号的 IDE Raw 可能返回 `app config record not found`；可选择 IDE Agent / Remote 或打开自动路由。
+- 个人账号的 IDE Raw 可能返回 `2001 app config record not found`；正式控制台已移除该预设，请选择 IDE Agent / Solo / Remote 或打开自动路由。
 - 端口映射变化需重新创建容器，单纯 `docker restart` 不会改变 Docker 映射。
 - 仅建议内网部署；源码包不包含 `.env`、账号数据、诊断文件或备份。

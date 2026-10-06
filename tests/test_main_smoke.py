@@ -1597,7 +1597,7 @@ class UsageRecordTests(unittest.TestCase):
 
     def test_usage_records_render_request_mode_metadata(self):
         html = main_module._web_login_html()
-        for heading in ("思考强度", "上下文模式", "Tool 参数"):
+        for heading in ("思考强度", "上下文模式", "Max 模式", "Tool 参数"):
             with self.subTest(heading=heading):
                 self.assertIn(f"<th>{heading}</th>", html)
         # The browser keeps older records readable while accepting the
@@ -1606,6 +1606,9 @@ class UsageRecordTests(unittest.TestCase):
             "reasoning_effort",
             "context_mode",
             "tool_used",
+            "tool_called",
+            "max_mode_requested",
+            "max_mode_enabled",
             "requested_reasoning_effort",
             "reasoning_effort_applied",
             "未记录上下文模式",
@@ -1615,7 +1618,18 @@ class UsageRecordTests(unittest.TestCase):
                 self.assertIn(field, html)
         self.assertIn("usageReasoningMeta", html)
         self.assertIn("usageContextMeta", html)
+        self.assertIn("usageMaxMeta", html)
         self.assertIn("usageToolMeta", html)
+        self.assertIn("usageModelFlags", html)
+        self.assertIn("usage-model-flags", html)
+        self.assertIn("Max: '+maxText", html)
+        self.assertIn("Tool: '+toolText", html)
+        # Old rows with only a requested standard context remain visibly
+        # classified instead of becoming an indistinguishable unknown row.
+        self.assertIn("value===null && requested!==null) value=requested", html)
+        self.assertIn("enabled===null && requested===false", html)
+        self.assertIn("Max 请求/生效", html)
+        self.assertIn("Tool 请求/调用", html)
         self.assertNotIn('text+=\'<span class="usage-sub">', html)
         self.assertIn("max1m", html)
 
@@ -2003,6 +2017,43 @@ class SessionLeaseTests(unittest.TestCase):
         # The atomic snapshot supplies the credential and avoids a second
         # mutable account-store read.
         self.assertEqual(account.call_count, 0)
+
+    def test_ide_and_work_agent_new_sessions_participate_in_polling(self):
+        """Explicit IDE/Work selections must rotate accounts like Remote."""
+
+        for mode in ("ide", "work-agent"):
+            with self.subTest(mode=mode):
+                main_module._CHAT_HISTORY_SESSIONS.clear()
+                main_module._UPSTREAM_SESSION_LEASES.clear()
+                with (
+                    patch("src.main.UPSTREAM_MODE", mode),
+                    patch(
+                        "src.main.auth.get_polling_status",
+                        return_value={"enabled": True},
+                    ),
+                    patch("src.main.auth.next_polling_account") as rotate,
+                    patch(
+                        "src.main.auth.get_active_account_snapshot",
+                        return_value=("account-1", {"token": "first-jwt"}),
+                    ),
+                ):
+                    first = main_module._bind_chat_session(
+                        [{"role": "user", "content": "hello"}],
+                        {},
+                        requested_session_id=f"{mode}-terminal",
+                    )
+                    second = main_module._bind_chat_session(
+                        [
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "done"},
+                        ],
+                        {},
+                        requested_session_id=f"{mode}-terminal",
+                    )
+
+                self.assertEqual(first["_account_id"], "account-1")
+                self.assertEqual(second["_account_id"], "account-1")
+                self.assertEqual(rotate.call_count, 1)
 
     def test_session_binding_uses_jwt_billing_identity_for_raw_uid(self):
         token = UsageRecordTests._jwt_for_account("billing-account")
@@ -3255,16 +3306,22 @@ class MainCliSmokeTests(unittest.TestCase):
                 "provider_model_name": "glm-5.3__max",
             }
         )
-        with patch("src.main._dispatch_chat", new=AsyncMock(return_value=text_reply)):
+        text_dispatch = AsyncMock(return_value=text_reply)
+        with patch("src.main._dispatch_chat", new=text_dispatch):
             body = self.client.post(
                 "/api/model-test",
-                json={"model": "glm-5.3", "mode": "text"},
+                json={
+                    "model": "glm-5.3",
+                    "mode": "text",
+                    "disable_fallback": True,
+                },
                 headers=AUTH_HEADERS,
             ).json()
         self.assertTrue(body["success"])
         self.assertEqual(body["reply"], "pong")
         self.assertEqual(body["provider_model_name"], "glm-5.3__max")
         self.assertIsNone(body["error"])
+        self.assertTrue(text_dispatch.await_args.args[3]["_disable_upstream_fallback"])
 
         tool_reply = JSONResponse(
             {
@@ -3289,16 +3346,22 @@ class MainCliSmokeTests(unittest.TestCase):
                 "usage": {},
             }
         )
-        with patch("src.main._dispatch_chat", new=AsyncMock(return_value=tool_reply)):
+        tool_dispatch = AsyncMock(return_value=tool_reply)
+        with patch("src.main._dispatch_chat", new=tool_dispatch):
             body = self.client.post(
                 "/api/model-test",
-                json={"model": "glm-5.3", "mode": "tool"},
+                json={
+                    "model": "glm-5.3",
+                    "mode": "tool",
+                    "disable_fallback": True,
+                },
                 headers=AUTH_HEADERS,
             ).json()
         self.assertTrue(body["success"])
         self.assertEqual(
             [call["name"] for call in body["tool_calls"]], ["relay_probe"]
         )
+        self.assertTrue(tool_dispatch.await_args.args[3]["_disable_upstream_fallback"])
 
     def test_model_test_forwards_reasoning_effort_and_thinking(self):
         seen = {}

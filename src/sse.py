@@ -259,8 +259,9 @@ def _model_family(value: Any) -> str:
     # Runtime ids append build variants after a double underscore. They do not
     # represent a different public model family.
     text = text.split("__", 1)[0].replace("_", "-")
-    # The raw gateway prefixes Alibaba-hosted DeepSeek variants with ``ali-``.
-    if text.startswith("ali-deepseek-v4-"):
+    # The raw gateway prefixes Alibaba-hosted variants with ``ali-``
+    # (DeepSeek, Kimi, ...). It is a hosting marker, not a different model.
+    if text.startswith("ali-"):
         text = text[4:]
     # Provider deployments may append ``Official`` and/or a release date while
     # retaining the same DeepSeek public model identity.
@@ -629,6 +630,35 @@ class ToolCallAccumulator:
             return key
         function = call.get("function") or {}
         requested_index = call.get("index")
+        # Trae native stream: tool-call argument fragments. The first item of
+        # each call carries a real id + name; follow-up fragments carry no id
+        # and no name (normalize_tool_call then synthesizes a per-fragment
+        # content-hash id, which must NOT be used as the merge key). The
+        # upstream `index` is the stable cross-frame call ordinal (0, 1, ...),
+        # so index-based merge is the correct path when present.
+        if call.get("_synthetic_id") or not function.get("name"):
+            if isinstance(requested_index, int):
+                for existing_key, existing_index in self._indexes.items():
+                    if existing_index != requested_index:
+                        continue
+                    existing_name = (self._calls[existing_key].get("function") or {}).get(
+                        "name"
+                    )
+                    if not function.get("name") or function.get("name") == existing_name:
+                        return existing_key
+            # No usable index: nameless delta fragments are ordered, so merge
+            # into the latest open delta call (upstream order == merge order).
+            if call.get("_synthetic_id") and not function.get("name"):
+                last_key = self._order[-1] if self._order else None
+                if last_key is not None:
+                    last = self._calls.get(last_key) or {}
+                    last_function = last.get("function") or {}
+                    if (
+                        last.get("_arguments_mode") == "delta"
+                        and last_function.get("name")
+                    ):
+                        return last_key
+                return None
         if isinstance(requested_index, int) and (
             call.get("_synthetic_id") or not function.get("name")
         ):
@@ -673,6 +703,17 @@ class ToolCallAccumulator:
             function = call["function"]
             call_id = call["id"]
             key = self._existing_key(call) or call_id
+            if key not in self._calls and not function.get("name"):
+                # 匹配不到任何已有调用的无 name 帧：只有以 { [ 开头才是新调用
+                # 起点；孤立的 } ] 空串是上游并发流的遗留闭合帧，直接丢弃。
+                first = str(function.get("arguments") or "").lstrip()[:1]
+                if first not in ("{", "["):
+                    import logging as _lg
+                    _lg.getLogger("trae-cn-relay").warning(
+                        "[junk-drop] orphan fragment %r",
+                        str(function.get("arguments") or "")[:30],
+                    )
+                    continue
             existing = self._calls.get(key)
             if existing is not None:
                 call_id = key
@@ -737,6 +778,47 @@ class ToolCallAccumulator:
                 previous["name"] = current_name
                 function_delta["name"] = current_name
             if call.get("_arguments_mode") == "delta":
+                # Trae 并发工具流会把多个调用的参数串在同一个 index 下连续发。
+                # 当前 key 的 arguments 已是合法 JSON 时，新片段属于【新调用】，
+                # 不是续片——闭合后新开，避免 `{"a":1}{"b":2}` 拼接。
+                try:
+                    json.loads(previous_args)
+                    prev_closed = True
+                except Exception:
+                    prev_closed = False
+                if prev_closed and current_args:
+                    # 只有新片段以 { 或 [ 开头才是真正的新调用起点；
+                    # 孤立的 } / ] / 空帧是上游遗留的闭合帧，忽略不拼。
+                    first = current_args.lstrip()[:1]
+                    if first in ("{", "["):
+                        new_key = call_id + ":" + str(len(self._order))
+                        self._calls[new_key] = {
+                            "id": new_key,
+                            "type": "function",
+                            "function": {
+                                "name": current_name or previous["name"],
+                                "arguments": current_args,
+                            },
+                            "_synthetic_id": True,
+                            "_arguments_mode": "delta",
+                            "_source_index": call.get("_source_index", 0),
+                        }
+                        self._order.append(new_key)
+                        self._indexes[new_key] = len(self._order) - 1
+                        deltas.append(
+                            {
+                                "index": self._indexes[new_key],
+                                "id": new_key,
+                                "type": "function",
+                                "function": {
+                                    "name": current_name or previous["name"],
+                                    "arguments": current_args,
+                                },
+                            }
+                        )
+                        continue
+                    # 遗留闭合/空帧：丢弃，不污染已完整的前一个调用。
+                    continue
                 argument_delta = current_args
                 previous["arguments"] += current_args
                 if argument_delta:
@@ -765,26 +847,154 @@ class ToolCallAccumulator:
         return [self._calls[key] for key in self._order]
 
 
-def _ensure_native_tool_arguments(calls: list[dict], usage: Any = None) -> None:
+    def set_calls(self, calls: list[dict]) -> None:
+        """Replace the aggregated calls (used after repair/split)."""
+        self._calls = {}
+        self._order = []
+        self._indexes = {}
+        for idx, c in enumerate(calls):
+            cid = str(c.get("id") or f"call_repair_{idx}")
+            self._calls[cid] = c
+            self._order.append(cid)
+            self._indexes[cid] = idx
+
+
+def _repair_json_arguments(arguments: str) -> str:
+    """Best-effort repair of a truncated native tool arguments string.
+
+    Trae's native stream occasionally drops the final fragment(s) of a tool
+    call, leaving arguments like ``{"command": "git status"`` without the
+    closing ``}`` (or with a dangling quote). Never raise on malformed input;
+    return the original string when we cannot repair confidently.
+    """
+    if not arguments:
+        return arguments
+    try:
+        json.loads(arguments)
+        return arguments
+    except Exception:
+        pass
+    repaired = arguments.rstrip()
+    stack = []
+    in_str = False
+    esc = False
+    for ch in repaired:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+    if in_str:
+        repaired += '"'
+    closing = {"{": "}", "[": "]"}
+    for opener in reversed(stack):
+        repaired += closing[opener]
+    try:
+        json.loads(repaired)
+        return repaired
+    except Exception:
+        return arguments
+
+
+def _split_json_stream(text: str):
+    """从 {..}{..} 拼接串里切出一个个合法 JSON 对象（raw_decode）。"""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            break
+        if text[i] not in "{[":
+            return None
+        try:
+            obj, end = json.JSONDecoder().raw_decode(text, i)
+        except Exception:
+            return None
+        out.append(obj)
+        i = end
+    return out
+
+
+def _ensure_native_tool_arguments(
+    calls: list[dict], usage: Any = None
+) -> list[dict]:
+    """Validate/repair/split malformed native delta tool arguments."""
+    repaired_any = False
+    kept: list[dict] = []
     for call in calls:
         if call.get("_arguments_mode") != "delta":
+            kept.append(call)
             continue
         function = call.get("function") or {}
         arguments = function.get("arguments")
-        # Preserve the existing zero-argument behavior and the text/snapshot
-        # bridge; only reject malformed nonempty native fragment sequences.
         if not arguments:
+            kept.append(call)
             continue
         try:
             json.loads(arguments)
-        except (TypeError, ValueError) as error:
-            raise InvalidNativeToolArguments(
-                f"Trae native tool call {function.get('name') or 'unknown'} "
-                "ended with invalid JSON arguments",
-                retryable=False,
-                usage=usage,
-                observed_model_event=True,
-            ) from error
+            kept.append(call)
+            continue
+        except (TypeError, ValueError):
+            pass
+        parts = _split_json_stream(arguments)
+        if parts is not None:
+            if len(parts) > 1:
+                logger.warning(
+                    "[split] call=%s split %d objects",
+                    function.get("name") or "?",
+                    len(parts),
+                )
+            for idx, obj in enumerate(parts):
+                new_call = dict(call)
+                new_fn = dict(function)
+                new_fn["arguments"] = json.dumps(obj, ensure_ascii=False)
+                new_call["function"] = new_fn
+                if idx > 0:
+                    new_call["id"] = f"{call.get('id')}:{idx}"
+                kept.append(new_call)
+            repaired_any = True
+            continue
+        fixed = _repair_json_arguments(arguments)
+        if fixed != arguments:
+            try:
+                json.loads(fixed)
+                function["arguments"] = fixed
+                repaired_any = True
+                logger.warning(
+                    "[repair] call=%s %r -> %r",
+                    function.get("name") or "?",
+                    str(arguments)[:80],
+                    str(fixed)[:80],
+                )
+                kept.append(call)
+                continue
+            except Exception:
+                pass
+        stripped = arguments.strip()
+        if stripped in ("}", "]", "", "{}", "[]"):
+            logger.warning("[drop] orphan closing fragment %r", stripped[:30])
+            continue
+        logger.warning(
+            "[tool-drop] dropping unusable call %s args=%r",
+            function.get("name") or "?",
+            str(arguments)[:200],
+        )
+        repaired_any = True
+    if repaired_any:
+        logger.warning("[repair] repaired/split/dropped unusable tool call(s) this turn")
+    return kept
 
 
 def _calls_from_payload(data: Any) -> list[dict]:
@@ -882,10 +1092,12 @@ def _filter_tool_calls(
         if selected and name != selected:
             continue
         call_id = str(call.get("id") or "")
-        if call_id and call_id in seen:
-            continue
-        if call_id:
-            seen.add(call_id)
+        is_delta = call.get("_arguments_mode") == "delta"
+        if not is_delta:
+            if call_id and call_id in seen:
+                continue
+            if call_id:
+                seen.add(call_id)
         filtered.append(call)
         if parallel_tool_calls is False:
             break
@@ -1394,7 +1606,9 @@ async def translate_ide_stream(
             usage=final_usage,
             observed_model_event=observed_model_event,
         )
-    _ensure_native_tool_arguments(tool_calls.calls(), final_usage)
+    tool_calls.set_calls(
+        _ensure_native_tool_arguments(tool_calls.calls(), final_usage)
+    )
     if content_count == 0 and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
@@ -2515,7 +2729,7 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    _ensure_native_tool_arguments(tool_calls.calls(), usage)
+    tool_calls.set_calls(_ensure_native_tool_arguments(tool_calls.calls(), usage))
     if not full and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
