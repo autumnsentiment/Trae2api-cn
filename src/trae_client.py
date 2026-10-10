@@ -827,17 +827,63 @@ async def fetch_session_usage(
     data = payload.get("data")
     if not isinstance(data, Mapping):
         data = payload
-    usage = data.get("user_usage_group_by_session")
-    if not isinstance(usage, Mapping):
-        usage = data
+
+    # The commercial endpoint has shipped several envelopes.  The current
+    # client normally returns ``data.user_usage_group_by_session`` but older
+    # gateways return that object at the top level, wrap it in ``usage`` or
+    # use camelCase keys.  Walk only billing-shaped fields and return the
+    # first explicit numeric value; do not infer a charge from token counts or
+    # money amounts.
+    credit_keys = (
+        "credits_float",
+        "creditsFloat",
+        "credits_consumed",
+        "consumed_credits",
+        "credit_cost",
+        "credits_cost",
+        "amount_float",
+        "amountFloat",
+    )
+
+    def find_credit(value: Any, depth: int = 0) -> Decimal | None:
+        if depth > 6:
+            return None
+        if isinstance(value, Mapping):
+            for key in credit_keys:
+                if key in value:
+                    parsed = _credit_decimal(value.get(key))
+                    if parsed is not None:
+                        return parsed
+            # Prefer the known billing containers before a generic recursive
+            # walk so unrelated metadata cannot mask the session charge.
+            preferred = (
+                "user_usage_group_by_session",
+                "userUsageGroupBySession",
+                "usage",
+                "billing",
+                "cost",
+                "result",
+                "data",
+            )
+            for key in preferred:
+                if key in value:
+                    parsed = find_credit(value.get(key), depth + 1)
+                    if parsed is not None:
+                        return parsed
+            for child in value.values():
+                parsed = find_credit(child, depth + 1)
+                if parsed is not None:
+                    return parsed
+        elif isinstance(value, list):
+            for child in value:
+                parsed = find_credit(child, depth + 1)
+                if parsed is not None:
+                    return parsed
+        return None
 
     # Return only billing-safe scalar fields.  Do not persist or log
     # ``extra_info`` (which contains token details) or any upstream envelope.
-    credits = _credit_decimal(
-        usage.get("credits_float")
-        if isinstance(usage, Mapping)
-        else None
-    )
+    credits = find_credit(data)
     if credits is None or credits < 0:
         return {}
     return {
@@ -1363,6 +1409,119 @@ async def _fetch_web_model_configs(
     return out
 
 
+async def _fetch_solo_model_configs(
+    token_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+) -> dict[str, dict]:
+    """Fetch the native Solo catalog from ``get_detail_param``.
+
+    The web/Remote catalog and the native Solo catalog are not identical:
+    Solo can expose newly enabled configs before they appear in the Remote
+    groups. Keep this lookup independent from the Remote parser and merge it
+    at public model-list time.
+    """
+
+    token = token_override or auth.get_token()
+    if not token:
+        return {}
+    base = _model_gateway_base()
+    url = f"{base}/api/ide/v1/get_detail_param"
+    body = {
+        "function": "solo_work_lite",
+        "config_names": None,
+        "need_prompt": False,
+        "current_config_info": None,
+        "poly_prompt": True,
+        "mode_type": None,
+        "agent_type": None,
+    }
+    headers = build_headers(token_override=token)
+    headers.update(
+        {
+            "Accept": "application/json",
+            "Origin": web_origin(),
+            "Referer": web_origin() + "/",
+            "x-app-version": "default",
+            "x-app-version-code": SOLO_GATEWAY_VERSION_CODE,
+            "x-ide-version": SOLO_GATEWAY_VERSION,
+            "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
+            "x-ide-version-type": "stable",
+            "x-device-brand": SOLO_DEVICE_BRAND,
+            "x-device-type": SOLO_DEVICE_TYPE,
+            "x-device-platform": SOLO_PLATFORM,
+            "x-version-code": SOLO_GATEWAY_VERSION_CODE,
+            "x-os-version": SOLO_OS_VERSION,
+            "package-type": SOLO_PACKAGE_TYPE,
+            "x-lscbd-aid": SOLO_LSCBD_AID,
+            "x-lscbd-platform": SOLO_PLATFORM,
+            "x-ss-dp": SOLO_LSCBD_AID,
+            "x-plugin-channel": "icube-ai",
+            "app-version": SOLO_GATEWAY_VERSION,
+            "request-traffic-type": "prod",
+            "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
+        }
+    )
+    try:
+        timeout = float(
+            os.environ.get("TRAE_SOLO_MODEL_LIST_TIMEOUT_SECONDS", "8") or "8"
+        )
+        timeout = max(1.0, min(timeout, 20.0))
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, headers=headers, json=body)
+            if resp.status_code != 200:
+                logger.warning(
+                    "trae-client: solo model list returned %s", resp.status_code
+                )
+                return {}
+            data = resp.json()
+    except Exception as exc:
+        logger.warning("trae-client: solo model list failed: %s", exc)
+        return {}
+
+    if not isinstance(data, Mapping):
+        return {}
+    raw_list = data.get("config_info_list")
+    if not isinstance(raw_list, list):
+        nested = data.get("data")
+        raw_list = (
+            nested.get("config_info_list")
+            if isinstance(nested, Mapping)
+            else []
+        )
+    if not isinstance(raw_list, list):
+        return {}
+
+    out: dict[str, dict] = {}
+    for raw in raw_list:
+        if not isinstance(raw, Mapping):
+            continue
+        # Profiles such as custom_model_1M_text are routing configurations,
+        # not selectable chat models.
+        if str(raw.get("usage") or "").strip().lower() not in ("", "chat_completion"):
+            continue
+        if raw.get("custom_models"):
+            continue
+        config_name = str(raw.get("config_name") or raw.get("name") or "").strip()
+        if not config_name:
+            continue
+        display_config = raw.get("display_config")
+        display_config = display_config if isinstance(display_config, Mapping) else {}
+        normalized = dict(raw)
+        normalized["name"] = config_name
+        normalized["config_name"] = config_name
+        normalized["model_name"] = normalized.get("model_name") or config_name
+        normalized["display_name"] = (
+            normalized.get("display_name")
+            or display_config.get("display_name")
+            or config_name
+        )
+        normalized["max_mode"] = bool(
+            normalized.get("max_mode") or display_config.get("max_mode")
+        )
+        out[config_name] = _build_web_model_config(normalized)
+    return out
+
+
 async def _get_web_custom_model(
     model_name: str,
     *,
@@ -1391,6 +1550,25 @@ async def _get_web_custom_model(
         if agent_type:
             fetch_kwargs["agent_type"] = agent_type
         configs = await _fetch_web_model_configs(token, **fetch_kwargs)
+        # Only pay the extra native-Solo lookup when the requested config is
+        # absent from Remote. This keeps normal model resolution on the fast
+        # path while allowing Solo-only models to be used through Remote.
+        lowered_model = str(model_name).strip().lower()
+        found = any(
+            str(name).strip().lower() == lowered_model
+            or str(
+                (candidate or {}).get("display_name")
+                or (candidate or {}).get("display_model_name")
+                or ""
+            ).strip().lower()
+            == lowered_model
+            for name, candidate in configs.items()
+        )
+        if not found and not agent_type:
+            solo_configs = await _fetch_solo_model_configs(token, **fetch_kwargs)
+            if isinstance(solo_configs, Mapping):
+                for name, config in solo_configs.items():
+                    configs.setdefault(name, config)
         cached = (now, configs)
         _WEB_MODEL_CACHE[account_key] = cached
 
@@ -2206,9 +2384,9 @@ def _static_model_list(created: int) -> list[dict]:
 async def get_models(force: bool = False) -> list[dict]:
     """Return the model list for /v1/models.
 
-    Source is the active account's live Trae model list (the same
-    ``/models?functions=solo_agent_remote,solo_work_remote,solo_design_remote``
-    call the web client makes), merged across the Agent / Work / Design tiers.
+    Source is the active account's live Trae model lists: the Remote web
+    catalog (merged across Agent / Work / Design tiers) plus native Solo's
+    ``/api/ide/v1/get_detail_param`` catalog for Solo-only models.
     Only config names are listed; display labels such as ``GLM-5.3`` are not.
     Ids are exposed lowercase: config names that carry capitals appear once in
     lowercase and ``convert_model_name`` maps them back to the exact config
@@ -2231,11 +2409,26 @@ async def get_models(force: bool = False) -> list[dict]:
         )
         if isinstance(provider, Mapping):
             kwargs["provider_specific"] = dict(provider)
-        try:
-            configs = await _fetch_web_model_configs(**kwargs)
-        except Exception as e:
-            logger.warning("trae-client: web model list fetch failed: %s", e)
-            configs = {}
+        # Remote is the primary catalog because it carries the richer
+        # Agent/Work metadata.  Solo fills only models absent from Remote;
+        # this keeps discovery resilient when a newly enabled Solo model has
+        # not propagated to the web catalog yet.
+        remote_task = _fetch_web_model_configs(**kwargs)
+        solo_task = _fetch_solo_model_configs(**kwargs)
+        remote_configs, solo_configs = await asyncio.gather(
+            remote_task,
+            solo_task,
+            return_exceptions=True,
+        )
+        if isinstance(remote_configs, Mapping):
+            configs.update(remote_configs)
+        elif isinstance(remote_configs, Exception):
+            logger.warning("trae-client: web model list fetch failed: %s", remote_configs)
+        if isinstance(solo_configs, Mapping):
+            for name, config in solo_configs.items():
+                configs.setdefault(name, config)
+        elif isinstance(solo_configs, Exception):
+            logger.warning("trae-client: solo model list fetch failed: %s", solo_configs)
 
     ids: set[str] = set()
     for name in configs:

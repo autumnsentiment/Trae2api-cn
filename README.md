@@ -72,7 +72,7 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
 GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
-Run workflow** 手动执行，默认会构建 `v1.0.3`。部署机器不需要安装 Python、
+Run workflow** 手动执行，默认会构建 `v1.0.4`。部署机器不需要安装 Python、
 Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
 
 ```bash
@@ -83,7 +83,7 @@ docker compose -f docker-compose.image.yml up -d
 
 镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
 拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
-版本标签，例如 `:1.0.3`。更新已有部署时执行
+版本标签，例如 `:1.0.4`。更新已有部署时执行
 `docker compose -f docker-compose.image.yml pull`，再执行
 `docker compose -f docker-compose.image.yml up -d`。
 
@@ -178,19 +178,24 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_WEB_PARALLEL_LIMIT` | `2` | 每账号最大并行会话数 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
-| `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表实时取自当前账号的 Agent / Work / Design 模型，只返回小写模型名（带大写的 config 名统一转小写去重），外加 `auto`、`work`；上游拉取失败时回落内置列表 |
+| `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表合并 Remote 的 Agent / Work / Design 目录与 Solo 原生 `get_detail_param` 目录，只返回小写模型名（带大写的 config 名统一转小写去重），外加 `auto`、`work`；上游拉取失败时回落内置列表 |
+| `TRAE_SOLO_MODEL_LIST_TIMEOUT_SECONDS` | `8` | Solo 原生模型目录补齐请求的超时秒数；仅用于 Remote 目录缺失模型的发现与列表合并 |
 | `SSE_HEARTBEAT_SECONDS` | `1` | Chat/Responses 上游空窗时发送标准 SSE 注释心跳；`0` 为关闭 |
 | `TRAE_USAGE_RECORDS_PATH` | `data/usage_records.json` | 消费记录独立持久化文件，不改写 `data/accounts.json` |
 | `TRAE_USAGE_SESSION_QUERY` | `true` | 有上游回合 ID 时异步查询精确积分；失败自动回退账号快照差值 |
 | `TRAE_USAGE_API_HOST` | `https://api5-normal.mchost.guru` | TraeWork 商业用量查询主机，不与 entitlement API 混用 |
 | `TRAE_USAGE_QUERY_TIMEOUT_SECONDS` | `15` | 回合积分查询超时时间；只影响后台 enrichment |
 | `TRAE_USAGE_CREDIT_SETTLE_SECONDS` | `1` | 请求完成后等待上游积分账单落库再计算单次积分差值 |
+| `TRAE_USAGE_MAX_HISTORY` | `1000` | 消费明细保留上限；每日汇总不受影响 |
+| `TRAE_USAGE_QUERY_RETRIES` | `5` | 回合积分账单为空或暂不可用时的查询次数 |
+| `TRAE_USAGE_QUERY_RETRY_DELAY_SECONDS` | `0.5` | 回合积分查询的指数退避基准秒数 |
+| `TRAE_USAGE_ENRICH_CONCURRENCY` | `8` | 服务重启恢复历史待结算记录时的最大并发查询数（限制为 1-64） |
 | `RESPONSES_SESSION_TTL_SECONDS` | `3600` | `previous_response_id` 会话缓存有效期（秒） |
 | `RESPONSES_SESSION_MAX_ENTRIES` | `1024` | Responses 进程内会话缓存最大条数 |
 | `RELAY_API_KEYS` | 空 | API 密钥鉴权（逗号分隔多个）；公网部署必须设置并配合 TLS |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
-控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态、模型、思考强度、上下文模式和 Tool 参数。工具定义与模型实际返回的工具调用分别记录，Max 请求值与上游应用值分别保存，没有上游证据时不标为已启用，历史记录缺失字段显示 `--`。积分优先级为：上游显式 usage、TraeWork 回合级 `credits_float`、同一账号请求前后的累计积分差值；无法安全归属时显示 `--`，不会把未知值伪装成 0。回合级查询使用上游 `reply_to_message_id/userMessageId`，不会把固定 raw 会话 UUID 当作计费键，也不会阻塞模型首帧。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
+控制台的“消费记录”按请求保存一行，包含输入/输出/总 tokens、单次消耗积分、请求状态、模型、思考强度、上下文模式和 Tool 参数。工具定义与模型实际返回的工具调用分别记录，Max 请求值与上游应用值分别保存，没有上游证据时不标为已启用，历史记录缺失字段显示 `--`。积分优先级为：上游显式 usage、TraeWork 回合级 `credits_float`、同一账号请求前后的累计积分差值；账单尚未落库时显示“结算中”，后台会按退避策略重试，无法安全归属时才显示 `--`，不会把未知值伪装成 0。回合级查询使用上游 `reply_to_message_id/userMessageId`，并把 opaque 回合 ID 仅保存在本地记录中用于重启补偿，不会把固定 raw 会话 UUID 当作计费键，也不会阻塞模型首帧。记录保存在独立的 `usage_records.json`，账号凭据仍只在 `accounts.json` 中维护。
 
 ### 账号模型请求开关
 
@@ -352,7 +357,7 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 
 启动后访问 `http://服务器:8000/web/login`，左侧纵向导航五个页面，右上角可切换浅色 / 夜间主题：
 
-- **概览**（默认首页）：总 tokens、输入 / 输出 / 缓存 tokens、今日用量、有效账号数；按日期堆叠柱状图（7 / 14 / 30 天）、服务状态（版本、运行时长、上游端点、自动路由、轮询、1M、自动签到、并发中请求）和按日期汇总表。数据来自 `GET /api/overview?days=N`，每日汇总持久化在 `data/usage_stats.json`，不受 100 条消费记录上限影响
+- **概览**（默认首页）：总 tokens、输入 / 输出 / 缓存 tokens、今日用量、有效账号数；按日期堆叠柱状图（7 / 14 / 30 天）、服务状态（版本、运行时长、上游端点、自动路由、轮询、1M、自动签到、并发中请求）和按日期汇总表。数据来自 `GET /api/overview?days=N`，每日汇总持久化在 `data/usage_stats.json`，不受消费明细保留上限影响
 - **账号与签到**：上方是授权登录（网页授权、本机助手下载、手动填写凭证），中间是自动签到（启用开关、每日时间、立即执行，以及下次执行 / 上次执行 / 上次结果），下方是整宽账号列表（账号、用户 ID、状态、有效期、通用积分、签到状态，单账号签到 / 切换 / 删除，以及查询签到状态、查询全部积分、一键轮询签到）
 - **消费记录**：按请求显示模型、tokens、单次积分、状态、思考强度、上下文模式，以及是否携带工具参数和本轮是否返回工具调用
 - **轮询与设置**：多账号轮询开关、顺序 / 积分优先模式、上游端点预设与自定义 URL、Relay 端口、1M 上下文（Max 模式）开关与生效模型（可一键检测账号支持 Max 的模型）

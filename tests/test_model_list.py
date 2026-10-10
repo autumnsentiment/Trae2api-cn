@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from src import trae_client
 
@@ -22,11 +22,16 @@ UPSTREAM = {
 
 
 class ModelListTests(unittest.IsolatedAsyncioTestCase):
-    def _patches(self, fetch):
+    def _patches(self, fetch, solo=None):
         return (
             patch.object(trae_client, "_MODEL_LIST_CACHE", {}),
             patch.object(trae_client, "_UPSTREAM_MODEL_CASE", {}),
             patch.object(trae_client, "_fetch_web_model_configs", side_effect=fetch),
+            patch.object(
+                trae_client,
+                "_fetch_solo_model_configs",
+                new=AsyncMock(return_value=solo or {}),
+            ),
             patch.object(
                 trae_client.auth,
                 "get_active_account_snapshot",
@@ -41,8 +46,8 @@ class ModelListTests(unittest.IsolatedAsyncioTestCase):
             calls.append(kwargs)
             return dict(UPSTREAM)
 
-        p1, p2, p3, p4 = self._patches(fetch)
-        with p1, p2, p3, p4:
+        p1, p2, p3, p4, p5 = self._patches(fetch)
+        with p1, p2, p3, p4, p5:
             items = await trae_client.get_models()
             ids = [item["id"] for item in items]
             self.assertEqual(
@@ -84,8 +89,8 @@ class ModelListTests(unittest.IsolatedAsyncioTestCase):
         async def fetch(**kwargs):
             return {}
 
-        p1, p2, p3, p4 = self._patches(fetch)
-        with p1, p2, p3, p4:
+        p1, p2, p3, p4, p5 = self._patches(fetch)
+        with p1, p2, p3, p4, p5:
             items = await trae_client.get_models()
             ids = [item["id"] for item in items]
             self.assertIn("auto", ids)
@@ -93,6 +98,24 @@ class ModelListTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(i == i.lower() for i in ids))
             self.assertNotIn("DeepSeek-V4-Pro", ids)
             self.assertEqual(trae_client._MODEL_LIST_CACHE, {})
+
+    async def test_native_solo_only_model_is_merged_into_public_list(self):
+        async def fetch(**kwargs):
+            return {"glm-5.3": {"name": "glm-5.3"}}
+
+        solo = {
+            "glm-5.3-flash": {
+                "name": "glm-5.3-flash",
+                "config_name": "glm-5.3-flash",
+                "display_name": "GLM-5.3-Flash",
+            }
+        }
+        p1, p2, p3, p4, p5 = self._patches(fetch, solo)
+        with p1, p2, p3, p4, p5:
+            items = await trae_client.get_models(force=True)
+        ids = [item["id"] for item in items]
+        self.assertIn("glm-5.3-flash", ids)
+        self.assertIn("glm-5.3", ids)
 
     def test_builtin_aliases_still_resolve_exact_config_names(self):
         self.assertEqual(

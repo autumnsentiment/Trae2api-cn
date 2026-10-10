@@ -1121,6 +1121,210 @@ class UsageRecordTests(unittest.TestCase):
                 main_module._USAGE_ACTIVE_ACCOUNTS.clear()
                 main_module._USAGE_UNSAFE_ACCOUNTS.clear()
 
+    def test_tracker_retries_unsettled_turn_usage_and_persists_turn_id(self):
+        original_history = main_module._USAGE_HISTORY
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = []
+        main_module._USAGE_ENRICH_TASKS.clear()
+        main_module._USAGE_SNAPSHOT_TASKS.clear()
+        main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+        main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+        async def scenario(path):
+            turn_usage = AsyncMock(
+                side_effect=[
+                    {},
+                    {"credits_consumed": "0.58", "credits_source": "session_usage"},
+                ]
+            )
+            with (
+                patch("src.main._fetch_used_credits", new=AsyncMock(return_value=None)),
+                patch("src.main.trae_client.fetch_session_usage", new=turn_usage),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TRAE_USAGE_CREDIT_SETTLE_SECONDS": "0",
+                        "TRAE_USAGE_QUERY_RETRIES": "2",
+                        "TRAE_USAGE_QUERY_RETRY_DELAY_SECONDS": "0",
+                    },
+                ),
+            ):
+                tracker = main_module._UsageTracker(
+                    "glm-5.3",
+                    "/v1/chat/completions",
+                    True,
+                    {"_account_id": "acct-1", "_auth_token": "bound-token"},
+                )
+                tracker.bind_usage_turn("turn-persisted")
+                tracker.update({"input_tokens": 3, "output_tokens": 2})
+                with patch.object(main_module, "_USAGE_RECORDS_PATH", path):
+                    await tracker.finish("completed")
+                    tasks = list(main_module._USAGE_ENRICH_TASKS)
+                    if tasks:
+                        await asyncio.gather(*tasks)
+            return turn_usage, tracker.request_id
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "usage_records.json"
+            try:
+                turn_usage, request_id = asyncio.run(scenario(path))
+                record = main_module._USAGE_HISTORY[0]
+                self.assertEqual(record["credits_consumed"], 0.58)
+                self.assertEqual(record["credits_source"], "session_usage")
+                self.assertEqual(record["usage_turn_id"], "turn-persisted")
+                self.assertEqual(turn_usage.await_count, 2)
+                public = main_module._public_usage_record(record)
+                self.assertNotIn("usage_turn_id", public)
+                self.assertEqual(public["request_id"], request_id)
+            finally:
+                main_module._USAGE_HISTORY = original_history
+                main_module._USAGE_RECORDS_PATH = original_path
+                main_module._USAGE_ENRICH_TASKS.clear()
+                main_module._USAGE_SNAPSHOT_TASKS.clear()
+                main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+                main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+    def test_restart_usage_enrichment_does_not_release_live_snapshot(self):
+        original_history = main_module._USAGE_HISTORY
+        original_stats = main_module._USAGE_STATS
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = [
+            main_module._normalize_usage_record(
+                {
+                    "account_id": "acct-live",
+                    "model": "glm-5.3",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "credits_consumed": None,
+                    "credits_source": "pending",
+                    "usage_turn_id": "turn-restart",
+                    "request_id": "request-restart",
+                    "timestamp": time.time(),
+                }
+            )
+        ]
+        main_module._USAGE_ENRICH_TASKS.clear()
+        main_module._USAGE_SNAPSHOT_TASKS.clear()
+        main_module._USAGE_PENDING_TASK_IDS.clear()
+        main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+        main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+        main_module._USAGE_ACTIVE_ACCOUNTS["acct-live"] = 1
+
+        async def scenario(path):
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "bound-token"},
+                ),
+                patch(
+                    "src.main.trae_client.fetch_session_usage",
+                    new=AsyncMock(return_value={"credits_consumed": "0.7"}),
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TRAE_USAGE_CREDIT_SETTLE_SECONDS": "0",
+                        "TRAE_USAGE_QUERY_RETRIES": "1",
+                    },
+                ),
+                patch.object(main_module, "_USAGE_RECORDS_PATH", path),
+            ):
+                self.assertEqual(main_module._schedule_pending_usage_enrichment(), 1)
+                tasks = list(main_module._USAGE_ENRICH_TASKS)
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "usage_records.json"
+            try:
+                asyncio.run(scenario(path))
+                self.assertEqual(
+                    main_module._USAGE_ACTIVE_ACCOUNTS.get("acct-live"),
+                    1,
+                )
+                self.assertEqual(
+                    main_module._USAGE_HISTORY[0]["credits_consumed"],
+                    0.7,
+                )
+            finally:
+                main_module._USAGE_HISTORY = original_history
+                main_module._USAGE_STATS = original_stats
+                main_module._USAGE_RECORDS_PATH = original_path
+                main_module._USAGE_ENRICH_TASKS.clear()
+                main_module._USAGE_SNAPSHOT_TASKS.clear()
+                main_module._USAGE_PENDING_TASK_IDS.clear()
+                main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+                main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+    def test_restart_usage_enrichment_respects_concurrency_limit(self):
+        original_history = main_module._USAGE_HISTORY
+        main_module._USAGE_HISTORY = [
+            main_module._normalize_usage_record(
+                {
+                    "account_id": "acct-shared",
+                    "model": "glm-5.3",
+                    "credits_consumed": None,
+                    "credits_source": "pending",
+                    "usage_turn_id": f"turn-{index}",
+                    "request_id": f"request-{index}",
+                    "timestamp": time.time(),
+                }
+            )
+            for index in range(4)
+        ]
+        main_module._USAGE_ENRICH_TASKS.clear()
+        main_module._USAGE_PENDING_TASK_IDS.clear()
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            active = 0
+            peak = 0
+
+            async def fake_enrich(*_args, **_kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                started.set()
+                try:
+                    await release.wait()
+                finally:
+                    active -= 1
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "bound-token"},
+                ),
+                patch.object(main_module, "_enrich_usage_credits", new=fake_enrich),
+                patch.dict(
+                    os.environ,
+                    {"TRAE_USAGE_ENRICH_CONCURRENCY": "2"},
+                ),
+            ):
+                self.assertEqual(
+                    main_module._schedule_pending_usage_enrichment(),
+                    4,
+                )
+                await started.wait()
+                # Give all scheduled tasks a chance to enter the semaphore.
+                await asyncio.sleep(0)
+                self.assertEqual(peak, 2)
+                release.set()
+                tasks = list(main_module._USAGE_ENRICH_TASKS)
+                if tasks:
+                    await asyncio.gather(*tasks)
+            return peak
+
+        try:
+            self.assertEqual(asyncio.run(scenario()), 2)
+        finally:
+            main_module._USAGE_HISTORY = original_history
+            main_module._USAGE_ENRICH_TASKS.clear()
+            main_module._USAGE_PENDING_TASK_IDS.clear()
+
     def test_tracker_explicit_zero_credit_skips_turn_usage_query(self):
         original_history = main_module._USAGE_HISTORY
         original_path = main_module._USAGE_RECORDS_PATH

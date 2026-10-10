@@ -301,7 +301,26 @@ CHAT_OPTION_FIELDS = (
 # Per-request usage tracking. Records are stored separately from account data so
 # a dashboard/deploy change can never rewrite the saved login cache.
 _USAGE_HISTORY: list[dict] = []
-_USAGE_MAX_HISTORY = 100
+
+
+def _usage_history_limit() -> int:
+    """Return the persisted request-history cap.
+
+    The daily usage buckets are the long-lived source of truth for totals, but
+    the detail endpoint should not discard almost every request in a busy
+    relay.  Keep the default large enough for normal deployments while
+    allowing operators to tune disk usage explicitly.
+    """
+
+    raw = os.environ.get("TRAE_USAGE_MAX_HISTORY", "1000")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 1000
+    return max(100, min(value, 100_000))
+
+
+_USAGE_MAX_HISTORY = _usage_history_limit()
 _USAGE_LOCK = threading.RLock()
 _USAGE_RECORDS_PATH = Path(
     os.environ.get("TRAE_USAGE_RECORDS_PATH", "")
@@ -357,6 +376,7 @@ _FAVICON_LINKS = (
 _USAGE_TRACKER: ContextVar[Any] = ContextVar("trae_usage_tracker", default=None)
 _USAGE_ENRICH_TASKS: set[asyncio.Task] = set()
 _USAGE_SNAPSHOT_TASKS: set[asyncio.Task] = set()
+_USAGE_PENDING_TASK_IDS: set[str] = set()
 _USAGE_ACTIVE_ACCOUNTS: dict[str, int] = {}
 _USAGE_UNSAFE_ACCOUNTS: set[str] = set()
 _CHECKIN_ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
@@ -442,6 +462,26 @@ def _session_usage_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _session_usage_query_attempts() -> int:
+    try:
+        value = int(os.environ.get("TRAE_USAGE_QUERY_RETRIES", "5") or "5")
+    except (TypeError, ValueError):
+        value = 5
+    return max(1, min(value, 8))
+
+
+def _session_usage_query_delay() -> float:
+    try:
+        value = float(
+            os.environ.get("TRAE_USAGE_QUERY_RETRY_DELAY_SECONDS", "0.5")
+            or "0.5"
+        )
+    except (TypeError, ValueError):
+        value = 0.5
+    return max(0.0, min(value, 10.0))
+
 
 # Web login auth
 TRAE_AUTH_URL = os.environ.get("TRAE_AUTH_URL", "https://www.trae.cn/authorization")
@@ -830,7 +870,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -2362,9 +2402,11 @@ async function refreshUsage() {{
         var output=Number(record.output_tokens!==undefined?record.output_tokens:(record.completion_tokens||0));
         var total=Number(record.total_tokens!==undefined?record.total_tokens:(input+output));
         var tokenText=record.tokens_source==='unknown'?'--':(input+' / '+output+' / '+total);
-        var credits=record.credits_consumed;
-        var creditText=credits===null||credits===undefined?'--':Number(credits).toFixed(2);
         var source=record.credits_source||'unknown';
+        var credits=record.credits_consumed;
+        var creditText=credits===null||credits===undefined
+          ?(source==='pending'?'结算中':'--')
+          :Number(credits).toFixed(2);
         var status=record.status||'completed';
         var statusText=status==='completed'?'完成':(status==='cancelled'?'已取消':(status==='error'?'失败':status));
         var badge=status==='completed'?'badge-ok':(status==='error'?'badge-expired':'badge-none');
@@ -4465,7 +4507,17 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
 
 
 def _number_value(value: Any) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, (int, float)):
         return None
     return max(0, value)
 
@@ -4485,6 +4537,63 @@ def _first_number(data: Mapping[str, Any], *keys: str) -> int | float | None:
         value = _number_value(data.get(key))
         if value is not None:
             return value
+        # A few native adapters serialize accounting numbers as strings.
+        raw = data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = float(raw.strip())
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and parsed >= 0:
+                return parsed
+    return None
+
+
+def _nested_credit_value(value: Any, depth: int = 0) -> int | float | None:
+    """Find an explicit credit field without mistaking tokens or money for it."""
+
+    if depth > 6:
+        return None
+    keys = (
+        "credits_consumed",
+        "consumed_credits",
+        "credit_cost",
+        "credits_cost",
+        "credits_float",
+        "creditsFloat",
+        "amount_float",
+        "amountFloat",
+    )
+    if isinstance(value, Mapping):
+        for key in keys:
+            if key in value:
+                candidate = _first_number(value, key)
+                if candidate is not None:
+                    return candidate
+        preferred = (
+            "user_usage_group_by_session",
+            "userUsageGroupBySession",
+            "usage",
+            "billing",
+            "cost",
+            "response_meta",
+            "responseMeta",
+            "data",
+        )
+        for key in preferred:
+            if key in value:
+                candidate = _nested_credit_value(value.get(key), depth + 1)
+                if candidate is not None:
+                    return candidate
+        for child in value.values():
+            candidate = _nested_credit_value(child, depth + 1)
+            if candidate is not None:
+                return candidate
+    elif isinstance(value, list):
+        for child in value:
+            candidate = _nested_credit_value(child, depth + 1)
+            if candidate is not None:
+                return candidate
     return None
 
 
@@ -4510,24 +4619,7 @@ def _usage_values(usage: Any) -> dict[str, Any]:
     total = _first_number(usage, "total_tokens", "total_token", "totalTokens")
     if total is None:
         total = prompt + completion
-    credits = _first_number(
-        usage,
-        "credits_consumed",
-        "consumed_credits",
-        "credit_cost",
-        "credits_cost",
-        "credits_float",
-    )
-    billing = usage.get("billing") or usage.get("cost")
-    if credits is None and isinstance(billing, Mapping):
-        credits = _first_number(
-            billing,
-            "credits_consumed",
-            "consumed_credits",
-            "credit_cost",
-            "credits_cost",
-            "credits_float",
-        )
+    credits = _nested_credit_value(usage)
     cached = _first_number(
         usage,
         "cached_tokens",
@@ -4813,10 +4905,58 @@ def _credit_snapshot_is_safe(account_id: str) -> bool:
         return account_id not in _USAGE_UNSAFE_ACCOUNTS
 
 
+def _usage_account_token(account_id: str) -> str:
+    """Resolve a persisted row to the credential that owns its bill.
+
+    The account store may be keyed by a local user id while usage rows carry
+    the immutable JWT subject (or the reverse), especially after polling or
+    token refresh. Match both forms before abandoning a recoverable row.
+    """
+
+    identity = str(account_id or "").strip()
+    if not identity:
+        return ""
+    direct = auth.get_account_record(identity)
+    token = str((direct or {}).get("token") or "").strip()
+    if token:
+        return token
+    for stored_id, record in auth.get_accounts_raw():
+        record = record if isinstance(record, Mapping) else {}
+        candidate = str(record.get("token") or "").strip()
+        if not candidate:
+            continue
+        if (
+            str(stored_id or "") == identity
+            or str(record.get("user_id") or "") == identity
+            or _account_id_from_token(candidate) == identity
+        ):
+            return candidate
+    return ""
+
+
+def _usage_enrich_concurrency() -> int:
+    try:
+        value = int(os.environ.get("TRAE_USAGE_ENRICH_CONCURRENCY", "8") or "8")
+    except (TypeError, ValueError):
+        value = 8
+    return max(1, min(value, 64))
+
+
 def _spawn_usage_task(
     coro,
     registry: set[asyncio.Task] | None = None,
-) -> asyncio.Task:
+) -> asyncio.Task | None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # A few management/test paths construct a tracker synchronously.
+        # Close the coroutine we were handed so it cannot leak a
+        # ``was never awaited`` warning; real request paths always have a
+        # running loop and continue to schedule normally.
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        return None
     registry = registry if registry is not None else _USAGE_ENRICH_TASKS
     task = asyncio.create_task(coro)
     registry.add(task)
@@ -4832,6 +4972,62 @@ def _spawn_usage_task(
 
     task.add_done_callback(done)
     return task
+
+
+def _schedule_pending_usage_enrichment() -> int:
+    """Resume bill lookups for persisted rows after a relay restart."""
+
+    async def enrich_pending(
+        record: Mapping[str, Any], token: str, semaphore: asyncio.Semaphore
+    ) -> None:
+        # A restart-resumed lookup never acquired a live account snapshot.
+        # Keep it bounded so a large history cannot burst the usage endpoint.
+        request_id = str(record.get("request_id") or "")
+        try:
+            async with semaphore:
+                await _enrich_usage_credits(
+                    request_id,
+                    str(record.get("account_id") or ""),
+                    token,
+                    None,
+                    usage_turn_id=str(record.get("usage_turn_id") or ""),
+                    credit_safe=False,
+                    release_snapshot=False,
+                )
+        finally:
+            # Cancellation while waiting for the semaphore bypasses the
+            # enrichment coroutine's own cleanup.
+            _USAGE_PENDING_TASK_IDS.discard(request_id)
+
+    scheduled = 0
+    with _USAGE_LOCK:
+        pending = [
+            dict(record)
+            for record in _USAGE_HISTORY
+            if _number_value(record.get("credits_consumed")) is None
+            and record.get("usage_turn_id")
+            and record.get("request_id")
+        ]
+    concurrency_limit = _usage_enrich_concurrency()
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    for record in pending:
+        request_id = str(record.get("request_id") or "")
+        if not request_id or request_id in _USAGE_PENDING_TASK_IDS:
+            continue
+        account_id = str(record.get("account_id") or "")
+        token = _usage_account_token(account_id)
+        if not token:
+            continue
+        _USAGE_PENDING_TASK_IDS.add(request_id)
+        _spawn_usage_task(enrich_pending(record, token, semaphore))
+        scheduled += 1
+    if scheduled:
+        logger.info(
+            "scheduled %d pending usage credit lookup(s) concurrency=%d",
+            scheduled,
+            concurrency_limit,
+        )
+    return scheduled
 
 
 async def _cancel_usage_task(
@@ -4858,6 +5054,7 @@ async def _cancel_usage_tasks() -> None:
     """Cancel and await all usage enrichment/snapshot tasks during shutdown."""
     tasks = set(_USAGE_ENRICH_TASKS) | set(_USAGE_SNAPSHOT_TASKS)
     if not tasks:
+        _USAGE_PENDING_TASK_IDS.clear()
         return
     for task in tasks:
         if not task.done():
@@ -4865,6 +5062,28 @@ async def _cancel_usage_tasks() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
     _USAGE_ENRICH_TASKS.difference_update(tasks)
     _USAGE_SNAPSHOT_TASKS.difference_update(tasks)
+    _USAGE_PENDING_TASK_IDS.clear()
+
+
+def _usage_credit_retry_delays() -> tuple[float, ...]:
+    """Return short delays used while a just-finished turn settles upstream."""
+
+    explicit = os.environ.get("TRAE_USAGE_CREDIT_RETRY_DELAYS")
+    if explicit:
+        values: list[float] = []
+        for item in str(explicit).split(","):
+            try:
+                values.append(max(0.0, min(float(item.strip()), 30.0)))
+            except (TypeError, ValueError):
+                continue
+        if values:
+            return tuple(values)
+    attempts = _session_usage_query_attempts()
+    base = _session_usage_query_delay()
+    return tuple(
+        0.0 if index == 0 else min(30.0, base * (2 ** (index - 1)))
+        for index in range(attempts)
+    )
 
 
 async def _enrich_usage_credits(
@@ -4875,32 +5094,54 @@ async def _enrich_usage_credits(
     *,
     usage_turn_id: str = "",
     credit_safe: bool = True,
+    release_snapshot: bool = True,
 ) -> None:
+    if request_id:
+        _USAGE_PENDING_TASK_IDS.add(request_id)
     try:
         settle = _credit_settle_seconds()
         if settle:
             await asyncio.sleep(settle)
         if usage_turn_id and _session_usage_enabled():
-            try:
-                session_usage = await trae_client.fetch_session_usage(
-                    usage_turn_id,
-                    token,
-                )
-                credits = _number_value(session_usage.get("credits_consumed"))
-                if credits is not None and credits >= 0:
-                    await _cancel_usage_task(
-                        before_task,
-                        _USAGE_SNAPSHOT_TASKS,
+            for attempt, delay in enumerate(_usage_credit_retry_delays()):
+                if attempt and delay:
+                    await asyncio.sleep(delay)
+                try:
+                    session_usage = await trae_client.fetch_session_usage(
+                        usage_turn_id,
+                        token,
                     )
-                    before_task = None
-                    _update_usage_record(
+                    credits = _number_value(
+                        session_usage.get("credits_consumed")
+                        if isinstance(session_usage, Mapping)
+                        else None
+                    )
+                    # Zero is a valid settled charge. Only None means that
+                    # the commercial endpoint has not produced a bill yet.
+                    if credits is not None and credits >= 0:
+                        await _cancel_usage_task(
+                            before_task,
+                            _USAGE_SNAPSHOT_TASKS,
+                        )
+                        before_task = None
+                        _update_usage_record(
+                            request_id,
+                            credits_consumed=_credit_round(credits),
+                            credits_source="session_usage",
+                        )
+                        return
+                    logger.debug(
+                        "session usage not settled request=%s attempt=%d",
                         request_id,
-                        credits_consumed=_credit_round(credits),
-                        credits_source="session_usage",
+                        attempt + 1,
                     )
-                    return
-            except Exception as exc:
-                logger.debug("session usage enrichment unavailable: %s", exc)
+                except Exception as exc:
+                    logger.debug(
+                        "session usage enrichment unavailable request=%s attempt=%d: %s",
+                        request_id,
+                        attempt + 1,
+                        exc,
+                    )
         if not credit_safe or not _credit_snapshot_is_safe(account_id):
             return
         before = None
@@ -4920,8 +5161,11 @@ async def _enrich_usage_credits(
             credits_after=_credit_round(after),
         )
     finally:
+        if request_id:
+            _USAGE_PENDING_TASK_IDS.discard(request_id)
         await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
-        _end_credit_snapshot(account_id)
+        if release_snapshot:
+            _end_credit_snapshot(account_id)
 
 
 class _UsageTracker:
@@ -5126,7 +5370,13 @@ class _UsageTracker:
             self.tool_used = self.tool_calls_returned
         context_mode = self.context_mode_actual
         explicit_credits = values.get("credits_consumed")
-        credits_source = "upstream" if explicit_credits is not None else "unknown"
+        credits_source = (
+            "upstream"
+            if explicit_credits is not None
+            else "pending"
+            if self.usage_turn_id or self._credit_safe
+            else "unknown"
+        )
         _record_usage(
             self.account_id,
             self.model,
@@ -5134,6 +5384,7 @@ class _UsageTracker:
             values["completion_tokens"],
             credits_consumed=explicit_credits,
             credits_source=credits_source,
+            usage_turn_id=self.usage_turn_id or None,
             request_id=self.request_id,
             endpoint=self.endpoint,
             stream=self.stream,
@@ -5176,6 +5427,7 @@ class _UsageTracker:
                     self._before_task,
                     usage_turn_id=self.usage_turn_id,
                     credit_safe=self._credit_safe,
+                    release_snapshot=self._credit_snapshot_started,
                 )
             )
         else:
@@ -6125,6 +6377,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         exc_observed_model_event = bool(
                             getattr(exc, "observed_model_event", False)
                         )
+                        quota_exhausted = bool(
+                            getattr(exc, "account_quota_exhausted", False)
+                        )
                         if exc_usage is not None:
                             _track_usage_from_exception(exc, model)
                         polling_retry_enabled = bool(
@@ -6134,20 +6389,31 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             not exc_retryable
                             or work_fallback_used
                             or not (can_work_fallback or polling_retry_enabled)
+                            or (quota_exhausted and not polling_retry_enabled)
                         ):
                             logger.warning(
                                 "remote empty response is not safe to retry "
-                                "id=%s model=%s observed_model_event=%s fallback_used=%s",
+                                "id=%s model=%s observed_model_event=%s "
+                                "fallback_used=%s quota_exhausted=%s",
                                 request_id,
                                 model,
                                 exc_observed_model_event,
                                 work_fallback_used,
+                                quota_exhausted,
                             )
                             raise
                         logger.warning(
                             "remote upstream ended before any model event; "
                             "%s once id=%s model=%s",
-                            "falling back to Work" if can_work_fallback and not work_fallback_used else "retrying",
+                            (
+                                "rotating account after quota exhaustion"
+                                if quota_exhausted
+                                else (
+                                    "falling back to Work"
+                                    if can_work_fallback and not work_fallback_used
+                                    else "retrying"
+                                )
+                            ),
                             request_id,
                             model,
                         )
@@ -6182,15 +6448,22 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         try:
                             retry_options = dict(remote_options)
                             retry_model = model
-                            if can_work_fallback and not work_fallback_used:
+                            if (
+                                can_work_fallback
+                                and not work_fallback_used
+                                and not quota_exhausted
+                            ):
                                 retry_options = work_fallback_options(retry_options)
                                 work_fallback_used = True
                             retry_token = token
-                            # Prefer the same-account Work fallback.  Account
-                            # rotation remains the outer retry policy after a
-                            # Work attempt is exhausted.
-                            if auth.get_polling_status().get("enabled") and not (
-                                can_work_fallback and work_fallback_used
+                            # A 4008 is account-scoped. Never retry it through
+                            # the same account's Work executor; rotate to a
+                            # different enabled credential instead. Ordinary
+                            # empty Agent responses retain the historical
+                            # same-account Work fallback before rotation.
+                            if polling_retry_enabled and (
+                                quota_exhausted
+                                or not (can_work_fallback and work_fallback_used)
                             ):
                                 next_snapshot = _next_retry_account_snapshot(
                                     {_retry_account_key(options, 0)}, 1
@@ -6233,6 +6506,11 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                         retry_token,
                                         retry_provider,
                                     )
+                                elif quota_exhausted:
+                                    # Do not reacquire the exhausted account
+                                    # and replay the turn. The caller receives
+                                    # the original quota error instead.
+                                    raise
                             await trae_client.acquire_web_slot(
                                 retry_account_id,
                                 timeout=float(
@@ -7026,6 +7304,12 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         record.get("context_window_tokens")
         or record.get("max_context_tokens")
     )
+    usage_turn_id = str(
+        record.get("usage_turn_id")
+        or record.get("billing_turn_id")
+        or record.get("_usage_turn_id")
+        or ""
+    ).strip() or None
     normalized.update(
         {
             "account_id": str(record.get("account_id") or "default"),
@@ -7058,6 +7342,9 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 record.get("credits_source")
                 or ("upstream" if credits is not None else "unknown")
             ),
+            # Keep only the opaque upstream turn id needed for delayed billing
+            # enrichment. Credentials and token payloads are never persisted.
+            "usage_turn_id": usage_turn_id,
             "request_id": str(record.get("request_id") or ""),
             "endpoint": record.get("endpoint") or None,
             "stream": record.get("stream") if "stream" in record else None,
@@ -7112,6 +7399,16 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             "tool": tool_called,
         }
     )
+    return normalized
+
+
+def _public_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a usage row without exposing the upstream billing correlation id."""
+
+    normalized = _normalize_usage_record(record)
+    normalized.pop("usage_turn_id", None)
+    normalized.pop("billing_turn_id", None)
+    normalized.pop("_usage_turn_id", None)
     return normalized
 
 
@@ -7325,6 +7622,7 @@ def _record_usage(
     *,
     credits_consumed: int | float | None = None,
     credits_source: str = "unknown",
+    usage_turn_id: str | None = None,
     request_id: str = "",
     endpoint: str | None = None,
     stream: bool | None = None,
@@ -7360,6 +7658,7 @@ def _record_usage(
             "tokens_source": tokens_source,
             "credits_consumed": credits_consumed,
             "credits_source": credits_source,
+            "usage_turn_id": usage_turn_id,
             "request_id": request_id,
             "endpoint": endpoint,
             "stream": stream,
@@ -8274,6 +8573,7 @@ async def init_app():
     auth.init_auth()
     _restore_persisted_relay_settings()
     auth.apply_max_mode_settings()
+    _schedule_pending_usage_enrichment()
     logger.info(
         "Trae CN relay initialized (auth source=%s edition=%s cli=%s)",
         auth.get_auth().source,
@@ -8533,7 +8833,7 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
     polling = auth.get_polling_status()
     with _USAGE_LOCK:
         in_flight = sum(_USAGE_ACTIVE_ACCOUNTS.values())
-        recent = [_normalize_usage_record(record) for record in _USAGE_HISTORY[:5]]
+        recent = [_public_usage_record(record) for record in _USAGE_HISTORY[:5]]
     return JSONResponse(
         {
             "success": True,
@@ -8571,14 +8871,14 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
 async def get_usage_records():
     """Return the usage history list (newest first)."""
     with _USAGE_LOCK:
-        records = [_normalize_usage_record(record) for record in _USAGE_HISTORY]
+        records = [_public_usage_record(record) for record in _USAGE_HISTORY]
     return JSONResponse(records, headers={"Cache-Control": "no-store"})
 
 @app.get("/api/usage/last")
 async def api_usage_last():
     """Backward-compatible: return only the latest record."""
     with _USAGE_LOCK:
-        records = [_normalize_usage_record(record) for record in _USAGE_HISTORY[:1]]
+        records = [_public_usage_record(record) for record in _USAGE_HISTORY[:1]]
     return JSONResponse(records, headers={"Cache-Control": "no-store"})
 
 

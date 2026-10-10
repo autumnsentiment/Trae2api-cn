@@ -414,6 +414,38 @@ class SessionUsageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["credits_consumed"], 0)
 
+    async def test_fetch_session_usage_accepts_nested_camel_case_string_amount(self):
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "usage": {
+                            "userUsageGroupBySession": {
+                                "amountFloat": "0.37",
+                            }
+                        }
+                    }
+                }
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        with patch("src.trae_client.httpx.AsyncClient", return_value=Client()):
+            result = await trae_client.fetch_session_usage("turn-camel", "jwt-token")
+
+        self.assertEqual(result["credits_consumed"], 0.37)
+        self.assertEqual(result["credits_source"], "session_usage")
+
     async def test_fetch_session_usage_rejects_business_error(self):
         class Response:
             status_code = 200
@@ -1220,6 +1252,75 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
             configs = await trae_client._fetch_web_model_configs(token_override="token-x")
 
         self.assertEqual(configs["glm-5.3"]["max_tokens"], 32000)
+
+
+class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_solo_catalog_parses_flash_and_filters_routing_profiles(self):
+        calls = {}
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "config_info_list": [
+                        {
+                            "config_name": "glm-5.3-flash",
+                            "usage": "chat_completion",
+                            "display_config": {
+                                "display_name": "GLM-5.3-Flash",
+                                "max_mode": False,
+                            },
+                        },
+                        {
+                            "config_name": "custom_model_1M_text",
+                            "usage": "custom_model",
+                            "custom_models": ["provider//glm-5.3"],
+                        },
+                    ]
+                }
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                calls["timeout"] = kwargs.get("timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                calls.update(url=url, headers=headers, body=json)
+                return FakeResponse()
+
+        with (
+            patch.object(trae_client.httpx, "AsyncClient", FakeClient),
+            patch.object(
+                trae_client,
+                "build_headers",
+                return_value={"Authorization": "Cloud-IDE-JWT token-x"},
+            ),
+            patch.object(
+                trae_client,
+                "_model_gateway_base",
+                return_value="https://trae-api-cn.mchost.guru",
+            ),
+        ):
+            configs = await trae_client._fetch_solo_model_configs(
+                token_override="token-x"
+            )
+
+        self.assertIn("glm-5.3-flash", configs)
+        self.assertNotIn("custom_model_1M_text", configs)
+        self.assertEqual(configs["glm-5.3-flash"]["display_name"], "GLM-5.3-Flash")
+        self.assertEqual(
+            calls["url"],
+            "https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param",
+        )
+        self.assertEqual(calls["body"]["function"], "solo_work_lite")
+        self.assertLessEqual(calls["timeout"], 20)
 
 
 if __name__ == "__main__":

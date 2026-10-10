@@ -145,6 +145,86 @@ class ExtractionTests(unittest.TestCase):
             delta[0]["function"]["arguments"], '{"filePath":"README.md"}'
         )
 
+    def test_extract_native_replay_with_same_real_id_keeps_one_call(self):
+        result = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_native",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                },
+                {
+                    "index": 0,
+                    "id": "call_native",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": ' { "path": "README.md" } ',
+                    },
+                },
+            ]
+        }
+        calls = cli_client.extract_tool_calls(result)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["id"], "call_native")
+        self.assertEqual(
+            calls[0]["function"]["arguments"], '{"path":"README.md"}'
+        )
+
+    def test_extract_native_distinct_ids_with_same_arguments_are_preserved(self):
+        arguments = '{"path":"README.md"}'
+        result = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": arguments},
+                },
+                {
+                    "index": 1,
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": arguments},
+                },
+            ]
+        }
+        calls = cli_client.extract_tool_calls(result)
+        self.assertEqual([call["id"] for call in calls], ["call_a", "call_b"])
+
+    def test_extract_native_id_conflict_keeps_first_complete_arguments(self):
+        result = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_native",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"a.txt"}',
+                    },
+                },
+                {
+                    "index": 0,
+                    "id": "call_native",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"b.txt"}',
+                    },
+                },
+            ]
+        }
+        calls = cli_client.extract_tool_calls(result)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["function"]["arguments"], '{"path":"a.txt"}'
+        )
+
     def test_extract_top_level_tool_call_info_preserves_id_and_parameters(self):
         calls = cli_client.extract_tool_calls(
             {

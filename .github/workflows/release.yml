@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (for example v1.0.3); leave blank for a snapshot image"
+        description: "Release version (for example v1.0.4); leave blank for a snapshot image"
         required: false
-        default: "v1.0.3"
+        default: "v1.0.4"
         type: string
       publish_release:
         description: "Create or update a GitHub Release with source archives"

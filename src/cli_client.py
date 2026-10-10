@@ -1149,6 +1149,11 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         # Models sometimes copy the prompt example verbatim (``<unique-id>``,
         # ``call_1``-style templates). Such ids collide across turns.
         raw_id = ""
+    explicit_id = raw.get("_explicit_id")
+    if explicit_id is None:
+        explicit_id = bool(raw_id) and not inherited_synthetic_id
+    else:
+        explicit_id = explicit_id is True
     name = (
         _string_or_empty(function.get("name"))
         or _string_or_empty(raw.get("name"))
@@ -1187,12 +1192,19 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
             }
         }
     arguments_text = _stringify_tool_arguments(arguments)
-    call_id = raw_id or _stable_tool_id(name, arguments_text, index)
+    identity_index = raw.get("index")
+    if not isinstance(identity_index, int):
+        identity_index = index
+    call_id = raw_id or _stable_tool_id(name, arguments_text, identity_index)
     result = {
         "id": call_id,
         "type": "function",
         "function": {"name": name, "arguments": arguments_text},
         "_synthetic_id": inherited_synthetic_id or not bool(raw_id),
+        # Keep upstream identity separate from an id synthesized by the
+        # relay; the accumulator uses this to distinguish replays from new
+        # logical calls.
+        "_explicit_id": explicit_id,
         "_source_index": raw.get("_source_index", index),
         "_explicit_index": raw.get("_explicit_index") is True
         or isinstance(raw.get("index"), int),
@@ -1239,6 +1251,62 @@ def tool_call_signature(call: Any) -> str:
     except (TypeError, ValueError):
         encoded = str(arguments)
     return f"{name}\0{encoded}"
+
+
+def complete_tool_call_signature(call: Any) -> str:
+    """Return a signature only for a named call with valid JSON arguments."""
+
+    if not isinstance(call, dict):
+        return ""
+    function = call.get("function") or {}
+    if not isinstance(function, dict):
+        return ""
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        return ""
+    try:
+        json.loads(arguments)
+    except (TypeError, ValueError):
+        return ""
+    return tool_call_signature(call)
+
+
+def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
+    """Deduplicate complete identities without dropping native fragments."""
+
+    kept: list[dict] = []
+    completed: dict[str, dict] = {}
+    snapshots: dict[str, int] = {}
+    for call in calls:
+        call_id = str(call.get("id") or "")
+        signature = complete_tool_call_signature(call)
+        previous = completed.get(call_id) if call_id else None
+        if previous is not None and signature:
+            if signature != complete_tool_call_signature(previous):
+                logger.warning(
+                    "dropping conflicting complete tool call id=%s", call_id
+                )
+            continue
+        # Native delta frames have no event ids. Identical short fragments
+        # can be legitimate nested JSON, so leave assembly to the accumulator.
+        if call.get("_arguments_mode") == "delta":
+            kept.append(call)
+        elif call_id and call_id in snapshots:
+            previous_index = snapshots[call_id]
+            previous_call = kept[previous_index]
+            previous_args = str((previous_call.get("function") or {}).get("arguments") or "")
+            current_args = str((call.get("function") or {}).get("arguments") or "")
+            if current_args.startswith(previous_args) or (
+                not complete_tool_call_signature(previous_call) and signature
+            ):
+                kept[previous_index] = call
+        else:
+            if call_id:
+                snapshots[call_id] = len(kept)
+            kept.append(call)
+        if call_id and signature:
+            completed[call_id] = call
+    return kept
 
 
 _TOOL_FAILURE_STATUSES = {
@@ -1777,10 +1845,7 @@ def extract_tool_calls(result: Any) -> list[dict]:
     if not calls:
         calls.extend(extract_text_tool_calls(result.get("response")))
 
-    deduped: dict[str, dict] = {}
-    for call in calls:
-        deduped[call["id"]] = call
-    return list(deduped.values())
+    return deduplicate_tool_calls(calls)
 
 
 def strip_tool_call_blocks(content: Any) -> str:

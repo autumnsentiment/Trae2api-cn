@@ -119,6 +119,163 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(calls[0]["id"], "call_native")
                 self.assertEqual(calls[0]["function"]["arguments"], '{"outer":{"x":1}}')
 
+    async def test_replayed_complete_native_call_with_same_real_id_is_emitted_once(self):
+        frames = [
+            [
+                _call(
+                    '{"path":"README.md"}',
+                    name="read_file",
+                    call_id="call_native",
+                )
+            ],
+            [
+                _call(
+                    '{"path":"README.md"}',
+                    name="read_file",
+                    call_id="call_native",
+                )
+            ],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["id"], "call_native")
+                self.assertEqual(
+                    calls[0]["function"]["arguments"], '{"path":"README.md"}'
+                )
+
+    async def test_replayed_native_call_uses_canonical_json_for_duplicate_detection(self):
+        first = '{"path":"README.md","line":1}'
+        replay = ' { "line": 1, "path": "README.md" } '
+        frames = [
+            [_call(first, name="read_file", call_id="call_native")],
+            [_call(replay, name="read_file", call_id="call_native")],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                # Keep the first closed payload byte-for-byte; the replay is
+                # only a duplicate even though its whitespace/key order differs.
+                self.assertEqual(calls[0]["function"]["arguments"], first)
+
+    async def test_conflicting_complete_native_replay_keeps_first_closed_arguments(self):
+        frames = [
+            [_call('{"path":"a.txt"}', name="read_file", call_id="call_native")],
+            [_call('{"path":"b.txt"}', name="read_file", call_id="call_native")],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    calls[0]["function"]["arguments"], '{"path":"a.txt"}'
+                )
+
+    async def test_idless_replay_with_same_explicit_index_is_emitted_once(self):
+        frames = [
+            [_call('{"path":"README.md"}', name="read_file", index=3)],
+            [_call('{"path":"README.md"}', name="read_file", index=3)],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["function"]["arguments"], '{"path":"README.md"}')
+
+    async def test_distinct_real_ids_or_explicit_indexes_keep_identical_calls(self):
+        arguments = '{"path":"README.md"}'
+        first = _call(arguments, name="read_file", call_id="call_a")
+        second = _call(arguments, name="read_file", call_id="call_b")
+        first.pop("index")
+        second.pop("index")
+        cases = [
+            (
+                "real ids",
+                [[
+                    first,
+                    second,
+                ]],
+                {"call_a", "call_b"},
+            ),
+            (
+                "explicit indexes",
+                [[
+                    _call(arguments, name="read_file", index=0),
+                    _call(arguments, name="read_file", index=1),
+                ]],
+                None,
+            ),
+        ]
+        for stream in (False, True):
+            for label, frames, expected_ids in cases:
+                with self.subTest(stream=stream, case=label):
+                    calls = await self._calls(frames, stream)
+                    self.assertEqual(len(calls), 2)
+                    if expected_ids is not None:
+                        self.assertEqual(
+                            {call["id"] for call in calls}, expected_ids
+                        )
+                    else:
+                        self.assertEqual(
+                            [call["function"]["arguments"] for call in calls],
+                            [arguments, arguments],
+                        )
+
+    async def test_idless_unindexed_calls_dedup_only_when_arguments_match(self):
+        def no_identity(arguments: str) -> dict:
+            call = _call(arguments, name="read_file", call_id="")
+            call.pop("index")
+            return call
+
+        same_frames = [
+            [no_identity('{"path":"README.md"}')],
+            [no_identity('{"path":"README.md"}')],
+        ]
+        different_frames = [
+            [no_identity('{"path":"a.txt"}')],
+            [no_identity('{"path":"b.txt"}')],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream, case="same"):
+                calls = await self._calls(same_frames, stream)
+                self.assertEqual(len(calls), 1)
+            with self.subTest(stream=stream, case="different"):
+                calls = await self._calls(different_frames, stream)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(
+                    [call["function"]["arguments"] for call in calls],
+                    ['{"path":"a.txt"}', '{"path":"b.txt"}'],
+                )
+
+    async def test_repeated_short_nested_fragments_remain_valid(self):
+        frames = [
+            [_call("", name="read_file", call_id="call_nested")],
+            *[
+                [_call(fragment)]
+                for fragment in (
+                    "{",
+                    '"a":',
+                    "{",
+                    '"b":',
+                    "{",
+                    '"c":1',
+                    "}",
+                    "}",
+                    "}",
+                )
+            ],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"a": {"b": {"c": 1}}},
+                )
+
     async def test_named_fragment_without_id_keeps_the_initial_call_identity(self):
         frames = [
             [_call('{"path":', name="read_file", call_id="call_native")],
@@ -294,12 +451,32 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
             _call("{", name="read_file", call_id="call_native")
         )
         self.assertEqual(native["_arguments_mode"], "delta")
+        self.assertTrue(native["_explicit_id"])
         replay = cli_client.normalize_tool_call(native)
         self.assertEqual(replay["_arguments_mode"], "delta")
+        self.assertTrue(replay["_explicit_id"])
         snapshot = cli_client.normalize_tool_call(
             _call("{}", name="read_file", representation="function")
         )
         self.assertNotIn("_arguments_mode", snapshot)
+        self.assertFalse(snapshot["_explicit_id"])
+
+    def test_prepare_preserves_inherited_id_as_non_explicit(self):
+        head = cli_client.normalize_tool_call(
+            _call("", name="read_file", call_id="call_native")
+        )
+        accumulator = sse.ToolCallAccumulator()
+        accumulator.add([head])
+
+        tail = cli_client.normalize_tool_call(_call("{", name="read_file"))
+        self.assertFalse(tail["_explicit_id"])
+        prepared = accumulator.prepare([tail])[0]
+        self.assertEqual(prepared["id"], "call_native")
+        self.assertFalse(prepared["_explicit_id"])
+
+        renormalized = cli_client.normalize_tool_call(prepared)
+        self.assertEqual(renormalized["id"], "call_native")
+        self.assertFalse(renormalized["_explicit_id"])
 
     def test_empty_initial_native_record_keeps_its_mode_after_accumulation(self):
         native = cli_client.extract_tool_calls(

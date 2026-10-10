@@ -15,6 +15,8 @@ import uuid
 from typing import Any, AsyncIterator, Optional
 
 from .cli_client import extract_result_text as _cli_extract_text
+from .cli_client import complete_tool_call_signature as _complete_tool_call_signature
+from .cli_client import deduplicate_tool_calls as _deduplicate_tool_calls
 from .cli_client import extract_tool_calls as _extract_tool_calls
 from .cli_client import extract_usage as _cli_extract_usage
 from .cli_client import normalize_tool_call as _normalize_tool_call
@@ -98,11 +100,16 @@ class EmptyUpstreamResponse(RuntimeError):
         retryable: bool = True,
         usage: Optional[dict] = None,
         observed_model_event: bool = False,
+        account_quota_exhausted: bool = False,
     ):
         super().__init__(message)
         self.retryable = bool(retryable)
         self.usage = dict(usage) if isinstance(usage, dict) else None
         self.observed_model_event = bool(observed_model_event)
+        # A quota response is account-scoped.  The dispatcher may rotate to
+        # another credential, but must never replay it through the same
+        # account's Work fallback after a streaming Agent attempt.
+        self.account_quota_exhausted = bool(account_quota_exhausted)
 
 
 class IncompleteUpstreamResponse(EmptyUpstreamResponse):
@@ -250,6 +257,29 @@ def _provider_model_name(payload: Any) -> str:
             if value:
                 return str(value).strip()
     return ""
+
+
+def _is_account_quota_error(payload: Any) -> bool:
+    """Return whether an upstream error represents account quota exhaustion."""
+
+    if not isinstance(payload, dict):
+        return False
+    code = str(
+        payload.get("code")
+        or payload.get("error_code")
+        or payload.get("errorCode")
+        or ""
+    ).strip().lower()
+    text = " ".join(
+        str(payload.get(key) or "")
+        for key in ("message", "error", "detail", "reason")
+    ).lower()
+    return (
+        code == "4008"
+        or "requests have exceeded the quota" in text
+        or "quota exceeded" in text
+        or "exceeded the quota" in text
+    )
 
 
 def _model_family(value: Any) -> str:
@@ -672,6 +702,35 @@ class ToolCallAccumulator:
                     return existing_key
         return None
 
+    @staticmethod
+    def _complete_signature(call: Any) -> str:
+        """Return a canonical signature only when arguments are valid JSON."""
+
+        return _complete_tool_call_signature(call)
+
+    @classmethod
+    def _closed_state(cls, existing: dict, current: dict) -> str:
+        """Classify a complete frame for an already closed logical call."""
+
+        previous_signature = cls._complete_signature(existing)
+        current_signature = cls._complete_signature(current)
+        if not previous_signature or not current_signature:
+            return ""
+        if previous_signature == current_signature:
+            return "replay"
+        same_index = (
+            existing.get("_explicit_index") is True
+            and current.get("_explicit_index") is True
+            and existing.get("index") == current.get("index")
+        )
+        if (
+            existing.get("_explicit_id") is True
+            or current.get("_explicit_id") is True
+            or same_index
+        ):
+            return "conflict"
+        return ""
+
     def prepare(self, calls: Any) -> list[dict]:
         if not isinstance(calls, list):
             return []
@@ -725,8 +784,38 @@ class ToolCallAccumulator:
                 ):
                     continue
                 function["name"] = existing_function["name"]
+            if existing is not None:
+                closed_state = self._closed_state(existing, call)
+                if closed_state == "replay":
+                    logger.debug(
+                        "dropping repeated complete tool call id=%s",
+                        existing.get("id"),
+                    )
+                    continue
+                if closed_state == "conflict":
+                    logger.warning(
+                        "dropping conflicting complete tool call id=%s",
+                        existing.get("id"),
+                    )
+                    continue
             requested_index = call.get("index")
             if key not in self._calls and call.get("_synthetic_id"):
+                current_signature = self._complete_signature(call)
+                if (
+                    current_signature
+                    and call.get("_explicit_index") is not True
+                    and any(
+                        existing_call.get("_synthetic_id") is True
+                        and existing_call.get("_explicit_index") is not True
+                        and self._complete_signature(existing_call) == current_signature
+                        for existing_call in self._calls.values()
+                    )
+                ):
+                    logger.debug(
+                        "dropping repeated idless complete tool call signature=%s",
+                        current_signature,
+                    )
+                    continue
                 for existing_key in self._order:
                     existing = self._calls[existing_key]
                     if not existing.get("_synthetic_id"):
@@ -791,6 +880,20 @@ class ToolCallAccumulator:
                     # 孤立的 } / ] / 空帧是上游遗留的闭合帧，忽略不拼。
                     first = current_args.lstrip()[:1]
                     if first in ("{", "["):
+                        if (
+                            existing.get("_explicit_id") is True
+                            or call.get("_explicit_id") is True
+                            or (
+                                existing.get("_explicit_index") is True
+                                and call.get("_explicit_index") is True
+                                and existing.get("index") == call.get("index")
+                            )
+                        ):
+                            logger.warning(
+                                "dropping new delta object for closed logical call id=%s",
+                                existing.get("id"),
+                            )
+                            continue
                         new_key = call_id + ":" + str(len(self._order))
                         self._calls[new_key] = {
                             "id": new_key,
@@ -856,7 +959,12 @@ class ToolCallAccumulator:
             cid = str(c.get("id") or f"call_repair_{idx}")
             self._calls[cid] = c
             self._order.append(cid)
-            self._indexes[cid] = idx
+            call_index = c.get("index")
+            if not isinstance(call_index, int):
+                call_index = idx
+            else:
+                c.setdefault("index", call_index)
+            self._indexes[cid] = call_index
 
 
 def _repair_json_arguments(arguments: str) -> str:
@@ -956,11 +1064,22 @@ def _ensure_native_tool_arguments(
                     function.get("name") or "?",
                     len(parts),
                 )
+            seen_signatures: set[str] = set()
             for idx, obj in enumerate(parts):
                 new_call = dict(call)
                 new_fn = dict(function)
                 new_fn["arguments"] = json.dumps(obj, ensure_ascii=False)
                 new_call["function"] = new_fn
+                signature = _tool_call_signature(new_call)
+                if signature and signature in seen_signatures:
+                    logger.warning(
+                        "[split-drop] repeated object in one native stream call=%s",
+                        function.get("name") or "?",
+                    )
+                    repaired_any = True
+                    continue
+                if signature:
+                    seen_signatures.add(signature)
                 if idx > 0:
                     new_call["id"] = f"{call.get('id')}:{idx}"
                 kept.append(new_call)
@@ -1026,10 +1145,7 @@ def _calls_from_payload(data: Any) -> list[dict]:
         )
         if call and not already_present:
             calls.append(call)
-    deduped: dict[str, dict] = {}
-    for call in calls:
-        deduped[call["id"]] = call
-    return list(deduped.values())
+    return _deduplicate_tool_calls(calls)
 
 
 def _tool_names(tools: Any) -> Optional[set[str]]:
@@ -1273,7 +1389,13 @@ class ProtocolTextAccumulator:
 
     def add_snapshot(self, value: Any) -> tuple[str, list[dict]]:
         text = value if isinstance(value, str) else ""
-        if text and not self.raw.startswith(text):
+        if text:
+            # Cumulative snapshots can arrive out of order.  A shorter
+            # prefix/suffix is an old snapshot, not a new assistant reply.
+            if self.raw.startswith(text):
+                return self._result()
+            if self.raw.endswith(text) and len(text) < len(self.raw):
+                return self._result()
             self.raw = text
         return self._result()
 
@@ -1363,6 +1485,35 @@ def _common_prefix_length(left: str, right: str) -> int:
     while index < limit and left[index] == right[index]:
         index += 1
     return index
+
+
+def _text_suffix_prefix_overlap(left: str, right: str, minimum: int = 4) -> int:
+    """Return the longest suffix(left)/prefix(right) overlap."""
+
+    limit = min(len(left), len(right))
+    for size in range(limit, minimum - 1, -1):
+        if left[-size:] == right[:size]:
+            return size
+    return 0
+
+
+def _merge_plan_message_text(plan_text: str, message_text: str) -> str:
+    """Merge remote plan content and message text without replaying either."""
+
+    plan = plan_text or ""
+    message = message_text or ""
+    if not plan:
+        return message
+    if not message:
+        return plan
+    if plan == message or plan.startswith(message) or plan.endswith(message):
+        return plan
+    if message.startswith(plan):
+        return message
+    overlap = _text_suffix_prefix_overlap(plan, message)
+    if overlap:
+        return plan + message[overlap:]
+    return plan.rstrip() + "\n\n" + message.lstrip()
 
 
 async def translate_ide_stream(
@@ -2000,6 +2151,8 @@ async def translate_web_events(
     reasoning_states: dict[str, ProtocolTextAccumulator] = {}
     plan_visible_states: dict[str, ProtocolTextAccumulator] = {}
     streamed_text = ""
+    plan_streamed_text = ""
+    message_visible_text = ""
     message_text = ProtocolTextAccumulator()
     usage = None
     error_event = None
@@ -2085,8 +2238,14 @@ async def translate_web_events(
                 if not started:
                     started = True
                     yield openai_chunk(prefix_id, model, {"role": "assistant"})
-                streamed_text += content_delta
-                yield openai_chunk(prefix_id, model, {"content": content_delta})
+                plan_streamed_text += content_delta
+                merged_text = _merge_plan_message_text(
+                    plan_streamed_text, message_visible_text
+                )
+                public_delta = _cli_text_delta(streamed_text, merged_text)
+                if public_delta:
+                    streamed_text += public_delta
+                    yield openai_chunk(prefix_id, model, {"content": public_delta})
             summary = _web_finish_summary(data)
             if summary:
                 final_summary = summary
@@ -2106,7 +2265,7 @@ async def translate_web_events(
                 if embedded_reasoning:
                     reasoning_state.add(embedded_reasoning)
             if text:
-                message_delta, message_calls = message_text.add_snapshot(text)
+                _, message_calls = message_text.add_snapshot(text)
                 for chunk in _emit_tool_deltas(
                     prefix_id,
                     model,
@@ -2121,6 +2280,11 @@ async def translate_web_events(
                         started = True
                         yield openai_chunk(prefix_id, model, {"role": "assistant"})
                     yield chunk
+                message_visible_text = message_text.visible
+                merged_text = _merge_plan_message_text(
+                    plan_streamed_text, message_visible_text
+                )
+                message_delta = _cli_text_delta(streamed_text, merged_text)
                 if message_delta:
                     if not started:
                         started = True
@@ -2169,8 +2333,42 @@ async def translate_web_events(
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            streamed_text += content_delta
-            yield openai_chunk(prefix_id, model, {"content": content_delta})
+            plan_streamed_text += content_delta
+            merged_text = _merge_plan_message_text(
+                plan_streamed_text, message_visible_text
+            )
+            public_delta = _cli_text_delta(streamed_text, merged_text)
+            if public_delta:
+                streamed_text += public_delta
+                yield openai_chunk(prefix_id, model, {"content": public_delta})
+
+    message_delta, message_calls = message_text.finalize()
+    for chunk in _emit_tool_deltas(
+        prefix_id,
+        model,
+        tool_calls,
+        message_calls,
+        allowed_tools,
+        tool_choice,
+        parallel_tool_calls,
+        completed_tool_signatures,
+    ):
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+        yield chunk
+    message_visible_text = message_text.visible
+    merged_text = _merge_plan_message_text(
+        plan_streamed_text, message_visible_text
+    )
+    if message_delta or merged_text:
+        public_delta = _cli_text_delta(streamed_text, merged_text)
+        if public_delta:
+            if not started:
+                started = True
+                yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            streamed_text += public_delta
+            yield openai_chunk(prefix_id, model, {"content": public_delta})
 
     if final_summary:
         summary_calls = _extract_tool_calls({"response": final_summary})
@@ -2283,8 +2481,15 @@ async def translate_web_events(
         yield "data: [DONE]\n\n"
         return
     if fail_on_empty and not streamed_text and not tool_calls.has_calls and not saw_reasoning_output:
+        quota_exhausted = _is_account_quota_error(error_event)
+        # ``model_config`` is emitted before a Trae 4008 error.  It identifies
+        # the selected provider, but it is not model output and must not make
+        # an account-quota failure look non-retryable.  A retry is safe only
+        # while this turn has produced no billable usage or visible reasoning.
         observed_model_event = bool(
-            usage is not None or provider_model_name or reasoning_raw
+            usage is not None
+            or reasoning_raw
+            or (provider_model_name and not quota_exhausted)
         )
         message = "Trae remote upstream returned no text or tool call"
         if error_event:
@@ -2297,6 +2502,7 @@ async def translate_web_events(
             retryable=not observed_model_event,
             usage=usage,
             observed_model_event=observed_model_event,
+            account_quota_exhausted=quota_exhausted,
         )
 
     if error_event:
@@ -2906,6 +3112,17 @@ async def collect_nonstream_web(
                 completed_tool_signatures,
             )
         )
+    _, message_calls = message_text.finalize()
+    tool_calls.add(
+        _filter_for_accumulator(
+            tool_calls,
+            message_calls,
+            allowed_tools,
+            tool_choice,
+            parallel_tool_calls,
+            completed_tool_signatures,
+        )
+    )
     content = "\n\n".join(
         state.visible.strip()
         for state in plan_visible_states.values()
@@ -2913,10 +3130,7 @@ async def collect_nonstream_web(
     )
     message_content = message_text.visible.strip()
     if message_content:
-        if not content:
-            content = message_content
-        elif not content.rstrip().endswith(message_content.rstrip()):
-            content = content.rstrip() + "\n\n" + message_content
+        content = _merge_plan_message_text(content, message_content)
     if final_summary:
         summary_calls = _extract_tool_calls({"response": final_summary})
         summary_calls = _filter_for_accumulator(
@@ -2981,8 +3195,14 @@ async def collect_nonstream_web(
         # exposing the complete working trace.
         content = reasoning_summary
     if fail_on_empty and not content and not public_reasoning and not tool_calls.has_calls:
+        quota_exhausted = _is_account_quota_error(error_event)
+        # A provider/model metadata event is not output.  In particular,
+        # Trae sends it immediately before a 4008 quota error; treating it as
+        # activity prevents the dispatcher from rotating credentials.
         observed_model_event = bool(
-            usage is not None or provider_model_name or reasoning_raw
+            usage is not None
+            or reasoning_raw
+            or (provider_model_name and not quota_exhausted)
         )
         message = "Trae remote upstream returned no text or tool call"
         if error_event:
@@ -2995,6 +3215,7 @@ async def collect_nonstream_web(
             retryable=not observed_model_event,
             usage=usage,
             observed_model_event=observed_model_event,
+            account_quota_exhausted=quota_exhausted,
         )
     if not content and not public_reasoning and not tool_calls.has_calls:
         content = "(trae upstream returned an empty response)"
