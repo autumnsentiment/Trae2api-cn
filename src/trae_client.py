@@ -430,6 +430,34 @@ def _model_gateway_base(*candidates: Any) -> str:
     return DEFAULT_MODEL_GATEWAY
 
 
+_REMOTE_API_PATH = "/api/remote/v1"
+
+
+def _remote_web_base(value: str = "") -> str:
+    """Return the Remote web API base whatever dispatch tier is selected.
+
+    ``TRAE_WEB_BASE_URL`` is shared by the IDE/Solo presets, which persist only
+    the gateway host, and the Remote/Work presets, which persist the full
+    ``/api/remote/v1`` root.  Remote-only helpers -- the model list,
+    ``chat_sessions`` and session stop/events -- must re-append the Remote root
+    so selecting IDE Agent cannot turn ``{base}/models`` into a bare-host 404.
+    An explicit ``value`` (a bound transport URL) is normalized the same way.
+    """
+
+    default = DEFAULT_MODEL_GATEWAY + _REMOTE_API_PATH
+    base = (value or os.environ.get("TRAE_WEB_BASE_URL") or default).rstrip("/")
+    parsed = urlsplit(base)
+    if not (parsed.scheme and parsed.netloc):
+        return base
+    path = (parsed.path or "").rstrip("/")
+    if path.endswith(_REMOTE_API_PATH):
+        return base
+    if not path or path.startswith(("/api/agent", "/api/ide", "/api/remote")):
+        return urlunsplit((parsed.scheme, parsed.netloc, _REMOTE_API_PATH, "", ""))
+    # A custom gateway path is preserved: only known Trae API prefixes are repaired.
+    return base
+
+
 # Cache of checkin device ids per account. The upstream checkin API is
 # device-scoped and rate limits the claim endpoint (code 9074). A JWT is
 # refreshed periodically, so the raw token is not a stable device identity;
@@ -1217,7 +1245,7 @@ async def stop_web_session(
     """Actively interrupt an upstream web session so it stops occupying a running slot."""
     if not session_id or not message_id:
         return
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = _remote_web_base()
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
@@ -1333,7 +1361,7 @@ async def _fetch_web_model_configs(
     agent_type: str = "",
 ) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = _remote_web_base()
     token = token_override or auth.get_token()
     if not token:
         return {}
@@ -1640,7 +1668,7 @@ async def create_web_session(
         raise RuntimeError(
             "Trae web remote cannot safely proxy caller-owned tool policy"
         )
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = _remote_web_base()
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
@@ -1721,7 +1749,7 @@ async def stream_web_events(
     options: Optional[dict] = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     """GET /chat_sessions/{id}/events?reply_to_message_id=...（SSE）。"""
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = _remote_web_base()
     url = f"{base}/chat_sessions/{session_id}/events?reply_to_message_id={message_id}"
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")

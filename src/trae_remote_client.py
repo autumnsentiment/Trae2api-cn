@@ -94,7 +94,10 @@ def base_url(options: Optional[Mapping[str, Any]] = None) -> str:
     options = options or {}
     configured = options.get("base_url") or options.get("baseURL")
     value = configured or os.environ.get("TRAE_WEB_BASE_URL") or DEFAULT_BASE_URL
-    return str(value).rstrip("/")
+    # ``TRAE_WEB_BASE_URL`` is shared with the IDE/Solo presets, which persist
+    # only the gateway host, so a bare host must regain the Remote API root
+    # before this transport builds ``{base}/chat_sessions``.
+    return str(trae_client._remote_web_base(str(value)))
 
 
 def _provider_specific(options: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
