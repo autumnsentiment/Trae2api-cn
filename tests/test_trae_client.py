@@ -1372,3 +1372,107 @@ class UserInfoTests(unittest.TestCase):
         with patch("src.trae_client.httpx.AsyncClient", FakeClient):
             with self.assertRaises(RuntimeError):
                 asyncio.run(trae_client.fetch_user_info("jwt-token"))
+
+
+class RemoteWebBaseTests(unittest.TestCase):
+    """The Remote API root must survive an IDE/Solo preset selection."""
+
+    def test_bare_gateway_host_regains_remote_root(self):
+        with patch.dict(
+            os.environ,
+            {"TRAE_WEB_BASE_URL": "https://trae-api-cn.mchost.guru"},
+            clear=False,
+        ):
+            self.assertEqual(
+                trae_client._remote_web_base(),
+                "https://trae-api-cn.mchost.guru/api/remote/v1",
+            )
+
+    def test_full_remote_root_is_preserved(self):
+        with patch.dict(
+            os.environ,
+            {"TRAE_WEB_BASE_URL": "https://charged.example/api/remote/v1"},
+            clear=False,
+        ):
+            self.assertEqual(
+                trae_client._remote_web_base(),
+                "https://charged.example/api/remote/v1",
+            )
+
+    def test_agent_and_ide_prefixes_are_repaired(self):
+        for value in (
+            "https://trae-api-cn.mchost.guru/api/agent/v3",
+            "https://trae-api-cn.mchost.guru/api/ide/v1",
+        ):
+            with patch.dict(os.environ, {"TRAE_WEB_BASE_URL": value}, clear=False):
+                self.assertEqual(
+                    trae_client._remote_web_base(),
+                    "https://trae-api-cn.mchost.guru/api/remote/v1",
+                )
+
+    def test_custom_gateway_path_is_preserved(self):
+        with patch.dict(
+            os.environ,
+            {"TRAE_WEB_BASE_URL": "https://my-gw.example/custom/root"},
+            clear=False,
+        ):
+            self.assertEqual(
+                trae_client._remote_web_base(),
+                "https://my-gw.example/custom/root",
+            )
+
+
+class RemoteModelListBaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_list_uses_remote_root_when_ide_preset_selected(self):
+        """Regression: IDE Agent's bare host once produced a ``/models`` 404."""
+
+        seen = {}
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "list": [
+                            {
+                                "function": "solo_agent_remote",
+                                "models": [
+                                    {"name": "glm-5.3", "max_tokens": 64000}
+                                ],
+                            }
+                        ]
+                    }
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, url):
+                seen["url"] = url
+                return FakeResponse()
+
+        with patch.dict(
+            os.environ,
+            {"TRAE_WEB_BASE_URL": "https://trae-api-cn.mchost.guru"},
+            clear=False,
+        ):
+            with patch.object(
+                trae_client.httpx, "AsyncClient", return_value=FakeClient()
+            ):
+                configs = await trae_client._fetch_web_model_configs(
+                    token_override="token-x", agent_type="solo_agent_remote"
+                )
+
+        self.assertEqual(configs["glm-5.3"]["max_tokens"], 64000)
+        self.assertTrue(
+            seen["url"].startswith(
+                "https://trae-api-cn.mchost.guru/api/remote/v1/models?"
+            ),
+            seen["url"],
+        )
