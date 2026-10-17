@@ -72,6 +72,57 @@ uvicorn src.main:app --host 0.0.0.0 --port 8000
 开发环境使用 `pip install -r requirements-dev.txt`，Windows TraeWork native
 helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只安装核心依赖。
 
+## 局域网（LAN）模式
+
+默认 `HOST=0.0.0.0`，服务本身就会监听所有网卡；`start_lan.sh` 在此基础上
+把“能连”做成“能用且安全”：自动生成并持久化 API Key、打印各设备可用的
+访问地址，并在缺少依赖或端口被占用时给出明确提示。
+
+```bash
+./start_lan.sh                    # 端口取 .env 的 PORT，缺省 8000
+./start_lan.sh 8000               # 指定端口
+./start_lan.sh 8000 MyApiKey      # 指定端口 + 自定义 key
+./start_lan.sh --dry-run          # 只打印将要执行的命令，不启动
+```
+
+端口优先级为 **命令行参数 > `.env` 的 `PORT` > 8000**，与直接用
+`uvicorn` 启动时的取值顺序一致。需要 Python 3.11+（项目使用了 3.10+
+的联合类型注解，3.9/3.10 无法导入）。
+
+macOS 可双击 `start_lan.command`（首次被 Gatekeeper 拦截时右键 > 打开）。
+
+脚本通过 UDP connect 探测本机出口地址，默认目标为 `8.8.8.8:80`（不会真的
+发包）。纯内网或无外网环境可用 `LAN_PROBE_ADDR=<host>:<port>` 覆盖探测目标，
+探测失败时会回退为打印 `http://<本机IP>:<端口>`。
+
+启动后脚本会打印：
+
+- **控制台**：`http://<本机IP>:8000/web/login`，用于授权登录、账号与签到管理
+- **OpenAI 兼容接口**：`http://<本机IP>:8000/v1`，API Key 填脚本打印的值
+
+### API Key 与安全
+
+- 局域网可达时 `/v1` 必须用真实 Key 保护：`.env.example` 里的
+  `your-master-key` 只是占位符。`start_lan.sh` 检测到空值或占位符时会生成
+  一个随机 key（`trae-lan-` 前缀）写入 `.env`，重启后继续复用。
+- 已经配置了真实 key 时脚本不会改写 `.env`，多个 key（逗号分隔）会原样保留。
+  解析规则与 `python-dotenv` 一致：支持 `export` 前缀、单/双引号和行尾注释。
+- 直接用 `uvicorn` 启动、且 `HOST` 非回环时，若 `RELAY_API_KEYS` 为空或仍是
+  占位符，服务会在启动日志中给出告警，提示先设置真实 key。
+- 管理接口和模型测试接口对内网地址免鉴权（见「使用注意事项 · 网络边界」），
+  因此不要把该端口直接暴露到公网；公网访问请加 TLS 反代。
+
+### 其它设备连不上时
+
+- **Linux**：放行防火墙端口，例如 `sudo ufw allow 8000/tcp`。
+- **macOS**：首次监听时系统会询问“允许传入连接”，选择允许；macOS 15+ 还需在
+  「系统设置 > 隐私与安全性」中允许终端访问本地网络。
+- 确认所有设备处于同一网段，且路由器没有开启 AP / 客户端隔离。
+
+> **授权只能在服务器本机完成**：Trae 授权页强制回调 `http://127.0.0.1:<端口>/authorize`，
+> 手机 / 平板无法运行本机助手。请在服务器或另一台电脑上执行 `./start_auth.sh`
+> （或先在服务器上登录一次账号），之后所有设备共用同一账号池。
+
 ## Docker 部署
 
 ### 使用 GitHub 发布镜像（推荐）
@@ -433,7 +484,7 @@ export ANTHROPIC_MODEL=glm-5.3
 
 ## 使用注意事项
 
-- **网络边界**：本项目设计为内网部署。不要把 8000 端口直接暴露到公网；如必须公网访问，请设置 `RELAY_API_KEYS` 并在前面加 TLS 反代。管理接口和模型测试接口对内网地址免鉴权。
+- **网络边界**：本项目设计为内网部署。不要把 8000 端口直接暴露到公网；如必须公网访问，请设置 `RELAY_API_KEYS` 并在前面加 TLS 反代。管理接口和模型测试接口对内网地址免鉴权。局域网共享给手机等设备时建议用 `./start_lan.sh`，它会生成并持久化一个随机 Key，避免 `your-master-key` 这类占位符被直接用于可达端口。
 - **敏感数据**：`.env` 与 `data/`（`accounts.json`、`usage_records.json`）包含 JWT、刷新令牌和账号信息，已在 `.gitignore` 和 `.dockerignore` 中排除，切勿提交或分享。
 - **工具执行在调用端**：relay 只转发工具调用和结果，不会替客户端执行命令或写文件。模型声称“已下载 / 已写入”但本地没有文件，说明客户端没有真正执行工具，请检查客户端是否把 `tools` 发给 relay、是否回传了 `role: "tool"` 结果。
 - **端点选择**：不想手动切换时打开「自动路由」；需要工具调用时优先用 IDE Agent 或 Remote。IDE Raw 已从正式控制台和打包预设中移除，个人账号不要选择 `UPSTREAM_MODE=raw`。切换端点或开关后无需重启，立即生效。
