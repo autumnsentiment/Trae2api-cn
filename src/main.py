@@ -11833,6 +11833,72 @@ async def handle_anthropic_count_tokens(req: Request):
     )
 
 
+# Keys that ship as examples or are trivially guessable.  ``.env.example``
+# ships ``your-master-key``; a plain ``cp .env.example .env`` must not turn
+# into a reachable relay protected by a value anyone can read from the repo.
+_PLACEHOLDER_API_KEYS = {
+    "",
+    "your-master-key",
+    "your-key",
+    "changeme",
+    "change-me",
+    "master-key",
+    "key",
+    "key1",
+    "test",
+    "test-key",
+    "sk-xxx",
+}
+
+
+def _placeholder_api_keys() -> list[str]:
+    return [key for key in API_KEYS if key.strip().lower() in _PLACEHOLDER_API_KEYS]
+
+
+def _is_lan_reachable() -> bool:
+    """True when the configured host accepts connections beyond loopback."""
+
+    host = str(HOST or "").strip().lower()
+    if host in ("0.0.0.0", "::", "*"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not (address.is_loopback or address.is_unspecified)
+
+
+def _warn_insecure_lan_key() -> None:
+    """Warn loudly when a non-loopback bind has no real API key.
+
+    The relay spends the signed-in account's own upstream quota and, by
+    design, leaves the management endpoints public to private networks.  That
+    is acceptable on a trusted LAN only if the model endpoints are protected,
+    so a blank or placeholder key on a reachable host is a deployment mistake
+    worth surfacing at startup rather than discovering after the quota is gone.
+    """
+
+    if not _is_lan_reachable():
+        return
+    placeholders = _placeholder_api_keys()
+    if not API_KEYS:
+        logger.warning(
+            "LAN mode without RELAY_API_KEYS: %s is reachable from the network "
+            "and /v1 is unprotected. Set RELAY_API_KEYS (or start with "
+            "./start_lan.sh, which mints one) before exposing this relay.",
+            HOST,
+        )
+        return
+    if placeholders:
+        logger.warning(
+            "LAN mode with placeholder API key(s) %s: /v1 on %s is protected by "
+            "a guessable value. Replace RELAY_API_KEYS with a random key "
+            "(./start_lan.sh generates and persists one).",
+            ", ".join(repr(key) for key in placeholders),
+            HOST,
+        )
+
+
 async def init_app():
     _load_usage_history()
     _load_usage_stats()
@@ -11840,6 +11906,7 @@ async def init_app():
     _restore_persisted_relay_settings()
     auth.apply_max_mode_settings()
     _schedule_pending_usage_enrichment()
+    _warn_insecure_lan_key()
     logger.info(
         "Trae CN relay initialized (auth source=%s edition=%s cli=%s)",
         auth.get_auth().source,
