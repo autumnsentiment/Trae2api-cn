@@ -324,13 +324,15 @@ class Issue6SettingsTests(unittest.TestCase):
             else:
                 os.environ["TRAE_MODEL_API_HOST"] = old_env
 
-    def test_ide_raw_is_not_a_formal_endpoint_preset(self):
-        """Personal accounts cannot satisfy Raw's enterprise app-config check."""
+    def test_enterprise_raw_is_a_formal_endpoint_preset(self):
+        """The restored enterprise entrance is selectable without hiding it."""
 
-        self.assertNotIn(
-            "raw",
-            {str(item.get("id") or "").strip().lower() for item in main_module.UPSTREAM_ENDPOINT_PRESETS},
+        raw = next(
+            item for item in main_module.UPSTREAM_ENDPOINT_PRESETS
+            if str(item.get("id") or "").strip().lower() == "raw"
         )
+        self.assertEqual(raw["mode"], "raw")
+        self.assertEqual(raw["endpoint_path"], "/api/ide/v2/llm_raw_chat")
 
     def test_legacy_settings_update_migrates_or_clears_stale_endpoint_id(self):
         """URL/mode-only callers must not resurrect a previous shared URL tier."""

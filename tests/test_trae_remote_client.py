@@ -123,6 +123,20 @@ class _Client:
 
 
 class RemoteClientTests(unittest.TestCase):
+    def test_model_session_id_uses_prompt_cache_key_affinity(self):
+        base = {"_account_id": "account-1", "_session_variant": "default"}
+        first = trae_remote_client.model_session_id(
+            "glm-5.2", {**base, "_prompt_cache_key_affinity": "stable-prefix-a"}
+        )
+        second = trae_remote_client.model_session_id(
+            "glm-5.2", {**base, "_prompt_cache_key_affinity": "stable-prefix-a"}
+        )
+        other = trae_remote_client.model_session_id(
+            "glm-5.2", {**base, "_prompt_cache_key_affinity": "stable-prefix-b"}
+        )
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+
     def test_work_common_params_uses_bound_paid_account_identity(self):
         params = json.loads(
             trae_remote_client.common_params(
@@ -2725,27 +2739,29 @@ class RemoteClientTests(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(body["error"]["type"], "upstream_model_mismatch")
 
-    def test_dispatch_accepts_tools_in_remote_mode(self):
-        """Tools are no longer rejected in remote mode; they are injected as a
-        system prompt and the upstream response is filtered for tool calls."""
+    def test_dispatch_routes_remote_tool_policy_to_ide(self):
+        """Remote tool policies must use an endpoint preserving caller tools."""
         messages = [{"role": "user", "content": "inspect"}]
         options = {"tools": []}
         remote = AsyncMock(return_value="remote-ok")
+        ide = AsyncMock(return_value="ide-ok")
 
         async def run():
             with (
                 patch.object(main_module, "UPSTREAM_MODE", "remote"),
                 patch.object(main_module, "_run_remote_with_retry", remote),
+                patch.object(main_module, "run_ide_chat", ide),
             ):
                 return await main_module._dispatch_chat(
                     messages, "auto", False, options
                 )
 
         response = asyncio.run(run())
-        self.assertEqual(response, "remote-ok")
-        remote.assert_awaited_once()
+        self.assertEqual(response, "ide-ok")
+        ide.assert_awaited_once()
+        remote.assert_not_awaited()
         called_messages, called_model, called_stream, called_options = (
-            remote.await_args.args
+            ide.await_args.args
         )
         self.assertEqual(called_messages, messages)
         # Tool-bearing automatic requests are classified as complex.  When

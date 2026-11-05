@@ -152,7 +152,10 @@ class TaskModelRoutingTests(unittest.TestCase):
 
     def test_remote_tier_catalog_is_account_scoped(self):
         cache = {
-            "account-1:solo_agent_remote": (
+            main.trae_client._model_catalog_cache_key(
+                user_id_override="account-1", agent_type="solo_agent_remote",
+                raw_chat_function="solo_agent_remote",
+            ): (
                 main.time.time(),
                 {
                     "deepseek-v4.1-flash": {
@@ -184,7 +187,10 @@ class TaskModelRoutingTests(unittest.TestCase):
             }
         }
         work_cache = {
-            "account-1:solo_work_remote": (main.time.time(), model),
+            main.trae_client._model_catalog_cache_key(
+                user_id_override="account-1", agent_type="solo_work_remote",
+                raw_chat_function="solo_work_remote",
+            ): (main.time.time(), model),
         }
         with patch.object(main.trae_client, "_WEB_MODEL_CACHE", work_cache):
             self.assertTrue(
@@ -195,7 +201,10 @@ class TaskModelRoutingTests(unittest.TestCase):
             )
 
         agent_cache = {
-            "account-1:solo_agent_remote": (main.time.time(), model),
+            main.trae_client._model_catalog_cache_key(
+                user_id_override="account-1", agent_type="solo_agent_remote",
+                raw_chat_function="solo_agent_remote",
+            ): (main.time.time(), model),
         }
         with patch.object(main.trae_client, "_WEB_MODEL_CACHE", agent_cache):
             self.assertFalse(
@@ -230,7 +239,10 @@ class TaskModelDispatchTests(unittest.IsolatedAsyncioTestCase):
         remote = AsyncMock(return_value={"route": "remote"})
         ide = AsyncMock(return_value={"route": "ide"})
         cache = {
-            "account-1:solo_agent_remote": (
+            main.trae_client._model_catalog_cache_key(
+                user_id_override="account-1", agent_type="solo_agent_remote",
+                raw_chat_function="solo_agent_remote",
+            ): (
                 main.time.time(),
                 {
                     "deepseek-v4.1-flash": {
@@ -273,7 +285,10 @@ class TaskModelDispatchTests(unittest.IsolatedAsyncioTestCase):
         ide = AsyncMock(side_effect=RuntimeError("IDE unavailable"))
         remote = AsyncMock(return_value={"route": "remote"})
         cache = {
-            "account-1:solo_agent_remote": (
+            main.trae_client._model_catalog_cache_key(
+                user_id_override="account-1", agent_type="solo_agent_remote",
+                raw_chat_function="solo_agent_remote",
+            ): (
                 main.time.time(),
                 {
                     "deepseek-v4.1-flash": {

@@ -15,10 +15,10 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 - 图片输入：`image_url` / Anthropic `image` 块会转成 Trae 渲染层媒体块；所选模型不支持视觉时自动改用多模态模型
 - 完整工具调用：`tools` / `tool_choice`（auto / none / required / 指定函数）/ `parallel_tool_calls`，流式输出标准 `delta.tool_calls`
 - Codex Responses API：文本流、`function_call`、`custom_tool_call`、namespace 工具、`*_call_output` 续轮和 `previous_response_id`
-- thinking 与正文分离：思考内容只进 `reasoning_content` / Responses reasoning 事件，不混入正文，且默认压缩为关键结论
+- thinking 与正文分离：思考内容进入 `reasoning_content` / Responses reasoning 事件；控制台可切换关键节点与完整思考文本
 - 思考强度：`reasoning_effort` / `thinking.budget_tokens` 映射到 Trae 原生 `light` / `high` / `extra_high`，按模型声明的档位自动钳制
-- 四个正式可切换上游端点：Remote、Work、Solo、IDE，原生端点失败时可自动回落 Remote
-- 自动路由开关：工具或图片请求走 IDE Agent，纯文字聊天走 Remote；失败可回落 Remote，超限图片保留原端点错误
+- 四个正式可切换上游端点：Remote、Work、Solo、IDE；纯文本请求可按端点策略回落，调用方工具请求默认使用 IDE，保留显式选择的兼容工具链路
+- 自动路由开关：工具或图片请求走 IDE Agent，纯文字聊天走 Remote；工具请求不会回落到不支持调用方工具的 Remote/Work 传输
 - 多账号：网页 OAuth 登录、手动添加凭证、账号模型请求开关（不影响签到）、顺序轮询 / 积分优先轮询、每账号并发槽位与排队
 - 每日签到：一键签到、定时自动签到（控制台开关 + 每日时间，北京时间）、9074 风控自动换设备 ID 并退避重试、后台错峰自动重试
 - 积分与消费记录：统一显示通用积分，按请求记录 tokens、单次积分、状态、思考强度、上下文模式及工具调用
@@ -37,18 +37,15 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 | Solo | `solo` | 默认 `https://trae-api-cn.mchost.guru` + `/api/ide/v2/llm_raw_chat`；请求失败时依次尝试 v1 和已知调度主机 `api5-normal.mchost.guru` | 由 TraeCode `raw_chat_function=solo_agent` 承接；工具字段按原生协议/提示桥接 | 由模型 `CustomModel` 声明决定 | TraeCode SOLO 本地链路；Remote 沙箱仍使用 `solo_agent_remote` |
 | IDE Agent | `ide` | 默认 `https://trae-api-cn.mchost.guru` + `/api/ide/v2/llm_raw_chat`；请求失败时依次尝试 v1 和已知调度主机 `api5-normal.mchost.guru` | 由 `raw_chat_function=chat_v3` / `builder_v3` 承接 | 由模型 `CustomModel` 声明决定 | TraeCode IDE 主聊天链路；与 Remote 基址分离，回落 Remote 仍保留 `/api/remote/v1` |
 | Work | `work`（`work-agent` 为旧兼容别名） | `/api/remote/v1/chat_sessions`，请求固定 `agent_type=agent_id=solo_work_remote` | 由 Work 档模型配置决定 | Work 不启用 1M Max | TraeWork 产品链路；Work 失败时清除 Work 绑定并回落普通 Remote Agent |
+| 企业 Raw（实验性） | `raw` | `/api/ide/v2/llm_raw_chat` | 工具提示桥接，未完成企业实测 | 未完整验证 | 企业模式固定所选账号，禁止回退到普通通道；模型请求链路尚不完整 |
 
 部分模型在 Remote / Work 上会出现上游 `4028` / 502（例如 deepseek-v4-pro），此时请切换到 IDE Agent。需要完整工具能力（含并行调用）时推荐 IDE Agent；只聊天或需要思考强度时用 Remote。
 
-> **IDE Raw 暂不作为正式端点发布。** 逆向报告确认其协议是
-
 > **基址分离**：Web/Remote 使用 `TRAE_WEB_BASE_URL`（含 `/api/remote/v1`），TraeCode IDE / Solo 使用 `TRAE_CODE_BASE_URL`（仅主机名；旧变量 `TRAE_MODEL_API_HOST` 兼容）。两者分开保存，选择 IDE/SOLO 预设不会再破坏 Remote 回落（#9）。
-> `POST /api/ide/v2/llm_raw_chat`，但个人账号的 Cloud-IDE-JWT 没有企业
-> app config 时，上游在鉴权/配置绑定阶段固定返回
-> `2001 failed to get app config: record not found`。这不是请求体、模型名或
-> SSE 重试可以修复的错误，必须使用企业版 app config/PAT。relay 仍保留
-> `raw_client.py` 和显式 `UPSTREAM_MODE=raw` 供内部协议诊断，但正式控制台、
-> 模型测试页和预设列表不再暴露该端点。
+
+控制台「企业版入口」可选择已导入的企业账号并启用企业模式。启用后请求固定使用该账号和 Raw 通道，不参与普通账号轮询，也不因错误回退到个人通道；关闭后恢复原先保存的普通端点、自动路由和账号选择。企业权限由所选 Cloud-IDE-JWT 及对应 App ID/配置决定，不能按 Pro 等级或积分推断。个人账号缺企业 app config 时仍会收到上游 `2001 failed to get app config: record not found`。当前不增加未经验证的 PAT 鉴权协议。
+
+> **企业入口为实验性功能。** 企业级账号的权益信息可以查询和查看，但目前没有可用于联调的企业级账号，企业模型请求链路尚不完整，也未完成真实企业账号的端到端验证。当前可能存在无法发起模型请求、缺失 App ID 或应用配置的情况，并可能返回 `2001 failed to get app config: record not found`。权益可见不代表模型请求已经可用，开启企业开关也不会自动补齐缺失的应用配置。
 
 ## 认证方式
 
@@ -78,7 +75,7 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
 GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
-Run workflow** 手动执行，默认会构建 `v1.0.10`。部署机器不需要安装 Python、
+Run workflow** 手动执行，默认会构建 `v1.0.11`。部署机器不需要安装 Python、
 Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
 
 ```bash
@@ -89,7 +86,7 @@ docker compose -f docker-compose.image.yml up -d
 
 镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
 拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
-版本标签，例如 `:1.0.10`。更新已有部署时执行
+版本标签，例如 `:1.0.11`。更新已有部署时执行
 `docker compose -f docker-compose.image.yml pull`，再执行
 `docker compose -f docker-compose.image.yml up -d`。
 
@@ -169,9 +166,11 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TRAE_AUTH_SOURCE` | `auto` | 认证来源 |
-| `UPSTREAM_MODE` | `remote` | 上游模式：`remote` 为 Trae Remote Agent；`work`/`work-agent` 为 TraeWork Work-tier Remote；`solo`/`ide` 为 TraeCode raw；另有 `cli` / `web`；`raw` 仅供内部诊断 |
+| `UPSTREAM_MODE` | `remote` | 上游模式：`remote` 为 Trae Remote Agent；`work`/`work-agent` 为 TraeWork Work-tier Remote；`solo`/`ide` 为 TraeCode raw；另有 `cli` / `web`；`raw` 为企业入口 |
 | `TRAE_WEB_SLOT_TIMEOUT` | `60` | 等待账号并发槽位的超时（秒）；所有账号槽位占满时请求排队等待 |
-| `TRAE_VERBOSE_REASONING` | 空 | 设为 `1` 时输出完整思考链；默认只保留压缩后的关键结论 |
+| `TRAE_VERBOSE_REASONING` | `0` | 完整思考文本输出默认值；控制台「思考链路输出」保存后以持久设置为准，重启保留；单次请求显式关闭输出时优先遵循请求 |
+| `TRAE_ENTERPRISE_ENABLED` | `0` | 企业版账号模式默认值；控制台保存后以持久设置为准 |
+| `TRAE_ENTERPRISE_ACCOUNT_ID` | 空 | 企业模式固定使用的已导入账号 ID；不影响关闭企业模式后的普通账号选择 |
 | `TRAE_MAX_COMPLETION_TOKENS` | `64000` | OpenAI/Anthropic 入站输出预算的 relay 硬上限；不按模型名推断模型能力。上游仍可能按当前账号/tier/function 的 descriptor 施加更低限制；Raw v2 不转发该生成参数 |
 | `TRAEWORK_CUSTOM_UPSTREAM_MODE` | `remote` | TraeWork custom-model/raw 入站使用的上游；默认走已验证的 remote 会话，`raw` 仅保留作原生协议诊断 |
 | `TRAE_CHECKIN_DEVICE_ID` | 空 | 可选的 TraeWork 原生 `guaranteedDeviceId`；配置后签到优先使用真实客户端设备身份 |
@@ -180,7 +179,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_CHECKIN_9074_RETRY_SECONDS` | `60` | 上游返回业务码 9074 后提示的最短重试等待时间；relay 不会立即重复 claim |
 | `TRAE_CHECKIN_9074_MAX_BACKOFF_SECONDS` | `3600` | 连续 9074 指数退避的等待上限（秒） |
 | `TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS` | `60` | 后台自动错峰重试的扫描间隔（秒），到点自动 claim 冷却到期的账号 |
-| `TRAE_RAW_BASE_URL` | `https://trae-api-cn.mchost.guru` | 内部 Raw v2 诊断地址；个人账号缺企业 app config 时会返回 `2001 record not found`，不属于正式能力 |
+| `TRAE_RAW_BASE_URL` | `https://trae-api-cn.mchost.guru` | 企业 Raw v2 地址；个人账号缺企业 app config 时会返回 `2001 record not found` |
 | `TRAE_RAW_MAX_MESSAGES` | `80` | raw 请求保留的非系统历史消息上限；会保留最近连续历史及边界工具调用配对 |
 | `TRAE_RAW_MAX_HISTORY_CHARS` | `120000` | raw 历史文本字符上限，避免重复工具 schema 和过长历史造成额外消费 |
 | `TRAE_RAW_MAX_TOOL_SCHEMA_CHARS` | `48000` | raw 系统提示中的工具 schema 字符预算；超限时保留全部工具名并压缩为字段签名，减少输入积分消耗 |
@@ -188,7 +187,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_REMOTE_MAX_MESSAGES` | `500` | remote 会话保留的非系统历史消息上限 |
 | `TRAE_REMOTE_MAX_HISTORY_CHARS` | `480000` | remote 历史文本字符上限（压缩阶段） |
 | `TRAE_REMOTE_QUERY_MAX_CHARS` | `480000` | remote 实际 query（含图片 Base64）的硬上限；上游超过约 500K 字符会静默结束事件流，超限时从最早的非系统消息开始裁剪；仅裁文字，不截断图片，仍超限则在请求上游前返回 413 |
-| `TRAE_AUTO_ROUTE` | `0` | 自动路由默认值，控制台「自动路由」开关保存后以控制台为准；开启后带图片、`tools` / `tool_choice` 或工具历史的请求走 IDE Agent，纯文字聊天走 Remote；失败可回落 Remote，压缩后仍超过 Remote query 上限的图片请求不回落 |
+| `TRAE_AUTO_ROUTE` | `0` | 自动路由默认值，控制台「自动路由」开关保存后以控制台为准；开启后带图片、`tools` / `tool_choice` 或工具历史的请求走 IDE Agent，纯文字聊天走 Remote；工具协议不允许回落到不支持调用方工具的 Remote/Work，压缩后仍超过 Remote query 上限的图片请求保留原端点错误 |
 | `TRAE_AUTO_CHECKIN` | `0` | 定时自动签到默认值，控制台「自动签到」开关保存后以控制台为准 |
 | `TRAE_AUTO_CHECKIN_TIME` | `08:30` | 每日自动签到时间（`HH:MM`，北京时间）；relay 晚于该时间启动时当天会补签一次 |
 | `TRAE_REMOTE_MAX_MODE` | `0` | 默认值，控制台「1M 上下文」开关保存后以控制台为准（写入 `data/accounts.json`，重启后保留）；仅当当前账号与 raw function 的模型 descriptor 明确声明 `max_mode` 及上下文/输出上限时启用 Max，不合成 1M/936K/64K 参数 |
@@ -196,7 +195,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_REMOTE_MAX_MODE_TYPE` | `1` | 服务端 `get_model_selection_modes` 的模式枚举；`1` 已实测生效 |
 | `TRAE_REMOTE_AGENT_FIRST` | `1` | remote 是否默认锁定 Agent 执行器；关闭后普通请求直接使用 Work |
 | `TRAE_REMOTE_WORK_FALLBACK` | `1` | Agent 创建失败或可重试空响应时，是否同账号回退一次 Work |
-| `TRAE_REMOTE_CALLER_TOOLS_USE_WORK` | `0` | remote 请求默认统一使用 Agent（包括带 `tools` 的请求）；设为 `1` 才将调用端工具请求固定到 Work，以便工具在调用端/本地工作区执行 |
+| `TRAE_REMOTE_CALLER_TOOLS_USE_WORK` | `0` | 内部 Remote 兼容链路是否把调用端工具桥接回合固定到 Work；公开模型接口会先把调用方工具请求路由到支持工具协议的端点 |
 | `TRAE_TASK_MODEL_ROUTING` | `1` | 是否对 `model=auto` 按任务复杂度选模型；显式模型不受影响，设为 `0` 可恢复 provider-owned auto |
 | `TRAE_SIMPLE_MODEL` | `deepseek-v4.1-flash` | 自动路由的简单任务模型 |
 | `TRAE_COMPLEX_MODEL` | `6.1sol` | 自动路由的复杂任务模型；仅在当前目录确认可用时发送 |
@@ -216,6 +215,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_USAGE_SESSION_QUERY` | `true` | 有上游回合 ID 时异步查询精确积分；失败自动回退账号快照差值 |
 | `TRAE_USAGE_API_HOST` | `https://api5-normal.mchost.guru` | TraeWork 商业用量查询主机，不与 entitlement API 混用 |
 | `TRAE_USAGE_QUERY_TIMEOUT_SECONDS` | `15` | 回合积分查询超时时间；只影响后台 enrichment |
+| `TRAE_CACHE_USAGE_LOOKUP_TIMEOUT_SECONDS` | `3` | Remote 与旧版 `llm_utils_chat` 缓存明细缺失或全部为零时，查询对应请求商业账单的总等待上限（秒），最大 `10`，`0` 禁用；流式正文立即转发，仅末尾 usage/结束帧可能等待 |
 | `TRAE_USAGE_CREDIT_SETTLE_SECONDS` | `1` | 请求完成后等待上游积分账单落库再计算单次积分差值 |
 | `TRAE_USAGE_MAX_HISTORY` | `1000` | 消费明细保留上限；每日汇总不受影响 |
 | `TRAE_USAGE_QUERY_RETRIES` | `5` | 回合积分账单为空或暂不可用时的查询次数 |
@@ -320,11 +320,11 @@ IDE Agent 使用原生工具协议：schema 放入上游 `tools`，`parameters` 
 }
 ```
 
-路由规则：选中的端点总是第一个尝试。`ide` / `solo` / `work`（以及旧别名 `work-agent`）失败时回落 `remote`；Raw 仅在显式内部诊断模式下按兼容逻辑处理。空响应仅在允许重试且未观察到模型活动时可跨端点回落。已收到输出、provider、usage 或工具事件，或返回不可重试错误时，不重放模型请求，避免重复消费。公开流的初始空 delta / 心跳不是模型输出。`TRAE_REMOTE_ONLY_MODELS` 可把指定模型强制送往 remote，`*` 表示全部。
+路由规则：请求包含调用方工具定义、工具选择参数或工具历史时，先约束到支持该协议的端点；显式选择 Remote/Work 也会改送 IDE，工具请求不回落 Remote/Work。普通文本请求会先尝试所选端点，`ide` / `solo` / `work`（以及旧别名 `work-agent`）失败时可回落 `remote`。企业模式会固定选定账号并送往 Raw，禁止回落到个人端点；关闭企业模式后恢复普通路由。空响应仅在允许重试且未观察到模型活动时可跨端点回落。已收到输出、provider、usage 或工具事件，或返回不可重试错误时，不重放模型请求，避免重复消费。公开流的初始空 delta / 心跳不是模型输出。`TRAE_REMOTE_ONLY_MODELS` 可把指定的普通文本模型请求强制送往 remote，`*` 表示全部；它不会覆盖工具协议约束。
 
-自动路由：在「轮询与设置 → 自动路由」打开开关（或 `POST /api/auto-route {"enabled":true}`）后，每个请求按内容选端点：请求带图片、`tools` / `tool_choice` / `parallel_tool_calls`，或历史中有工具调用 / 工具结果时走 IDE Agent，纯文字聊天走 Remote；IDE Agent 失败时按上面的规则回落 Remote。图片经 IDE 原生媒体通道发送，不占用 Remote 的扁平化 query 预算；显式指定的模型保持不变。显式指定端点不受自动路由改写；回落前会检查含图片的完整 query，压缩后仍超限则跳过 Remote 并保留原端点错误，小图仍可正常回落。显式选择 Remote 时，超限请求返回 413，不再轮询重放。开关开启时预设端点的模式选择不再生效，关闭后恢复预设端点。本地 CLI / TraeWork native 模式不受影响。模型测试页可选「自动路由」单独验证，不需要打开全局开关。
+自动路由：在「轮询与设置 → 自动路由」打开开关（或 `POST /api/auto-route {"enabled":true}`）后，每个请求按内容选端点：请求带图片、`tools` / `tool_choice` / `parallel_tool_calls`，或历史中有工具调用 / 工具结果时走 IDE Agent，纯文字聊天走 Remote。调用方工具属于传输约束：显式选择 Remote、Work 等不支持该协议的端点时，带工具请求也会改送 IDE/Solo；首个模型事件前的普通文本错误仍可按端点策略回落，但工具请求不会重放到不安全端点。图片经 IDE 原生媒体通道发送，不占用 Remote 的扁平化 query 预算；显式指定的模型保持不变。回落前会检查含图片的完整 query，压缩后仍超限则跳过 Remote 并保留原端点错误，小图仍可正常回落。显式选择 Remote 时，超限请求返回 413，不再轮询重放。开关开启时预设端点的模式选择不再生效，关闭后恢复预设端点。本地 CLI / TraeWork native 模式不受影响。模型测试页可选「自动路由」单独验证，不需要打开全局开关。
 
-内部 Raw 诊断端点的 HTTP body 固定为 `config_name`、`conversation_id`、`messages`、`model_name`、`session_id`、`stream` 六个字段，OpenAI 工具字段由 relay 转成系统提示，再把模型文本中的工具调用解析回 OpenAI 事件；个人账号因缺少企业 app config 仍无法通过上游绑定校验。
+企业 Raw 端点的 HTTP body 固定为 `config_name`、`conversation_id`、`messages`、`model_name`、`session_id`、`stream` 六个字段，OpenAI 工具字段由 relay 转成系统提示，再把模型文本中的工具调用解析回 OpenAI 事件；个人账号因缺少企业 app config 仍无法通过上游绑定校验。企业开关优先于自动路由，`POST /api/enterprise {"enabled":true,"account_id":"已导入账号ID"}` 启用，`{"enabled":false}` 关闭；`GET /api/enterprise` 返回当前设置。
 
 ### 传输实现说明
 
@@ -344,11 +344,13 @@ raw 模式不会向上游发送其不接受的 OpenAI 顶层工具字段，也�
 
 在控制台「轮询与设置 → 1M 上下文（Max 模式）」打开开关即可，新会话立即生效，无需重启。「生效模型」留空表示账号中所有标记 `max_mode` 的模型；点「检测支持的模型」可列出当前账号支持 Max 的模型并一键加入。单次请求也可带 `"trae_max_mode": true` 临时开启。
 
-Max 只作用于 Remote 端点的 Agent 会话。Remote 请求默认先走 Agent，包含带调用端工具的请求；若需要让调用端工具固定在本地工作区执行，可设置 `TRAE_REMOTE_CALLER_TOOLS_USE_WORK=1`，此时该回合使用 Work 且不会使用 Max。IDE / Work 端点也不使用 Max。模型测试页勾选「1M Max」可确认是否实际生效。
+Max 只作用于 Remote 端点的 Agent 会话。带调用端工具的请求会优先使用 IDE/Solo 原生工具链，不会为了 Max 回落到不支持工具协议的 Remote/Work；`TRAE_REMOTE_CALLER_TOOLS_USE_WORK` 仅保留给无原生工具协议的兼容 Remote 场景。IDE / Work 端点不使用 Max。模型测试页勾选「1M Max」可确认是否实际生效。
 
 ## 思考内容与思考强度
 
-思考内容默认不对外输出。请求带 `thinking: {"type": "enabled"}`（或 `include_reasoning: true`）时，Chat 返回 `reasoning_content`，Responses 返回独立的 reasoning 事件，正文 `content` 中不会出现思考文本。思考内容默认被压缩为关键结论，设置 `TRAE_VERBOSE_REASONING=1` 可恢复完整输出。
+请求带 `thinking: {"type": "enabled"}`（或 `include_reasoning: true`）时，Chat 返回 `reasoning_content`，Responses 返回独立的 reasoning 事件，正文 `content` 中不会出现思考文本。默认保持现有关键节点呈现；在「轮询与设置 → 思考链路输出」开启「输出完整思考文本」后，返回上游提供的完整思考文本，省略请求开关时也会输出。请求显式设置 `thinking: {"type":"disabled"}` 或 `include_reasoning:false` 仍优先。该开关仅改变输出呈现，不强制上游生成思考，也不改变思考强度。
+
+开关通过 `POST /api/reasoning-output {"enabled":true}` 保存，`GET /api/reasoning-output` 查询。设置同时保存在 `data/accounts.json` 和 `.env`，重启后保留；首次默认值可用 `TRAE_VERBOSE_REASONING=1` 配置。
 
 思考强度支持以下写法，统一映射到 Trae `custom_model.reasoning_effort`：
 
@@ -357,10 +359,22 @@ Max 只作用于 Remote 端点的 Agent 会话。Remote 请求默认先走 Agent
 | `reasoning_effort: minimal / low` | `light` |
 | `reasoning_effort: medium / high` | `high` |
 | `reasoning_effort: xhigh / max / ultra` | `extra_high` |
-| `reasoning: {"effort": ...}`（Responses） | 同上 |
+| `reasoning: {"effort": ...}`（Chat / Responses） | 同上 |
+| `reasoningEffort` / `thinking_effort` / `output_config.effort` | 同上 |
+| `thinking.effort` / `thinking.level` | 同上 |
 | `thinking.budget_tokens` < 4096 / < 16384 / 更大 | `light` / `high` / `extra_high` |
 
-档位会被钳制到模型 `reasoning_effort_config` 声明的选项内。模型不支持思考档位或端点不接受该字段时（IDE Agent、内部 Raw 诊断），请求照常完成，强度字段被忽略；模型测试页会显示未生效原因。
+档位会被钳制到当前 Trae 模型描述中的 `reasoning_effort_config` 选项内，不按官方模型名称推断能力。支持该字段的 IDE/Solo 原生描述会把强度写入对应的 Trae 字段；模型不支持思考档位或旧版端点不接受该字段时，请求照常完成并在上游追踪中标记未生效，模型测试页会显示原因。
+
+模型目录缓存按账号、Agent/Work 档位、原生 `raw_chat_function`、网关与客户端身份参数隔离；同一范围的并发冷读取共享一次上游请求。查询先使用 Remote 目录，缺失时仍会补查 Solo，避免已预热的 Remote 缓存屏蔽 Solo 独有模型。工具 schema 和客户端上下文中的 JSON 对象键保持稳定顺序，减少等价请求因键顺序变化而破坏上游提示缓存；实际推理缓存命中由上游决定，relay 不会伪造命中或把一次响应当作另一轮响应缓存。
+
+推理缓存与模型目录缓存是两件事：`cached_tokens` / `cache_write_tokens` 采用 Trae 明确报告的计数。Remote/Work 的 `token_usage` 可能是扁平或多层包装，relay 会保留这两种格式。2026 年 10 月 27 日晚开始，已观察到 Remote SSE 缓存读写均为 0、同一 turn 的商业账单却报告真实缓存读取的情况；旧版 `llm_utils_chat` 也已复现，因此 SSE 的 0 不能单独证明未命中。Remote 与该旧版端点的缓存明细缺失或全部为零时，relay 会用本次账号和已验证的账单 ID 查询商业账单；输入 token 总数必须精确匹配，旧版端点还必须匹配输出 token 总数，缓存计数有效后才补入最终 usage，再转发到 Chat、Responses、Messages 和 TraeWork。已有非零缓存明细时不发起补查。
+
+旧版 `llm_utils_chat` 按请求体 `session_id` 累计商业账单，复用逻辑会话 ID 会把多轮用量合并。该端点的实际发送层因此为每次请求生成独立账单 ID，写入上游 `session_id` 和 `request_id`；反代逻辑会话、账号绑定及工具调用/结果历史保持原样。其他端点不套用此规则，没有可靠商业账单标识的调用仍不补查。
+
+账单补查不改写输入、输出或总 token 数，也不把账单总计和子项重复相加。流式正文立即转发，仅末尾 usage/结束帧最多等待 `TRAE_CACHE_USAGE_LOOKUP_TIMEOUT_SECONDS`；禁用、超时、账单缺失或不匹配时保留原响应。相同前缀、同一缓存键或第二次请求都不保证缓存命中，不能作为补造计数的依据。发布范围和验证结果见 [v1.0.11 发布说明](docs/release-v1.0.11.md)。
+
+DSH 的自定义提供商模型还需要在客户端逐模型声明 `reasoningEfforts`，relay 返回的模型扩展元数据不保证被 DSH 的模型发现流程采用。DSH 0.2.0-rc.2 的模型编辑器没有此项，需在主机 profile 配置中补齐，或使用带此编辑器的 DSH 版本。声明的档位必须来自当前账号和所选端点的 Trae 描述；不要直接照搬官方同名模型的档位。经 new-api 接入时也应使用目标分组的 API Key，确认消费记录实际命中 Trae 渠道。相关限制见 [v1.0.11 发布说明](docs/release-v1.0.11.md)。
 
 ## Codex Responses API
 
@@ -436,15 +450,15 @@ export ANTHROPIC_MODEL=glm-5.3
 - **网络边界**：本项目设计为内网部署。不要把 8000 端口直接暴露到公网；如必须公网访问，请设置 `RELAY_API_KEYS` 并在前面加 TLS 反代。管理接口和模型测试接口对内网地址免鉴权。
 - **敏感数据**：`.env` 与 `data/`（`accounts.json`、`usage_records.json`）包含 JWT、刷新令牌和账号信息，已在 `.gitignore` 和 `.dockerignore` 中排除，切勿提交或分享。
 - **工具执行在调用端**：relay 只转发工具调用和结果，不会替客户端执行命令或写文件。模型声称“已下载 / 已写入”但本地没有文件，说明客户端没有真正执行工具，请检查客户端是否把 `tools` 发给 relay、是否回传了 `role: "tool"` 结果。
-- **端点选择**：不想手动切换时打开「自动路由」；需要工具调用时优先用 IDE Agent 或 Remote。IDE Raw 已从正式控制台和打包预设中移除，个人账号不要选择 `UPSTREAM_MODE=raw`。切换端点或开关后无需重启，立即生效。
+- **端点选择**：不想手动切换时打开「自动路由」；需要调用方工具时使用 IDE Agent 或 Solo，或让自动路由处理端点约束。带工具请求不会回落到不支持工具协议的 Remote/Work。使用企业 Raw 时在「企业版入口」固定具有对应 App 权限的账号。切换端点或开关后无需重启，后续请求生效。
 - **截断处理**：relay 不会自动续写或隐式重放模型请求；收到 `finish_reason=length` 或上游提前断流时，由调用端决定是否发起下一轮，避免重复消费和工具回合错乱。
 - **上下文长度**：remote 扁平化 query 约 500K 字符时上游会静默断流，relay 默认在 480K 字符处裁剪最早的历史。长会话建议客户端自行压缩上下文。
 - **并发**：账号记录会保存 entitlement 返回的 `user_pay_identity`、`user_pay_identity_str` 和 `quota.solo_agent_parallel_limit`；免费或未知账号默认 2 槽，付费账号使用服务返回的实际额度。所有账号的 Web、Remote、Raw、IDE 和原生工具流共用账号池；可选 `TRAE_MODEL_REQUEST_PARALLEL_LIMIT` 只作为进程级硬上限。积分优先模式按剩余积分及可用槽位分配新请求，续接会话固定原账号；每个请求使用唯一槽位 lease，关闭、取消和重试只释放自己的槽位。上游仍可能实施更低限制并返回 4011/429，此时会在首个模型事件前轮换到未尝试账号。
 - **签到 9074**：9074 是上游风控码。relay 会自动轮换签到设备 ID 并指数退避重试，无需手动反复点击；若长期失败，可在 `TRAE_CHECKIN_DEVICE_IDS_JSON` 中填入真实客户端的设备 ID。
 - **自动签到**：定时签到按顺序逐个账号执行，已签到和无凭证的账号会跳过，账号之间沿用 `TRAE_CHECKIN_INTERVAL_SECONDS` 间隔，遇到 9074 的账号交给后台退避重试。时间以北京时间计算，每天只触发一次定时任务；「立即执行」不会占用当天的定时任务。
-- **用量统计**：缓存 tokens 仅在上游返回时统计，旧记录按 0 计；日期按北京时间划分，最多保留 400 天。
+- **用量统计**：缓存读写 tokens 和 reasoning tokens 采用上游 usage 的平铺或嵌套明细；Remote 与旧版 `llm_utils_chat` 缓存缺失或全零时，可由对应请求且输入量匹配的商业账单补回，旧版端点另需输出量匹配。没有验证数据的字段在汇总中显示为 0，不表示已证明实际未命中；旧记录不会按新样本推算缓存。日期按北京时间划分，最多保留 400 天。
 - **积分**：控制台只显示合并后的通用积分。单次积分需要等上游账单落库后才能计算，个别记录短时间显示 `--` 属于正常现象。
-- **502 / 空响应**：首个模型事件前的空响应会自动重试一次，仍失败时返回 502 并在错误信息中列出每个端点的失败原因。常见原因有模型未绑定到账号和上游 `4028`。如果日志出现 `raw: ... 2001 failed to get app config: record not found`，这是个人账号不具备企业 app config 的固定权限错误；正式版本已移除 Raw 预设，请改用 IDE Agent、Solo 或 Remote。
+- **502 / 空响应**：首个模型事件前的空响应会自动重试一次，仍失败时返回 502 并在错误信息中列出每个端点的失败原因。常见原因有模型未绑定到账号和上游 `4028`。如果日志出现 `raw: ... 2001 failed to get app config: record not found`，请检查所选企业账号及 App 配置；个人账号使用 IDE Agent、Solo 或 Remote。
 - **更新部署**：更新前建议先 `docker commit` 备份当前容器镜像；更新后浏览器按 Ctrl+F5 强制刷新控制台。
 - **合规**：使用本项目需自行承担账号风险，请遵守 Trae 服务条款。
 

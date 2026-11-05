@@ -12,8 +12,9 @@ import os
 import re
 import time
 import uuid
-from typing import Any, AsyncIterator, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Optional
 
+from . import auth
 from .cli_client import extract_result_text as _cli_extract_text
 from .cli_client import complete_tool_call_signature as _complete_tool_call_signature
 from .cli_client import deduplicate_tool_calls as _deduplicate_tool_calls
@@ -22,6 +23,7 @@ from .cli_client import extract_usage as _cli_extract_usage
 from .cli_client import normalize_tool_call as _normalize_tool_call
 from .cli_client import strip_tool_call_blocks as _strip_tool_call_blocks
 from .cli_client import tool_call_signature as _tool_call_signature
+from .token_usage import usage_details
 
 logger = logging.getLogger(__name__)
 
@@ -654,6 +656,31 @@ def _map_usage(usage: Any) -> Optional[dict]:
     if not isinstance(usage, dict):
         return None
 
+    # Some remote builds wrap the terminal object as ``token_usage`` or
+    # ``data.usage``. Prefer the innermost usage object for token totals while
+    # retaining the original object as a fallback for older flat frames.
+    usage_fields = (
+        "prompt_tokens",
+        "input_tokens",
+        "completion_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "cache_read_tokens",
+        "prompt_tokens_details",
+        "input_tokens_details",
+    )
+    for _ in range(4):
+        for key in ("usage", "token_usage", "tokenUsage", "metrics", "data"):
+            nested = usage.get(key)
+            if isinstance(nested, dict) and (
+                any(field in nested for field in usage_fields)
+                or any(wrapper in nested for wrapper in ("usage", "token_usage", "tokenUsage", "metrics", "data"))
+            ):
+                usage = nested
+                break
+        else:
+            break
+
     def number(*keys: str) -> int:
         for key in keys:
             value = usage.get(key)
@@ -703,19 +730,71 @@ def _map_usage(usage: Any) -> Optional[dict]:
     # Trae's raw stream reports prompt-cache hits (report 9.1:
     # cache_read_tokens / cache_write_tokens). Surface the read count in the
     # OpenAI-standard slot so a caller can see its cache savings.
-    cached = optional_number(
-        "cache_read_tokens",
-        "cacheReadTokens",
-        "cached_tokens",
-        "cachedTokens",
-        "cache_read_input_tokens",
-    )
-    if cached is not None:
-        mapped["prompt_tokens_details"] = {"cached_tokens": int(cached)}
-    reasoning = optional_number("reasoning_tokens", "reasoningTokens")
-    if reasoning is not None:
-        mapped["completion_tokens_details"] = {"reasoning_tokens": int(reasoning)}
+    details = usage_details(usage)
+    prompt_details = {
+        key: details[key]
+        for key in ("cached_tokens", "cache_write_tokens")
+        if key in details
+    }
+    if prompt_details:
+        mapped["prompt_tokens_details"] = prompt_details
+    if "reasoning_tokens" in details:
+        mapped["completion_tokens_details"] = {
+            "reasoning_tokens": details["reasoning_tokens"]
+        }
     return mapped
+
+
+def _merge_usage(previous: Optional[dict], incoming: Optional[dict]) -> Optional[dict]:
+    """Merge usage snapshots without letting a detail-only frame erase totals.
+
+    Remote transports sometimes report prompt/output totals in ``token_usage``
+    and cache details on a later terminal frame. Treat nested detail objects
+    as additive and keep established non-zero totals when a later snapshot
+    only contains zero/default placeholders.
+    """
+
+    if not incoming:
+        return previous
+    if not previous:
+        return dict(incoming)
+    merged = dict(previous)
+    nested_keys = {
+        "prompt_tokens_details",
+        "input_tokens_details",
+        "completion_tokens_details",
+        "output_tokens_details",
+    }
+    total_keys = {"prompt_tokens", "completion_tokens", "total_tokens"}
+    for key, value in incoming.items():
+        if key in nested_keys and isinstance(value, dict):
+            current = merged.get(key)
+            if isinstance(current, dict):
+                nested = dict(current)
+                for detail_key, detail_value in value.items():
+                    # Terminal frames from some Trae builds repeat the usage
+                    # object with zero-valued cache fields. Keep a previously
+                    # observed non-zero detail instead of erasing the hit.
+                    if (
+                        isinstance(detail_value, (int, float))
+                        and not isinstance(detail_value, bool)
+                        and detail_value == 0
+                        and isinstance(nested.get(detail_key), (int, float))
+                        and not isinstance(nested.get(detail_key), bool)
+                        and nested.get(detail_key) != 0
+                    ):
+                        continue
+                    nested[detail_key] = detail_value
+                merged[key] = nested
+            else:
+                merged[key] = dict(value)
+            continue
+        if value is None:
+            continue
+        if key in total_keys and value == 0 and merged.get(key, 0):
+            continue
+        merged[key] = value
+    return merged
 
 
 def _payload_finish_reason(data: Any) -> Optional[str]:
@@ -2041,6 +2120,7 @@ async def translate_ide_stream(
     require_terminal: bool = True,
     upstream_metadata: Optional[dict] = None,
     include_reasoning: bool = False,
+    usage_enricher: Optional[Callable[[Optional[dict]], Awaitable[Optional[dict]]]] = None,
 ):
     """Translate /api/ide chat or llm_raw_chat SSE into OpenAI SSE."""
     prefix_id = make_id()
@@ -2338,6 +2418,15 @@ async def translate_ide_stream(
             observed_model_event=observed_model_event,
         )
 
+    if (
+        usage_enricher is not None
+        and saw_terminal
+        and (has_visible_content or tool_calls.has_calls or reasoning_summary)
+    ):
+        enriched_usage = await usage_enricher(final_usage)
+        if enriched_usage is not None:
+            final_usage = enriched_usage
+
     if content_count == 0 and not tool_calls.has_calls and not reasoning_summary:
         yield openai_chunk(prefix_id, model, {"content": "(trae upstream returned an empty response)"})
     usage = final_usage
@@ -2397,13 +2486,14 @@ _NARRATION_PREFIX_RE = re.compile(
 )
 
 
+def full_reasoning_enabled() -> bool:
+    """Return the persisted presentation mode shared by all adapters."""
+
+    return bool(auth.get_reasoning_output_settings().get("enabled"))
+
+
 def _concise_reasoning_enabled() -> bool:
-    return str(os.environ.get("TRAE_VERBOSE_REASONING", "")).strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return not full_reasoning_enabled()
 
 
 def strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> str:
@@ -2422,6 +2512,10 @@ def strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> st
 
     if not text or not _concise_reasoning_enabled():
         return text
+    return _strip_reasoning_narration(text, hold_incomplete=hold_incomplete)
+
+
+def _strip_reasoning_narration(text: str, *, hold_incomplete: bool = False) -> str:
     if hold_incomplete and _NARRATION_PREFIX_RE.match(text):
         # Still inside a possible narration opener; wait for the full sentence.
         return ""
@@ -2454,28 +2548,33 @@ _REASONING_PRIORITY_RE = re.compile(
 
 
 def compact_reasoning_text(
-    text: Any, *, max_chars: int = 800, max_lines: int = 6
+    text: Any, *, max_chars: int = 800, max_lines: int = 6,
+    allow_full: bool = True,
 ) -> str:
-    """Return a few reasoning checkpoints instead of the model's full trace.
+    """Format upstream reasoning as full text or bounded checkpoints.
 
-    This is intentionally extractive and bounded.  It removes serialized tool
-    protocol first, splits long paragraphs into sentence-sized checkpoints,
-    de-duplicates cumulative snapshots, and retains a small set of salient or
-    final nodes.  Tool calls are parsed from the unmodified upstream payload by
-    the callers before this presentation-only summary is produced.
+    Serialized tool protocol is removed in both modes. Concise mode splits
+    paragraphs into checkpoints and retains a bounded subset. Callers using
+    reasoning as a legacy answer fallback can forbid full text independently
+    of the global presentation setting.
     """
 
     if not isinstance(text, str) or not text.strip() or max_chars <= 0 or max_lines <= 0:
         return ""
-    cleaned = _visible_text(text)
+    cleaned = _hold_incomplete_tool_block(
+        _visible_text(text), hold_escape_prefix=False
+    )
     cleaned = re.sub(
         r"<(?:think|thinking)\b[^>]*>|</(?:think|thinking)>",
         "",
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = strip_reasoning_narration(
-        cleaned.strip(), hold_incomplete=False
+    cleaned = cleaned.strip()
+    if allow_full and full_reasoning_enabled():
+        return cleaned
+    cleaned = _strip_reasoning_narration(
+        cleaned, hold_incomplete=False
     ).strip()
     if not cleaned:
         return ""
@@ -2765,12 +2864,29 @@ async def translate_web_events(
         if event == "error":
             error_event = data
             break
+        # A few remote builds attach usage details to the terminal ``done``
+        # frame instead of emitting a separate token_usage event. Capture that
+        # snapshot before the event-specific branches below so cache-read/write
+        # accounting survives every public translation mode.
+        embedded_usage = data.get("usage")
+        if isinstance(embedded_usage, dict):
+            usage = _merge_usage(usage, _map_usage(embedded_usage))
+        elif event == "done" and any(
+            key in data
+            for key in (
+                "prompt_tokens", "input_tokens", "completion_tokens",
+                "output_tokens", "cached_tokens", "cache_read_tokens",
+                "cache_write_tokens", "prompt_tokens_details",
+                "input_tokens_details",
+            )
+        ):
+            usage = _merge_usage(usage, _map_usage(data))
         reported_provider = _provider_model_name({**data, "event": event})
         if reported_provider:
             provider_model_name = reported_provider
             _check_provider_model(model, reported_provider)
         if event == "token_usage":
-            usage = _map_usage(data.get("usage") or data)
+            usage = _merge_usage(usage, _map_usage(data.get("usage") or data))
             continue
         if event == "plan_item":
             emitted_tool = False
@@ -2984,7 +3100,9 @@ async def translate_web_events(
     reasoning_raw = "\n".join(
         reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
     )
-    reasoning_summary = compact_reasoning_text(reasoning_raw)
+    reasoning_summary = compact_reasoning_text(
+        reasoning_raw, allow_full=include_reasoning
+    )
     if include_reasoning and reasoning_summary:
         if not started:
             started = True
@@ -3400,6 +3518,7 @@ async def collect_nonstream_ide(
     require_terminal: bool = True,
     upstream_metadata: Optional[dict] = None,
     include_reasoning: bool = False,
+    usage_enricher: Optional[Callable[[Optional[dict]], Awaitable[Optional[dict]]]] = None,
 ) -> dict:
     prefix_id = make_id()
     full = ""
@@ -3577,6 +3696,15 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
+    if (
+        usage_enricher is not None
+        and saw_terminal
+        and (full.strip() or reasoning_summary or tool_calls.has_calls)
+    ):
+        enriched_usage = await usage_enricher(usage)
+        if enriched_usage is not None:
+            usage = enriched_usage
+
     if not full.strip() and not reasoning_summary and not tool_calls.has_calls:
         full = "(trae upstream returned an empty response)"
     if usage is None:
@@ -3631,12 +3759,28 @@ async def collect_nonstream_web(
         if event == "error":
             error_event = data
             break
+        # Some remote builds attach cache details to the terminal ``done``
+        # frame rather than emitting a separate token_usage event. Capture
+        # embedded usage before handling the event-specific branches below.
+        embedded_usage = data.get("usage")
+        if isinstance(embedded_usage, dict):
+            usage = _merge_usage(usage, _map_usage(embedded_usage))
+        elif event == "done" and any(
+            key in data
+            for key in (
+                "prompt_tokens", "input_tokens", "completion_tokens",
+                "output_tokens", "cached_tokens", "cache_read_tokens",
+                "cache_write_tokens", "prompt_tokens_details",
+                "input_tokens_details",
+            )
+        ):
+            usage = _merge_usage(usage, _map_usage(data))
         reported_provider = _provider_model_name({**data, "event": event})
         if reported_provider:
             provider_model_name = reported_provider
             _check_provider_model(model, reported_provider)
         if event == "token_usage":
-            usage = _map_usage(data.get("usage") or data)
+            usage = _merge_usage(usage, _map_usage(data.get("usage") or data))
             continue
         if event == "plan_item":
             pid = _web_plan_state_key(data, len(reasoning_order))
@@ -3819,7 +3963,9 @@ async def collect_nonstream_web(
             content = final_summary.strip()
         elif final_summary and not content.rstrip().endswith(final_summary.rstrip()):
             content = content.rstrip() + "\n\n" + final_summary
-    reasoning_summary = compact_reasoning_text(reasoning_raw)
+    reasoning_summary = compact_reasoning_text(
+        reasoning_raw, allow_full=include_reasoning
+    )
     public_reasoning = reasoning_summary if include_reasoning else ""
     if (
         not content

@@ -2071,6 +2071,49 @@ class WebEventTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["finish_reason"], "length")
         self.assertEqual(result["usage"]["total_tokens"], 4)
 
+    def test_web_terminal_usage_merges_cache_details_into_nonstream_result(self):
+        async def events():
+            yield "planItem", {"id": "answer", "thought": "complete"}
+            yield "tokenUsage", {"inputToken": 300, "outputToken": 4}
+            yield "done", {
+                "stopReason": "stop",
+                "usage": {
+                    "input_tokens_details": {
+                        "cached_tokens": 240,
+                        "cache_write_tokens": 60,
+                    }
+                },
+            }
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(result["usage"]["prompt_tokens"], 300)
+        self.assertEqual(
+            result["usage"]["prompt_tokens_details"],
+            {"cached_tokens": 240, "cache_write_tokens": 60},
+        )
+
+    def test_web_terminal_zero_cache_placeholder_does_not_erase_hit(self):
+        async def events():
+            yield "tokenUsage", {
+                "inputToken": 300,
+                "outputToken": 4,
+                "input_tokens_details": {"cached_tokens": 240},
+            }
+            yield "done", {
+                "stopReason": "stop",
+                "usage": {
+                    "input_tokens_details": {
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                    }
+                },
+            }
+
+        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+        self.assertEqual(
+            result["usage"]["prompt_tokens_details"]["cached_tokens"], 240
+        )
+
     def test_interleaved_plan_updates_do_not_replay_later_items(self):
         async def events():
             yield "plan_item", {"id": "a", "thought": "A"}
@@ -2851,6 +2894,227 @@ class RawUpstreamErrorEventTests(unittest.TestCase):
         self.assertFalse(raised.exception.retryable)
         self.assertTrue(raised.exception.observed_model_event)
         self.assertEqual(raised.exception.usage["prompt_tokens"], 11)
+
+
+class IdeUsageEnricherTests(unittest.TestCase):
+    def _run(self, streaming, lines, **kwargs):
+        response = _LineResponse(lines)
+        if not streaming:
+            return asyncio.run(sse.collect_nonstream_ide(response, "m", **kwargs))
+        chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "m", **kwargs)))
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        return parsed
+
+    def _usage(self, streaming, result):
+        if streaming:
+            return result[-1]["usage"]
+        return result["usage"]
+
+    def test_split_native_tool_arguments_survive_enrichment(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                seen = []
+
+                async def enrich(usage):
+                    seen.append(usage)
+                    await asyncio.sleep(0)
+                    return {
+                        **usage,
+                        "prompt_tokens_details": {
+                            "cached_tokens": 2048,
+                            "cache_write_tokens": 0,
+                        },
+                    }
+
+                lines = _trae_native_split_tool_response()._lines[:-1] + [
+                    "event: token_usage",
+                    'data: {"input_tokens":2104,"output_tokens":79,"total_tokens":2183}',
+                    "data: [DONE]",
+                ]
+                result = self._run(streaming, lines, usage_enricher=enrich)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0]["prompt_tokens"], 2104)
+                self.assertEqual(seen[0]["completion_tokens"], 79)
+                usage = self._usage(streaming, result)
+                self.assertEqual(usage["prompt_tokens"], 2104)
+                self.assertEqual(usage["completion_tokens"], 79)
+                self.assertEqual(usage["total_tokens"], 2183)
+                self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 2048)
+                if streaming:
+                    calls = [
+                        call
+                        for chunk in result
+                        for choice in chunk.get("choices", [])
+                        for call in choice.get("delta", {}).get("tool_calls", [])
+                    ]
+                    reason = result[-1]["choices"][0]["finish_reason"]
+                else:
+                    calls = result["choices"][0]["message"]["tool_calls"]
+                    reason = result["choices"][0]["finish_reason"]
+                self.assertEqual(reason, "tool_calls")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["id"], "call_native_1")
+                self.assertEqual(calls[0]["function"]["name"], "Read")
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"filePath": "README.md"},
+                )
+
+    def test_multiple_snapshots_enrich_only_final_usage_and_preserve_none_result(self):
+        lines = [
+            'data: {"response":"hello","usage":{"input_tokens":11,"output_tokens":1}}',
+            'data: {"response":"hello world","usage":{"input_tokens":11,"output_tokens":3}}',
+            "data: [DONE]",
+        ]
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                seen = []
+
+                async def enrich(usage):
+                    seen.append(usage)
+                    return None
+
+                result = self._run(streaming, lines, usage_enricher=enrich)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0]["completion_tokens"], 3)
+                self.assertEqual(self._usage(streaming, result), seen[0])
+                if streaming:
+                    content = "".join(
+                        choice.get("delta", {}).get("content", "")
+                        for chunk in result
+                        for choice in chunk.get("choices", [])
+                    )
+                else:
+                    content = result["choices"][0]["message"]["content"]
+                self.assertEqual(content, "hello world")
+
+    def test_missing_upstream_usage_can_be_enriched_before_estimation(self):
+        expected = {"prompt_tokens": 23, "completion_tokens": 2, "total_tokens": 25}
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                seen = []
+
+                async def enrich(usage):
+                    seen.append(usage)
+                    return expected
+
+                result = self._run(
+                    streaming,
+                    ['data: {"response":"hello"}', "data: [DONE]"],
+                    usage_enricher=enrich,
+                )
+                self.assertEqual(seen, [None])
+                self.assertEqual(self._usage(streaming, result), expected)
+
+    def test_rejected_or_incomplete_responses_do_not_enrich(self):
+        cases = (
+            (
+                "upstream_error",
+                [
+                    'data: {"response":"partial"}',
+                    "event: error",
+                    'data: {"code":4001,"message":"request rejected"}',
+                ],
+                {},
+                sse.UpstreamEventError,
+            ),
+            (
+                "missing_terminal",
+                ['data: {"response":"partial"}'],
+                {},
+                sse.IncompleteUpstreamResponse,
+            ),
+            (
+                "strict_empty",
+                ["data: [DONE]"],
+                {"fail_on_empty": True},
+                sse.EmptyUpstreamResponse,
+            ),
+            (
+                "invalid_tool_arguments",
+                [
+                    'data: {"tool_calls":[{"id":"call_bad","type":"function","function":{"name":"Read","arguments":"not-json"}}]}',
+                    "data: [DONE]",
+                ],
+                {},
+                sse.InvalidNativeToolArguments,
+            ),
+            ("empty_placeholder", ["data: [DONE]"], {}, None),
+            (
+                "accepted_eof",
+                ['data: {"response":"partial"}'],
+                {"require_terminal": False},
+                None,
+            ),
+        )
+        for streaming in (False, True):
+            for name, lines, options, expected_error in cases:
+                with self.subTest(streaming=streaming, case=name):
+                    seen = []
+
+                    async def enrich(usage):
+                        seen.append(usage)
+                        return usage
+
+                    if expected_error:
+                        with self.assertRaises(expected_error):
+                            self._run(streaming, lines, usage_enricher=enrich, **options)
+                    else:
+                        self._run(streaming, lines, usage_enricher=enrich, **options)
+                    self.assertEqual(seen, [])
+
+    def test_terminal_length_limited_turn_can_enrich(self):
+        expected = {
+            "prompt_tokens": 64,
+            "completion_tokens": 8,
+            "total_tokens": 72,
+            "prompt_tokens_details": {"cached_tokens": 32},
+        }
+        for streaming in (False, True):
+            for reason in ("length", "model_context_window_exceeded"):
+                with self.subTest(streaming=streaming, reason=reason):
+                    seen = []
+
+                    async def enrich(usage):
+                        seen.append(usage)
+                        return expected
+
+                    result = self._run(
+                        streaming,
+                        [
+                            "data: " + json.dumps({"response": "partial", "finish_reason": reason}),
+                            "data: [DONE]",
+                        ],
+                        usage_enricher=enrich,
+                    )
+                    self.assertEqual(seen, [None])
+                    self.assertEqual(self._usage(streaming, result), expected)
+                    final = result[-1] if streaming else result
+                    self.assertEqual(final["choices"][0]["finish_reason"], "length")
+
+    def test_missing_required_tool_does_not_enrich(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                seen = []
+
+                async def enrich(usage):
+                    seen.append(usage)
+                    return usage
+
+                options = {
+                    "allowed_tools": [{"type": "function", "function": {"name": "Read"}}],
+                    "tool_choice": "required",
+                    "usage_enricher": enrich,
+                }
+                lines = ['data: {"response":"No tool."}', "data: [DONE]"]
+                if streaming:
+                    result = self._run(streaming, lines, **options)
+                    self.assertIn("error", result[-1])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "required tool call"):
+                        self._run(streaming, lines, **options)
+                self.assertEqual(seen, [])
 
 
 class EmptyResponseBoundaryTests(unittest.TestCase):

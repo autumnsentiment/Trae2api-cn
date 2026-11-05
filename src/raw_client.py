@@ -31,6 +31,7 @@ from .cli_client import (
     tool_result_is_failed,
 )
 from . import images
+from .reasoning_effort import apply_reasoning_effort, requested_level
 logger = logging.getLogger(__name__)
 
 
@@ -196,6 +197,7 @@ class RawModel:
     display_name: str
     config_source: int = 1
     provider: str = ""
+    descriptor: Optional[Mapping[str, Any]] = field(default=None, compare=False, repr=False)
 
 
 class TraeCodeRateLimitError(RuntimeError):
@@ -454,6 +456,10 @@ _TRAECODE_RAW_V2_OPTION_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "custom_model_uniq_id",
         ("custom_model_uniq_id", "customModelUniqId"),
     ),
+    (
+        "application_config",
+        ("application_config", "applicationConfig", "app_config", "appConfig"),
+    ),
     ("provider_context", ("provider_context", "providerContext")),
     ("biz_context", ("biz_context", "bizContext")),
     ("extra_info", ("extra_info", "extraInfo")),
@@ -531,6 +537,9 @@ def _traecode_model_from_raw(raw_model: RawModel) -> RawModel:
         display_name=raw_model.display_name,
         config_source=raw_model.config_source,
         provider=raw_model.provider,
+        descriptor=copy.deepcopy(dict(raw_model.descriptor))
+        if isinstance(raw_model.descriptor, Mapping)
+        else raw_model.descriptor,
     )
 
 
@@ -599,6 +608,9 @@ def resolve_traecode_model(
             str(display_name or resolved.display_name),
             config_source or resolved.config_source,
             str(_traecode_option(options, "provider", default=None) or resolved.provider),
+            descriptor=copy.deepcopy(dict(resolved.descriptor))
+            if isinstance(resolved.descriptor, Mapping)
+            else resolved.descriptor,
         )
     else:
         resolved = _traecode_model_from_raw(resolved)
@@ -609,6 +621,9 @@ def resolve_traecode_model(
                 str(display_name or resolved.display_name),
                 config_source or resolved.config_source,
                 str(_traecode_option(options, "provider", default=None) or resolved.provider),
+                descriptor=copy.deepcopy(dict(resolved.descriptor))
+                if isinstance(resolved.descriptor, Mapping)
+                else resolved.descriptor,
             )
     return resolved
 
@@ -706,6 +721,7 @@ async def resolve_traecode_model_for_request(
                         live.get("config_source") or resolved.config_source or 1
                     ),
                     provider=str(live.get("provider") or resolved.provider or ""),
+                    descriptor=copy.deepcopy(dict(live)),
                 )
         except Exception as exc:
             logger.warning(
@@ -733,6 +749,13 @@ async def resolve_traecode_model_for_request(
         display_name=upstream.display_name or resolved.display_name,
         config_source=upstream.config_source or resolved.config_source,
         provider=upstream.provider or resolved.provider,
+        descriptor=copy.deepcopy(dict(upstream.descriptor))
+        if isinstance(upstream.descriptor, Mapping)
+        else (
+            copy.deepcopy(dict(resolved.descriptor))
+            if isinstance(resolved.descriptor, Mapping)
+            else resolved.descriptor
+        ),
     )
 
 
@@ -752,8 +775,6 @@ def traecode_session_id(
         "sessionId",
         default=None,
     )
-    if explicit:
-        return str(explicit)
     account_identity = str(
         options.get("_billing_id")
         or options.get("_auth_user_id")
@@ -767,6 +788,29 @@ def traecode_session_id(
             if token
             else "default"
         )
+    cache_key = _traecode_option(
+        options,
+        "_prompt_cache_key_affinity",
+        default=None,
+    )
+    if isinstance(cache_key, str) and cache_key.strip():
+        # The relay may bind a random local lease id before dispatch. When the
+        # caller supplied no explicit session, use the cache key for a stable
+        # upstream conversation instead of allowing that local id to fragment
+        # provider-side prompt cache affinity.
+        material = "\x1f".join(
+            (
+                "prompt-cache-v1",
+                account_identity,
+                cache_key.strip()[:1024],
+                model.config_name,
+                model.raw_model_name,
+                raw_chat_function,
+            )
+        )
+        return str(uuid.UUID(hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]))
+    if explicit:
+        return str(explicit)
     material = "\x1f".join(
         (account_identity, model.config_name, model.raw_model_name, raw_chat_function)
     )
@@ -987,6 +1031,8 @@ def build_traecode_chat_body(
         "config_source": int(resolved.config_source or 1),
         "messages": body_messages,
     }
+    if bool(_traecode_option(options, "_enterprise_mode", default=False)):
+        body["config_source"] = 2
     # Trae 3.4.4 expanded the shared Work/Code raw-v2 DTO. Only copy fields
     # explicitly supplied by the caller: defaults for queueing, effort, and
     # client mode belong to the selected upstream model configuration.
@@ -994,6 +1040,35 @@ def build_traecode_chat_body(
         value = _traecode_option(options, *aliases, default=None)
         if value is not None:
             body[wire_name] = copy.deepcopy(value)
+    descriptor = None
+    for descriptor_key in (
+        "_traecode_model_descriptor",
+        "traecode_model_descriptor",
+        "model_descriptor",
+        "custom_model",
+        "customModel",
+    ):
+        candidate = options.get(descriptor_key)
+        if isinstance(candidate, Mapping):
+            descriptor = candidate
+            break
+    if isinstance(descriptor, Mapping):
+        effort_model, effort_level = apply_reasoning_effort(descriptor, options)
+        body.pop("reasoning_effort", None)
+        body.pop("reasoning_effort_level", None)
+        if effort_level:
+            effort_key = (
+                "reasoning_effort_level"
+                if "reasoning_effort_level" in effort_model
+                else "reasoning_effort"
+            )
+            body[effort_key] = effort_level
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            if effort_level:
+                trace["reasoning_effort_applied"] = effort_level
+            else:
+                trace.pop("reasoning_effort_applied", None)
     if native_tools and isinstance(tools, list) and tools:
         converted_tools = _traecode_tool_definitions(tools)
         if converted_tools:
@@ -1371,6 +1446,13 @@ async def send_traecode_chat_request(
     body_options.setdefault("traecode_model_name", raw_model.raw_model_name)
     body_options.setdefault("display_name", raw_model.display_name)
     body_options.setdefault("config_source", raw_model.config_source)
+    if raw_model.descriptor is not None:
+        body_options["_traecode_model_descriptor"] = raw_model.descriptor
+    elif requested_level(body_options):
+        # A live capability decision is required before forwarding effort.
+        # When the bound catalog is unavailable, fail closed for the actual
+        # transport instead of guessing support from the model name.
+        body_options["_traecode_model_descriptor"] = {}
     body = build_traecode_chat_body(
         messages,
         model,
@@ -1678,12 +1760,24 @@ def resolve_raw_model(model: str, options: Optional[Mapping[str, Any]] = None) -
     except (TypeError, ValueError):
         config_source = 1
     provider = str(_option(options, "provider", default="") or "")
+    descriptor = _option(
+        options,
+        "_traecode_model_descriptor",
+        "traecode_model_descriptor",
+        "model_descriptor",
+        "custom_model",
+        "customModel",
+        default=None,
+    )
     return RawModel(
         str(config_name),
         str(raw_model_name),
         str(display_name),
         config_source,
         provider,
+        descriptor=copy.deepcopy(dict(descriptor))
+        if isinstance(descriptor, Mapping)
+        else None,
     )
 
 
@@ -1783,6 +1877,7 @@ async def resolve_raw_model_for_request(
                 display_name,
                 config_source,
                 str((config or {}).get("provider") or ""),
+                descriptor=copy.deepcopy(dict(config)),
             )
     except Exception as exc:
         logger.warning("raw model config lookup failed for %s: %s", requested, exc)
@@ -1816,6 +1911,13 @@ def raw_session_id(
             else "default"
         )
     material_parts = [account_identity, model.config_name, model.raw_model_name]
+    cache_key = _option(
+        options,
+        "_prompt_cache_key_affinity",
+        default=None,
+    )
+    if isinstance(cache_key, str) and cache_key.strip():
+        material_parts.extend(("prompt-cache-v1", cache_key.strip()[:1024]))
     material = "\x1f".join(material_parts)
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return str(uuid.UUID(digest[:32]))
@@ -2233,7 +2335,7 @@ def _tool_definitions_prompt(tool_defs: list[dict[str, Any]]) -> tuple[str, bool
     """
 
     full = json.dumps(
-        tool_defs, ensure_ascii=False, separators=(",", ":"), default=str
+        tool_defs, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str
     )
     budget = _tool_schema_budget()
     if len(full) <= budget:
@@ -2290,13 +2392,13 @@ def _tool_definitions_prompt(tool_defs: list[dict[str, Any]]) -> tuple[str, bool
             candidate["signatures"]
         )
         encoded = json.dumps(
-            candidate, ensure_ascii=False, separators=(",", ":"), default=str
+            candidate, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str
         )
         if len(encoded) > budget:
             continue
         payload = candidate
     encoded = json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":"), default=str
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str
     )
     return encoded, True, int(payload["omitted_signatures"])
 
@@ -2304,16 +2406,10 @@ def _tool_definitions_prompt(tool_defs: list[dict[str, Any]]) -> tuple[str, bool
 def _concise_reasoning_enabled() -> bool:
     """Whether to ask the model for conclusions instead of a narrated chain.
 
-    Set ``TRAE_VERBOSE_REASONING=1`` to keep the upstream's full deliberation in
-    the visible answer.
+    Share the live output setting with the reasoning formatters.
     """
 
-    return str(os.environ.get("TRAE_VERBOSE_REASONING", "")).strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return not bool(auth.get_reasoning_output_settings().get("enabled"))
 
 
 def response_style_instruction() -> str:
@@ -2356,7 +2452,7 @@ def build_runtime_system_prompt(
         "You are Trae Code connected to the user's local application.",
         "The external Trae-compatible terminal client application that started this conversation provides the client tools below.",
         "Caller client context (JSON):",
-        json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str),
+        json.dumps(context, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str),
         "Discover the local environment through the available client tools when the request requires it.",
         "If a tool can answer the question, call it proactively and wait for the external client result.",
         "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, patched, or saved unless a later matching client tool result with the same call id confirms success.",

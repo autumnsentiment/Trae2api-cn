@@ -46,7 +46,7 @@ from .model_limits import (
     descriptor_reasoning_config,
     descriptor_supports_max_mode,
 )
-from .reasoning_effort import supported_levels
+from .reasoning_effort import apply_reasoning_effort, requested_level, supported_levels
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +323,7 @@ def _model_catalog_cache_key(
     *,
     agent_type: str = "",
     raw_chat_function: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Scope live model metadata to one account and executor function."""
 
@@ -331,7 +332,82 @@ def _model_catalog_cache_key(
     function = (
         str(raw_chat_function or "default").strip().lower() or "default"
     )
-    return f"{account}:{tier}:{function}"
+    context = {
+        "remote_gateway": remote_base_url(),
+        "native_gateway": _model_gateway_base(),
+        "provider": dict(provider_specific) if provider_specific is not None else auth.get_psd(),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(context, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"{account}:{tier}:{function}:{fingerprint}"
+
+
+_MODEL_CATALOG_INFLIGHT: dict[tuple[Any, str], asyncio.Task] = {}
+
+
+async def _cached_model_catalog(
+    source: str,
+    token: str,
+    *,
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    agent_type: str = "",
+    raw_chat_function: str = "",
+    force: bool = False,
+) -> dict[str, dict]:
+    """Share exact-scope catalog reads and coalesce concurrent cache misses."""
+
+    function = raw_chat_function or ("solo_work_lite" if source == "solo" else "")
+    cache_key = _model_catalog_cache_key(
+        token, user_id_override,
+        agent_type="traecode" if source == "solo" else agent_type,
+        raw_chat_function=function,
+        provider_specific=provider_specific,
+    )
+    cached = _WEB_MODEL_CACHE.get(cache_key)
+    if not force and cached and time.time() - cached[0] < _WEB_MODEL_CACHE_TTL:
+        return copy.deepcopy(cached[1])
+    pending_key = (asyncio.get_running_loop(), cache_key)
+    pending = _MODEL_CATALOG_INFLIGHT.get(pending_key)
+    if pending is None:
+        async def fetch():
+            kwargs: dict[str, Any] = {}
+            if provider_specific is not None:
+                kwargs["provider_specific"] = provider_specific
+            if source == "solo":
+                if user_id_override:
+                    kwargs["user_id_override"] = user_id_override
+                kwargs["raw_chat_function"] = function
+                try:
+                    configs = await _fetch_solo_model_configs(token_override=token, **kwargs)
+                except TypeError as exc:
+                    if "raw_chat_function" not in str(exc):
+                        raise
+                    kwargs.pop("raw_chat_function", None)
+                    configs = await _fetch_solo_model_configs(token_override=token, **kwargs)
+            else:
+                if agent_type:
+                    kwargs["agent_type"] = agent_type
+                if raw_chat_function:
+                    kwargs["raw_chat_function"] = raw_chat_function
+                configs = await _fetch_web_model_configs(token, **kwargs)
+            if configs:
+                _WEB_MODEL_CACHE[cache_key] = (time.time(), copy.deepcopy(configs))
+            else:
+                _WEB_MODEL_CACHE.pop(cache_key, None)
+            return configs
+
+        pending = asyncio.create_task(fetch())
+        _MODEL_CATALOG_INFLIGHT[pending_key] = pending
+
+        def finished(task):
+            _MODEL_CATALOG_INFLIGHT.pop(pending_key, None)
+            if not task.cancelled():
+                task.exception()
+
+        pending.add_done_callback(finished)
+    return copy.deepcopy(await asyncio.shield(pending))
 
 
 def _tool_protocol_requested(
@@ -390,6 +466,8 @@ class IdeChatResponse:
     response: httpx.Response
     client: httpx.Client
     release_slot: Optional[Callable[[], None]] = field(default=None, repr=False)
+    auth_token: str = field(default="", repr=False)
+    usage_turn_id: str = ""
     _closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -1075,6 +1153,79 @@ async def fetch_account_total_credits(token: str = "") -> dict:
     return await fetch_account_credits(token, req_source=0)
 
 
+def _session_token_usage(data: Mapping[str, Any], session_id: str) -> dict:
+    """Extract only reported counters from a commercial turn aggregate."""
+
+    aliases = {
+        "prompt_tokens": ("input_token", "input_tokens", "prompt_tokens", "inputToken"),
+        "completion_tokens": ("output_token", "output_tokens", "completion_tokens", "outputToken"),
+        "cached_tokens": ("cache_read_token", "cache_read_tokens", "cached_tokens", "cacheReadToken"),
+        "cache_write_tokens": ("cache_write_token", "cache_write_tokens", "cache_creation_input_tokens", "cacheWriteToken"),
+    }
+    token_keys = {key for names in aliases.values() for key in names}
+
+    def counters(value: Mapping[str, Any]) -> tuple[bool, dict[str, int]]:
+        extra = value.get("extra_info", value.get("extraInfo"))
+        sources = [extra, value] if isinstance(extra, Mapping) else [value]
+        present = any(token_keys.intersection(source) for source in sources)
+        result = {}
+        for field, names in aliases.items():
+            for source in sources:
+                selected = next((key for key in names if key in source), None)
+                if selected is None:
+                    continue
+                number = _credit_decimal(source[selected])
+                if number is not None and number >= 0 and number == number.to_integral_value():
+                    result[field] = int(number)
+                break
+        return present, result
+
+    def aggregate(value: Any, depth: int = 0) -> dict[str, int] | None:
+        if not isinstance(value, Mapping) or depth > 6:
+            return None
+        for key in ("user_usage_group_by_session", "userUsageGroupBySession"):
+            group = value.get(key)
+            if isinstance(group, Mapping):
+                return aggregate(group, depth + 1)
+        present, result = counters(value)
+        if present:
+            return result
+        for key in ("usage", "result", "data"):
+            if key in value:
+                nested = aggregate(value[key], depth + 1)
+                if nested is not None:
+                    return nested
+        details = value.get("usage_group_details", value.get("usageGroupDetails"))
+        if isinstance(details, list) and details:
+            # Detail rows often duplicate the aggregate. Only use them when
+            # it is absent; multiple rows need an explicit matching turn id.
+            if not all(isinstance(item, Mapping) for item in details):
+                return None
+            if any(
+                str(item.get("session_id") or item.get("sessionId") or session_id) != session_id
+                for item in details
+            ):
+                return None
+            if len(details) > 1 and not all(
+                str(item.get("session_id") or item.get("sessionId") or "") == session_id
+                for item in details
+            ):
+                return None
+            parsed = [counters(item)[1] for item in details]
+            common = set(parsed[0]).intersection(*(set(item) for item in parsed[1:]))
+            return {key: sum(item[key] for item in parsed) for key in common}
+        return None
+
+    parsed = aggregate(data) or {}
+    result = {key: parsed[key] for key in ("prompt_tokens", "completion_tokens") if key in parsed}
+    if "prompt_tokens" in result and "completion_tokens" in result:
+        result["total_tokens"] = result["prompt_tokens"] + result["completion_tokens"]
+    details = {key: parsed[key] for key in ("cached_tokens", "cache_write_tokens") if key in parsed}
+    if details:
+        result["prompt_tokens_details"] = details
+    return result
+
+
 async def fetch_session_usage(
     session_id: str,
     token: str = "",
@@ -1085,8 +1236,8 @@ async def fetch_session_usage(
 
     ``session_id`` is the upstream *user-message/turn id* (usually
     ``reply_to_message_id``), not the relay's fixed chat conversation UUID.
-    This endpoint is read-only and is used only as asynchronous billing
-    enrichment after the model response has already been returned.
+    This endpoint is read-only and supplies billing and token counters for
+    the turn, including cache usage omitted by some model event streams.
     """
 
     session_id = str(session_id or "").strip()
@@ -1180,15 +1331,15 @@ async def fetch_session_usage(
                     return parsed
         return None
 
-    # Return only billing-safe scalar fields.  Do not persist or log
-    # ``extra_info`` (which contains token details) or any upstream envelope.
+    # Whitelist numeric counters; never return the upstream extra_info object.
+    result = _session_token_usage(data, session_id)
     credits = find_credit(data)
-    if credits is None or credits < 0:
-        return {}
-    return {
-        "credits_consumed": _json_credit_number(credits),
-        "credits_source": "session_usage",
-    }
+    if credits is not None and credits >= 0:
+        result.update(
+            credits_consumed=_json_credit_number(credits),
+            credits_source="session_usage",
+        )
+    return result
 
 def _provider_specific(options: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     if isinstance(options, Mapping):
@@ -2319,22 +2470,12 @@ async def resolve_traecode_model_config(
     token = str(token_override or auth.get_token() or "").strip()
     if not token:
         return None
-    solo_kwargs: dict[str, Any] = {
-        "token_override": token,
-        "provider_specific": provider_specific,
-        "user_id_override": str(user_id_override or ""),
-        "raw_chat_function": raw_chat_function,
-    }
-    try:
-        configs = await _fetch_solo_model_configs(**solo_kwargs)
-    except TypeError as exc:
-        # Keep compatibility with integrations that monkeypatch the old
-        # three-argument probe while the production resolver uses the scoped
-        # function parameter.
-        if "raw_chat_function" not in str(exc):
-            raise
-        solo_kwargs.pop("raw_chat_function", None)
-        configs = await _fetch_solo_model_configs(**solo_kwargs)
+    configs = await _cached_model_catalog(
+        "solo", token,
+        provider_specific=provider_specific,
+        user_id_override=str(user_id_override or ""),
+        raw_chat_function=raw_chat_function,
+    )
     config = _traecode_model_match(configs, model_name)
     if not config:
         return None
@@ -2427,55 +2568,24 @@ async def _get_web_custom_model(
     if not model_name:
         return None
     token = token_override or auth.get_token()
-    account_key = _model_catalog_cache_key(
-        token,
-        user_id_override,
-        agent_type=agent_type,
+    configs = await _cached_model_catalog(
+        "web", token, user_id_override=user_id_override,
+        provider_specific=provider_specific, agent_type=agent_type,
         raw_chat_function=raw_chat_function,
     )
-    now = time.time()
-    cached = _WEB_MODEL_CACHE.get(account_key)
-    if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
-        fetch_kwargs: dict[str, Any] = {}
-        if provider_specific is not None:
-            fetch_kwargs["provider_specific"] = provider_specific
-        if agent_type:
-            fetch_kwargs["agent_type"] = agent_type
-        if raw_chat_function:
-            fetch_kwargs["raw_chat_function"] = raw_chat_function
-        configs = await _fetch_web_model_configs(token, **fetch_kwargs)
-        # Only pay the extra native-Solo lookup when the requested config is
-        # absent from Remote. This keeps normal model resolution on the fast
-        # path while allowing Solo-only models to be used through Remote.
-        lowered_model = str(model_name).strip().casefold()
-        found = any(
-            any(value.casefold() == lowered_model for value in _model_descriptor_values(name, candidate))
-            for name, candidate in configs.items()
+    lowered_model = str(model_name).strip().casefold()
+    found = any(
+        any(value.casefold() == lowered_model for value in _model_descriptor_values(name, candidate))
+        for name, candidate in configs.items()
+    )
+    if not found and not agent_type:
+        # A warm Remote cache must still allow a later Solo-only lookup.
+        solo_configs = await _cached_model_catalog(
+            "solo", token, user_id_override=user_id_override,
+            provider_specific=provider_specific, raw_chat_function=raw_chat_function,
         )
-        if not found and not agent_type:
-            solo_kwargs: dict[str, Any] = {}
-            if provider_specific is not None:
-                solo_kwargs["provider_specific"] = provider_specific
-            if user_id_override:
-                solo_kwargs["user_id_override"] = user_id_override
-            if raw_chat_function:
-                solo_kwargs["raw_chat_function"] = raw_chat_function
-            solo_configs = await _fetch_solo_model_configs(token, **solo_kwargs)
-            if isinstance(solo_configs, Mapping):
-                for name, config in solo_configs.items():
-                    configs.setdefault(name, config)
-        # Do not pin a transient upstream failure for the full model-cache
-        # TTL.  A failed catalog probe otherwise makes every subsequent
-        # lower-case request return ``None`` until the cache expires, even
-        # though the account/model is healthy on the next attempt.
-        if configs:
-            cached = (now, configs)
-            _WEB_MODEL_CACHE[account_key] = cached
-        else:
-            _WEB_MODEL_CACHE.pop(account_key, None)
-            cached = (now, {})
-
-    configs = cached[1]
+        for name, config in solo_configs.items():
+            configs.setdefault(name, config)
     cfg = configs.get(model_name)
     if cfg is not None:
         return cfg
@@ -2553,38 +2663,16 @@ async def get_scoped_model_configs(
     token = str(token_override or auth.get_token() or "").strip()
     if not token:
         return {}
-    cache_key = _model_catalog_cache_key(
-        token,
-        user_id_override,
-        agent_type=agent_type,
+    configs = await _cached_model_catalog(
+        "web", token, user_id_override=user_id_override,
+        provider_specific=provider_specific, agent_type=agent_type,
         raw_chat_function=raw_chat_function,
     )
-    now = time.time()
-    cached = _WEB_MODEL_CACHE.get(cache_key)
-    if cached and now - cached[0] <= _WEB_MODEL_CACHE_TTL:
-        return cached[1]
-
-    web_kwargs: dict[str, Any] = {
-        "token_override": token,
-        "agent_type": agent_type,
-        "raw_chat_function": raw_chat_function,
-    }
-    if provider_specific is not None:
-        web_kwargs["provider_specific"] = provider_specific
-    configs = await _fetch_web_model_configs(**web_kwargs)
     if not configs and not agent_type:
-        solo_kwargs: dict[str, Any] = {
-            "token_override": token,
-            "user_id_override": user_id_override,
-            "raw_chat_function": raw_chat_function or "solo_work_lite",
-        }
-        if provider_specific is not None:
-            solo_kwargs["provider_specific"] = provider_specific
-        configs = await _fetch_solo_model_configs(**solo_kwargs)
-    if configs:
-        _WEB_MODEL_CACHE[cache_key] = (now, configs)
-    else:
-        _WEB_MODEL_CACHE.pop(cache_key, None)
+        configs = await _cached_model_catalog(
+            "solo", token, user_id_override=user_id_override,
+            provider_specific=provider_specific, raw_chat_function=raw_chat_function,
+        )
     return configs
 
 
@@ -2651,7 +2739,14 @@ async def create_web_session(
             lookup_kwargs["raw_chat_function"] = raw_function
         custom_model = await _get_web_custom_model(model_name, **lookup_kwargs)
         if custom_model:
-            initial_message["custom_model"] = custom_model
+            effort_model, effort_level = apply_reasoning_effort(custom_model, options)
+            initial_message["custom_model"] = effort_model
+            trace = options.get("_upstream_trace")
+            if isinstance(trace, dict):
+                if effort_level:
+                    trace["reasoning_effort_applied"] = effort_level
+                else:
+                    trace.pop("reasoning_effort_applied", None)
     body = {
         "mode": mode,
         "environment_id": "default",
@@ -2897,6 +2992,58 @@ def _ide_native_tool_choice(choice: Any) -> Optional[str]:
     return name or ("auto" if choice_type == "function" else None)
 
 
+def _apply_legacy_reasoning_effort(
+    body: Mapping[str, Any], options: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """Gate legacy endpoint effort fields by the selected live descriptor.
+
+    The legacy builders are still used by older IDE/Work fallbacks.  They
+    must follow the same capability rule as the native raw transport: an
+    explicit ``support_thinking: false`` descriptor removes caller effort,
+    while a supported descriptor receives one clamped native field.
+    """
+
+    result = dict(body)
+    options = options or {}
+    descriptor = None
+    for key in (
+        "_traecode_model_descriptor",
+        "traecode_model_descriptor",
+        "model_descriptor",
+        "custom_model",
+        "customModel",
+    ):
+        candidate = options.get(key)
+        if isinstance(candidate, Mapping):
+            descriptor = candidate
+            break
+    if descriptor is None:
+        # Legacy builders never copied caller effort fields implicitly.  Keep
+        # that property when the catalog is unavailable instead of guessing
+        # support from a model name.
+        result.pop("reasoning_effort", None)
+        result.pop("reasoning_effort_level", None)
+        return result
+
+    effort_model, effort_level = apply_reasoning_effort(descriptor, options)
+    result.pop("reasoning_effort", None)
+    result.pop("reasoning_effort_level", None)
+    if effort_level:
+        effort_key = (
+            "reasoning_effort_level"
+            if "reasoning_effort_level" in (effort_model or {})
+            else "reasoning_effort"
+        )
+        result[effort_key] = effort_level
+    trace = options.get("_upstream_trace")
+    if isinstance(trace, dict):
+        if effort_level:
+            trace["reasoning_effort_applied"] = effort_level
+        else:
+            trace.pop("reasoning_effort_applied", None)
+    return result
+
+
 def build_llm_chat_body(
     messages: list[dict],
     model: str,
@@ -2913,7 +3060,11 @@ def build_llm_chat_body(
     """
     options = options or {}
     converted = _convert_ide_native_messages(messages, options)
-    session_id = _requested_session_id(options) or str(uuid.uuid4())
+    session_id = (
+        str(options.get("_legacy_usage_turn_id") or "").strip()
+        or _requested_session_id(options)
+        or str(uuid.uuid4())
+    )
     config_name = convert_model_name(model) or model or "glm-5.2"
     body = {
         "messages": converted,
@@ -2937,7 +3088,7 @@ def build_llm_chat_body(
                 body["tool_choice"] = choice
             if options.get("parallel_tool_calls") is not None:
                 body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
-    return body
+    return _apply_legacy_reasoning_effort(body, options)
 
 
 def build_work_agent_body(
@@ -3017,7 +3168,7 @@ def build_work_agent_body(
             body["parallel_tool_calls"] = options["parallel_tool_calls"]
     if not stream:
         body["stream"] = False
-    return body
+    return _apply_legacy_reasoning_effort(body, options)
 
 
 async def build_trae_ide_request(
@@ -3117,7 +3268,7 @@ async def build_trae_ide_request(
     max_tokens = clamp_max_completion_tokens(max_tokens, trae_model)
     if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
         trae_req["max_output_tokens"] = int(max_tokens)
-    return trae_model, trae_req
+    return trae_model, _apply_legacy_reasoning_effort(trae_req, options)
 
 
 def convert_openai_messages(
@@ -3231,6 +3382,48 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             dict(provider_specific) if isinstance(provider_specific, Mapping) else None
         ),
     )
+    async def resolve_legacy_descriptor(endpoint: str) -> Optional[dict[str, Any]]:
+        """Resolve capabilities for the exact legacy executor being tried."""
+
+        for key in (
+            "_traecode_model_descriptor",
+            "traecode_model_descriptor",
+            "model_descriptor",
+            "custom_model",
+            "customModel",
+        ):
+            candidate = options.get(key)
+            if isinstance(candidate, Mapping):
+                return dict(candidate)
+        if not requested_level(options):
+            return None
+        lookup_kwargs: dict[str, Any] = {
+            "token_override": bound_token,
+            "user_id_override": bound_user_id,
+        }
+        if isinstance(provider_specific, Mapping):
+            lookup_kwargs["provider_specific"] = dict(provider_specific)
+        try:
+            if endpoint == "/api/agent/v3/create_agent_task":
+                # Work has a separate catalog scope; never reuse Agent or
+                # native Solo capability evidence for this fallback.
+                lookup_kwargs["agent_type"] = "solo_work_remote"
+                return await resolve_model_config(model_name, **lookup_kwargs)
+            raw_function = str(
+                options.get("_traecode_raw_chat_function")
+                or options.get("raw_chat_function")
+                or "solo_work_lite"
+            ).strip() or "solo_work_lite"
+            lookup_kwargs["raw_chat_function"] = raw_function
+            return await resolve_traecode_model_config(model_name, **lookup_kwargs)
+        except Exception as exc:
+            logger.debug(
+                "trae-client: legacy model capability lookup failed endpoint=%s model=%s: %s",
+                endpoint,
+                model_name,
+                exc,
+            )
+            return None
     max_tokens = options.get("maxTokens") or options.get("max_tokens")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     errors: list[str] = []
@@ -3405,6 +3598,30 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                         "User-Agent": f"Trae/{WORK_AGENT_VERSION}",
                     }
                 )
+            endpoint_options = dict(options)
+            if endpoint == "/api/agent/v3/llm_utils_chat":
+                # This endpoint aggregates billing by session_id. Each wire
+                # request needs its own id while relay conversation ownership
+                # and the replayed message/tool history remain unchanged.
+                endpoint_options["_legacy_usage_turn_id"] = str(uuid.uuid4())
+            if requested_level(options):
+                descriptor = await resolve_legacy_descriptor(endpoint)
+                if descriptor is not None:
+                    endpoint_options["_traecode_model_descriptor"] = descriptor
+                elif not any(
+                    isinstance(options.get(key), Mapping)
+                    for key in (
+                        "_traecode_model_descriptor",
+                        "traecode_model_descriptor",
+                        "model_descriptor",
+                        "custom_model",
+                        "customModel",
+                    )
+                ):
+                    # An unavailable catalog is not evidence of support.
+                    # Keep the request valid by removing effort fields from
+                    # this legacy attempt until a scoped descriptor exists.
+                    endpoint_options.pop("_traecode_model_descriptor", None)
             client = httpx.Client(
                 headers=endpoint_headers,
                 timeout=timeout,
@@ -3417,17 +3634,19 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                         messages,
                         model_name,
                         max_tokens,
-                        options,
+                        endpoint_options,
                     )
                 elif endpoint == "/api/agent/v3/create_agent_task":
-                    trae_req = build_work_agent_body(messages, model_name, stream, options)
+                    trae_req = build_work_agent_body(
+                        messages, model_name, stream, endpoint_options
+                    )
                 else:
                     trae_req = build_llm_chat_body(
                         messages,
                         model_name,
                         stream,
                         max_tokens,
-                        options,
+                        endpoint_options,
                     )
                 request_base = (
                     WORK_AGENT_HOST
@@ -3457,6 +3676,12 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                         response=resp,
                         client=client,
                         release_slot=release_slot_once,
+                        auth_token=bound_token,
+                        usage_turn_id=(
+                            str(trae_req.get("session_id") or "").strip()
+                            if endpoint == "/api/agent/v3/llm_utils_chat"
+                            else ""
+                        ),
                     )
 
                 await read_error_response(client, resp)
@@ -3691,37 +3916,31 @@ async def get_models(force: bool = False) -> list[dict]:
     created = int(time.time())
     account_id, record = auth.get_active_account_snapshot()
     token = str((record or {}).get("token") or "") or auth.get_token()
-    cache_key = account_id or auth.get_user_id() or token[:16] or "default"
+    bound_user_id = str((record or {}).get("user_id") or account_id or auth.get_user_id() or "").strip()
+    provider = (record or {}).get("provider_specific") or (record or {}).get("providerSpecificData")
+    provider = dict(provider) if isinstance(provider, Mapping) else None
+    cache_key = _model_catalog_cache_key(
+        token, bound_user_id, provider_specific=provider,
+    )
 
     cached = _MODEL_LIST_CACHE.get(cache_key)
     if not force and cached and time.time() - cached[0] < _MODEL_LIST_CACHE_TTL:
-        return [dict(item) for item in cached[1]]
+        return copy.deepcopy(cached[1])
 
     catalogs: list[tuple[Mapping[str, dict], Optional[list[str]]]] = []
     if token:
-        web_kwargs: dict[str, Any] = {"token_override": token}
-        solo_kwargs: dict[str, Any] = {"token_override": token}
-        bound_user_id = str(
-            (record or {}).get("user_id")
-            or account_id
-            or auth.get_user_id()
-            or ""
-        ).strip()
-        if bound_user_id:
-            solo_kwargs["user_id_override"] = bound_user_id
-        provider = (record or {}).get("provider_specific") or (record or {}).get(
-            "providerSpecificData"
-        )
-        if isinstance(provider, Mapping):
-            provider_copy = dict(provider)
-            web_kwargs["provider_specific"] = provider_copy
-            solo_kwargs["provider_specific"] = provider_copy
         # Keep catalog entries separate until public items are merged.  A
         # model can be advertised by Remote/Work and native TraeCode at once;
         # replacing or setdefault-ing the full config would discard one
         # catalog's endpoint evidence for that shared model.
-        remote_task = _fetch_web_model_configs(**web_kwargs)
-        solo_task = _fetch_solo_model_configs(**solo_kwargs)
+        remote_task = _cached_model_catalog(
+            "web", token, user_id_override=bound_user_id,
+            provider_specific=provider, force=force,
+        )
+        solo_task = _cached_model_catalog(
+            "solo", token, user_id_override=bound_user_id,
+            provider_specific=provider, force=force,
+        )
         remote_configs, solo_configs = await asyncio.gather(
             remote_task,
             solo_task,
@@ -3788,5 +4007,5 @@ async def get_models(force: bool = False) -> list[dict]:
             str(item.get("id") or ""),
         ),
     )
-    _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
-    return [dict(item) for item in items]
+    _MODEL_LIST_CACHE[cache_key] = (time.time(), copy.deepcopy(items))
+    return items

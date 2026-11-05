@@ -12,7 +12,8 @@ import json
 import re
 from typing import Any, AsyncIterator, Mapping, Optional
 
-from .reasoning_effort import normalize_level
+from .reasoning_effort import normalize_level, normalize_options as normalize_reasoning_options
+from .token_usage import usage_details
 
 _DEFAULT_MAX_TOKENS = 32000
 _ANTHROPIC_STOP_REASONS = {
@@ -268,7 +269,18 @@ def normalize_request(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], di
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, (int, float)):
         max_tokens = _DEFAULT_MAX_TOKENS
     options["max_tokens"] = int(max_tokens) if max_tokens > 0 else _DEFAULT_MAX_TOKENS
-    for key in ("temperature", "top_p", "stop_sequences", "metadata"):
+    for key in (
+        "temperature",
+        "top_p",
+        "stop_sequences",
+        "metadata",
+        "prompt_cache_key",
+        "promptCacheKey",
+        "prompt_cache_options",
+        "promptCacheOptions",
+        "prompt_cache_retention",
+        "promptCacheRetention",
+    ):
         if key in body and body[key] is not None:
             options["stop" if key == "stop_sequences" else key] = body[key]
 
@@ -321,6 +333,13 @@ def normalize_request(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], di
             options["parallel_tool_calls"] = not disable_parallel
 
     thinking = body.get("thinking")
+    for key in (
+        "reasoning_effort", "reasoningEffort", "reasoning_effort_level",
+        "reasoningEffortLevel", "thinking_effort", "reasoning",
+        "output_config", "outputConfig", "include_reasoning",
+    ):
+        if key in body:
+            options[key] = body[key]
     if isinstance(thinking, Mapping):
         thinking_type = str(thinking.get("type") or "").strip().lower()
         budget = thinking.get("budget_tokens")
@@ -328,9 +347,13 @@ def normalize_request(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], di
             request_thinking: dict[str, Any] = {"type": "enabled"}
             if isinstance(budget, (int, float)) and not isinstance(budget, bool):
                 request_thinking["budget_tokens"] = int(budget)
-            request_thinking["effort"] = _budget_effort(budget)
+            request_thinking["effort"] = (
+                thinking.get("effort") or thinking.get("level") or _budget_effort(budget)
+            )
             options["thinking"] = request_thinking
-    return messages, options
+        else:
+            options["thinking"] = {"type": "disabled"}
+    return messages, normalize_reasoning_options(options)
 
 
 def _budget_effort(budget: Any) -> str:
@@ -355,7 +378,17 @@ def _usage(usage: Any, *, input_fallback: int = 0) -> dict[str, Any]:
 
     input_tokens = number("prompt_tokens", "input_tokens") or input_fallback
     output_tokens = number("completion_tokens", "output_tokens")
-    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    result = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    details = usage_details(values)
+    if "cached_tokens" in details or "cache_write_tokens" in details:
+        cached = details.get("cached_tokens", 0)
+        written = details.get("cache_write_tokens", 0)
+        result["cache_read_input_tokens"] = cached
+        result["cache_creation_input_tokens"] = written
+        # Chat counts cached input in prompt_tokens; Messages reports it apart.
+        if "prompt_tokens" in values or "input_tokens_details" in values:
+            result["input_tokens"] = max(0, input_tokens - cached - written)
+    return result
 
 
 def _stop_reason(finish_reason: Any, *, has_tool_use: bool) -> str:

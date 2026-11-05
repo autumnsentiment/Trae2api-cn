@@ -1,6 +1,7 @@
 # Runtime state and credentials
 /.env
 /.env.local
+/.enterprise-probe.env
 /data/
 /logs/
 /work/

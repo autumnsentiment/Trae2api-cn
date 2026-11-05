@@ -1,6 +1,6 @@
 import unittest
 
-from src.reasoning_effort import apply_reasoning_effort, requested_level
+from src.reasoning_effort import apply_reasoning_effort, normalize_options, requested_level
 
 
 class ReasoningEffortTests(unittest.TestCase):
@@ -36,6 +36,32 @@ class ReasoningEffortTests(unittest.TestCase):
             "extra_high",
         )
         self.assertEqual(requested_level({"thinking": {"budget_tokens": 2048}}), "light")
+
+    def test_empty_canonical_value_does_not_hide_alias(self):
+        for empty in (None, "", " "):
+            with self.subTest(canonical=empty):
+                self.assertEqual(
+                    normalize_options({"reasoning_effort": empty, "reasoningEffort": "low"})[
+                        "reasoning_effort"
+                    ],
+                    "light",
+                )
+
+    def test_aliases_are_normalized_without_overwriting_explicit_canonical_value(self):
+        self.assertEqual(
+            normalize_options({"reasoningEffort": "low"})["reasoning_effort"],
+            "light",
+        )
+        self.assertEqual(
+            normalize_options({"reasoning": {"effort": "high"}})["reasoning_effort"],
+            "high",
+        )
+        self.assertEqual(
+            normalize_options({"reasoning_effort": "max", "reasoningEffort": "low"})[
+                "reasoning_effort"
+            ],
+            "max",
+        )
 
     def test_unsupported_model_or_no_request_is_untouched(self):
         plain = {"name": "Kimi"}

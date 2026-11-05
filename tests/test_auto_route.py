@@ -1,4 +1,4 @@
-"""Auto routing: tools/images -> IDE Agent, text -> Remote, fallback Remote."""
+"""Tool transport constraints and optional image/text auto routing."""
 
 from __future__ import annotations
 
@@ -252,7 +252,7 @@ class AutoRouteDispatchTests(unittest.IsolatedAsyncioTestCase):
         fallback = remote.await_args.args[3]
         self.assertEqual(fallback["_upstream_fallback_from"], "ide")
 
-    async def test_ide_failure_falls_back_to_remote(self):
+    async def test_ide_failure_does_not_fallback_to_remote_for_tools(self):
         ide = AsyncMock(side_effect=RuntimeError("ide down"))
         remote = AsyncMock(return_value={"route": "remote"})
         a, b, c = self._patches(True)
@@ -262,28 +262,76 @@ class AutoRouteDispatchTests(unittest.IsolatedAsyncioTestCase):
             result = await main_module._dispatch_chat(
                 CHAT, "glm-5.3", False, {"tools": TOOLS}
             )
-        self.assertEqual(result, {"route": "remote"})
-        fallback = remote.await_args.args[3]
-        self.assertEqual(fallback["_upstream_fallback_from"], "ide")
-        self.assertEqual(fallback["tools"], TOOLS)
+        self.assertEqual(result.status_code, 502)
+        remote.assert_not_awaited()
 
-    async def test_switch_off_keeps_preset_endpoint(self):
-        raw = AsyncMock(return_value={"route": "raw"})
-        a, b, c = self._patches(False)
-        with a, b, c, patch.object(main_module, "run_raw_chat", raw):
+    async def test_switch_off_still_routes_tools_to_ide(self):
+        messages = [
+            {"role": "user", "content": "Read README.md"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call-readme", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call-readme", "content": "Project readme"},
+        ]
+        cases = [(mode, {}) for mode in ("remote", "raw", "direct", "auto")]
+        cases.append(("remote", {"_upstream_mode": "auto"}))
+        for mode, override in cases:
+            with self.subTest(mode=mode, override=override):
+                ide = AsyncMock(return_value={"route": "ide"})
+                raw = AsyncMock(side_effect=AssertionError("tool requests must skip the text bridge"))
+                remote = AsyncMock(side_effect=AssertionError("remote cannot own caller tools"))
+                a, b, c = self._patches(False, mode=mode)
+                with (
+                    a, b, c,
+                    patch.object(main_module, "run_ide_chat", ide),
+                    patch.object(main_module, "run_raw_chat", raw),
+                    patch.object(main_module, "_run_remote_with_retry", remote),
+                ):
+                    result = await main_module._dispatch_chat(
+                        messages, "glm-5.3", False, {"tools": TOOLS, **override}
+                    )
+                self.assertEqual(result, {"route": "ide"})
+                ide.assert_awaited_once()
+                options = ide.await_args.args[3]
+                self.assertEqual(options["_upstream_mode"], "ide")
+                self.assertTrue(options["_traecode_native_tools"])
+                body = main_module.raw_client.build_traecode_chat_body(
+                    messages, "glm-5.3", options=options
+                )
+                self.assertEqual(body["tools"][0]["function"]["parameters"], TOOLS[0]["function"]["parameters"])
+                self.assertEqual(body["messages"][1]["tool_calls"][0]["id"], "call-readme")
+                self.assertEqual(body["messages"][2]["role"], "tool")
+                self.assertEqual(body["messages"][2]["tool_call_id"], "call-readme")
+                raw.assert_not_awaited()
+                remote.assert_not_awaited()
+
+    async def test_explicit_remote_with_tools_is_corrected_to_ide(self):
+        ide = AsyncMock(return_value={"route": "ide"})
+        remote = AsyncMock(side_effect=AssertionError("remote cannot own caller tools"))
+        a, b, c = self._patches(False, mode="remote")
+        with a, b, c, patch.object(main_module, "run_ide_chat", ide), patch.object(
+            main_module, "_run_remote_with_retry", remote
+        ):
             result = await main_module._dispatch_chat(
-                CHAT, "glm-5.3", False, {"tools": TOOLS}
+                CHAT, "glm-5.3", False,
+                {"_upstream_mode": "remote", "tools": TOOLS},
             )
-        self.assertEqual(result, {"route": "raw"})
+        self.assertEqual(result, {"route": "ide"})
+        ide.assert_awaited_once()
+        remote.assert_not_awaited()
 
     async def test_explicit_endpoint_wins_over_switch(self):
-        raw = AsyncMock(return_value={"route": "raw"})
         a, b, c = self._patches(True, mode="remote")
-        with a, b, c, patch.object(main_module, "run_raw_chat", raw):
-            result = await main_module._dispatch_chat(
-                CHAT, "glm-5.3", False, {"_upstream_mode": "raw"}
-            )
-        self.assertEqual(result, {"route": "raw"})
+        for mode in ("raw", "direct"):
+            with self.subTest(mode=mode):
+                selected = AsyncMock(return_value={"route": mode})
+                with a, b, c, patch.object(main_module, "run_raw_chat", selected):
+                    result = await main_module._dispatch_chat(
+                        CHAT, "glm-5.3", False, {"_upstream_mode": mode}
+                    )
+                self.assertEqual(result, {"route": mode})
+                selected.assert_awaited_once()
 
     async def test_explicit_auto_route_works_with_switch_off(self):
         ide = AsyncMock(return_value={"route": "ide"})

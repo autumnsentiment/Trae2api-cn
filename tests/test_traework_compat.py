@@ -204,6 +204,58 @@ class TraeWorkCompatTests(unittest.TestCase):
         common = json.loads(initial["common_params"])
         self.assertEqual(common["biz_session_id"], descriptor.ids.session_id)
 
+    def test_build_remote_session_request_filters_unsupported_reasoning_effort(self):
+        descriptor = traework_compat.build_remote_session_request(
+            [{"role": "user", "content": "hello"}],
+            "text-only",
+            options={
+                "reasoning_effort": "high",
+                "custom_model": {
+                    "reasoning_effort_config": {"support_thinking": False},
+                },
+            },
+        )
+
+        custom_model = descriptor.json_body["initial_message"]["custom_model"]
+        self.assertNotIn("reasoning_effort", custom_model)
+        self.assertNotIn("reasoning_effort_level", custom_model)
+
+    def test_build_remote_session_request_gates_effort_by_descriptor(self):
+        supported = {
+            "reasoning_effort_config": {
+                "support_thinking": True,
+                "options": ["light", "high"],
+            },
+            "reasoning_effort_level": "high",
+        }
+        descriptor = traework_compat.build_remote_session_request(
+            [{"role": "user", "content": "think"}],
+            "glm-5.3",
+            options={
+                "custom_model": supported,
+                "reasoning_effort": "ultra",
+            },
+        )
+        model = descriptor.json_body["initial_message"]["custom_model"]
+        self.assertEqual(model["reasoning_effort_level"], "high")
+        self.assertNotIn("reasoning_effort", model)
+
+        unsupported = {
+            "reasoning_effort_config": {"support_thinking": False},
+            "reasoning_effort_level": "high",
+        }
+        descriptor = traework_compat.build_remote_session_request(
+            [{"role": "user", "content": "think"}],
+            "glm-5.3",
+            options={
+                "custom_model": unsupported,
+                "reasoning_effort": "high",
+            },
+        )
+        model = descriptor.json_body["initial_message"]["custom_model"]
+        self.assertNotIn("reasoning_effort", model)
+        self.assertNotIn("reasoning_effort_level", model)
+
     def test_remote_events_path_formats_reply_target(self):
         self.assertEqual(
             traework_compat.remote_events_path("session-1", "message-1"),
@@ -616,6 +668,29 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertEqual(usage["cache_read_tokens"], 1)
         self.assertEqual(usage["credits_consumed"], 0.4)
         self.assertNotIn("Extra", usage)
+
+    def test_translate_preserves_nested_prompt_cache_details(self):
+        async def source():
+            yield (
+                'data: {"choices":[{"delta":{"content":"ok"},'
+                '"finish_reason":"stop"}],"usage":{"prompt_tokens":200,'
+                '"completion_tokens":4,"total_tokens":204,'
+                '"prompt_tokens_details":{"cached_tokens":120,'
+                '"cache_write_tokens":20}}}\n\n'
+            )
+            yield "data: [DONE]\n\n"
+
+        frames = asyncio.run(
+            _collect_async(
+                traework_compat.translate_openai_stream_to_traework(
+                    source(), model="glm-5.3", request_id="req-nested-cache"
+                )
+            )
+        )
+        events = _parse_custom_sse(frames)
+        usage = next(payload for name, payload in events if name == "token_usage")
+        self.assertEqual(usage["cache_read_tokens"], 120)
+        self.assertEqual(usage["cache_write_tokens"], 20)
 
     def test_translate_buffers_sse_json_split_across_transport_chunks(self):
         wire = (

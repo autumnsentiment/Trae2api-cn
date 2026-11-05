@@ -1123,6 +1123,18 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(options["max_tokens"], 64000)
 
+    def test_normalize_request_preserves_prompt_cache_affinity_fields(self):
+        _, options, _ = responses_api.normalize_request(
+            {
+                "model": "glm-5.2",
+                "input": "hello",
+                "prompt_cache_key": "stable-prefix-a",
+                "prompt_cache_options": {"retention": "24h"},
+            }
+        )
+        self.assertEqual(options["prompt_cache_key"], "stable-prefix-a")
+        self.assertEqual(options["prompt_cache_options"], {"retention": "24h"})
+
     def test_stream_function_call_emits_argument_delta_and_done_events(self):
         captured = {}
         arguments = '{"path":"README.md"}'

@@ -580,6 +580,11 @@ def model_session_id(model: str, options: Optional[Mapping[str, Any]] = None) ->
         or "default"
     )
     variant = str(options.get("_session_variant") or "")
+    cache_key = (
+        options.get("_prompt_cache_key_affinity")
+    )
+    if isinstance(cache_key, str) and cache_key.strip():
+        variant = "\x1f".join((variant, "prompt-cache-v1", cache_key.strip()[:1024]))
     material = "\x1f".join((account, str(model or "auto"), variant))
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return str(uuid.UUID(digest[:32]))

@@ -25,16 +25,17 @@ from .cli_client import (
     sanitize_assistant_history_messages,
 )
 from .model_limits import clamp_max_completion_tokens
+from .token_usage import usage_details
+from .reasoning_effort import normalize_options as normalize_reasoning_options
+from .sse import compact_reasoning_text, full_reasoning_enabled
 
 
 def thinking_requested(value: Any = None) -> bool:
     """Return whether the caller explicitly requested visible thinking.
 
-    Trae exposes reasoning internally even when the public request does not
-    ask for it.  Keep that trace private by default.  Only the explicit
-    ``thinking`` option (boolean or the common ``{type/enabled}`` forms)
-    enables a compact reasoning channel; ``reasoning_effort`` alone controls
-    generation quality and must not accidentally leak the full chain.
+    This parses the explicit ``thinking`` option without applying a server
+    default. ``reasoning_effort`` controls generation quality independently
+    of whether reasoning text is returned.
     """
 
     if isinstance(value, Mapping):
@@ -65,6 +66,24 @@ def thinking_requested(value: Any = None) -> bool:
             "1", "true", "yes", "on", "enabled", "enable", "summary",
         }
     return False
+
+
+def reasoning_output_requested(value: Any = None) -> bool:
+    """Apply the output setting unless the request specifies visibility."""
+
+    if isinstance(value, Mapping):
+        explicit = [
+            thinking_requested(value.get(key))
+            for key in ("thinking", "include_reasoning")
+            if key in value
+        ]
+        if explicit:
+            # Either explicit disable wins when clients send both switches.
+            return all(explicit)
+        return full_reasoning_enabled()
+    if value is not None:
+        return thinking_requested(value)
+    return full_reasoning_enabled()
 
 
 class ResponsesRequestError(ValueError):
@@ -287,11 +306,18 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def _compact_reasoning_summary(value: Any, *, max_chars: int = 800, max_lines: int = 6) -> str:
-    """Bound client-visible reasoning before it enters a Responses object."""
+def _compact_reasoning_summary(
+    value: Any, *, max_chars: int = 800, max_lines: int = 6,
+    allow_full: bool = False,
+) -> str:
+    """Format output reasoning while keeping replayed history bounded."""
 
     if not isinstance(value, str) or not value.strip():
         return ""
+    if allow_full and full_reasoning_enabled():
+        return compact_reasoning_text(
+            value, max_chars=max_chars, max_lines=max_lines
+        )
     lines: list[str] = []
     seen: set[str] = set()
     for raw in value.splitlines():
@@ -1174,6 +1200,13 @@ def normalize_request(
         "frequency_penalty",
         "seed",
         "reasoning_effort",
+        "reasoningEffort",
+        "reasoning_effort_level",
+        "reasoningEffortLevel",
+        "thinking_effort",
+        "reasoning",
+        "output_config",
+        "outputConfig",
         "thinking",
         "include_reasoning",
         "trae_max_mode",
@@ -1181,6 +1214,12 @@ def normalize_request(
         "stream_options",
         "response_format",
         "service_tier",
+        "prompt_cache_key",
+        "promptCacheKey",
+        "prompt_cache_options",
+        "promptCacheOptions",
+        "prompt_cache_retention",
+        "promptCacheRetention",
         "user",
         "logprobs",
         "top_logprobs",
@@ -1190,6 +1229,7 @@ def normalize_request(
     reasoning = body.get("reasoning")
     if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
         options.setdefault("reasoning_effort", reasoning.get("effort"))
+    options = normalize_reasoning_options(options)
     # Preserve the complete reasoning presentation request for the Chat core.
     # ``thinking`` is intentionally separate from ``reasoning_effort``: the
     # latter may be used only to tune generation, while the former opts into a
@@ -1285,14 +1325,15 @@ def _usage(usage: Any) -> Optional[dict[str, Any]]:
         "output_tokens", "completion_tokens", "outputTokens"
     )
     total_tokens = number("total_tokens", "totalTokens") or input_tokens + output_tokens
+    details = usage_details(usage)
     return {
         "input_tokens": input_tokens,
         "input_tokens_details": {
-            "cached_tokens": 0,
-            "cache_write_tokens": 0,
+            "cached_tokens": details.get("cached_tokens", 0),
+            "cache_write_tokens": details.get("cache_write_tokens", 0),
         },
         "output_tokens": output_tokens,
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": details.get("reasoning_tokens", 0)},
         "total_tokens": total_tokens,
     }
 
@@ -1531,9 +1572,10 @@ def completion_to_response(
                 embedded_reasoning,
             )
             if part
-        )
+        ),
+        allow_full=True,
     )
-    if thinking_requested(context.request) and reasoning_summary:
+    if reasoning_output_requested(context.request) and reasoning_summary:
         output.append(_reasoning_output_item(reasoning_summary))
     content = _content_to_text(visible_content)
     if content:
@@ -1738,7 +1780,7 @@ async def _translate_chat_stream(
         """Reserve a reasoning output slot without exposing raw trace text."""
 
         nonlocal sequence, reasoning_item, reasoning_index
-        if not thinking_requested(context.request) or reasoning_item is not None:
+        if not reasoning_output_requested(context.request) or reasoning_item is not None:
             return []
         reasoning_index = len(outputs)
         reasoning_item = {
@@ -1761,7 +1803,7 @@ async def _translate_chat_stream(
 
     def append_reasoning_events(summary: str) -> list[str]:
         nonlocal sequence, reasoning_item, reasoning_index
-        if not thinking_requested(context.request) or not summary:
+        if not reasoning_output_requested(context.request) or not summary:
             return []
         events: list[str] = []
         if reasoning_item is None:
@@ -2098,14 +2140,13 @@ async def _translate_chat_stream(
         return
 
     reasoning_summary = (
-        _compact_reasoning_summary(reasoning_raw)
-        if thinking_requested(context.request)
+        _compact_reasoning_summary(reasoning_raw, allow_full=True)
+        if reasoning_output_requested(context.request)
         else ""
     )
     if reasoning_summary:
-        # Reasoning is presentation-only.  Collect the upstream trace while
-        # the stream is running, then emit one bounded summary at completion so
-        # cumulative snapshots cannot flood the client or re-expand history.
+        # Collect cumulative snapshots before formatting the selected output
+        # mode. Replay history is bounded separately by _remember_response.
         for event in append_reasoning_events(reasoning_summary):
             yield event
         if reasoning_item is not None:

@@ -142,6 +142,15 @@ class OfflineRawChainReplayTests(unittest.TestCase):
                 with (
                     patch("src.main.API_KEYS", ["offline-chain-key"]),
                     patch("src.main.UPSTREAM_MODE", "raw"),
+                    # Replay the explicit legacy diagnostic transport; ordinary
+                    # tool-bearing HTTP requests now select the native IDE path.
+                    patch.object(
+                        main,
+                        "_apply_auto_route",
+                        side_effect=lambda _messages, options: {
+                            **options, "_upstream_mode": "raw"
+                        },
+                    ),
                     patch.object(main, "_USAGE_RECORDS_PATH", usage_path),
                     patch.dict(
                         os.environ,

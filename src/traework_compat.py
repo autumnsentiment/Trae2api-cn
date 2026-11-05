@@ -16,8 +16,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Iterable, Mapping, Optional
 
-from . import raw_client, trae_client, trae_remote_client
+from . import auth, raw_client, trae_client, trae_remote_client
+from .reasoning_effort import apply_reasoning_effort
 from .sse import compact_reasoning_text
+from .token_usage import usage_details
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,46 @@ def _option(options: Mapping[str, Any], *names: str, default: Any = None) -> Any
         if name in options and options[name] is not None:
             return options[name]
     return default
+
+
+def reasoning_output_mode(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Return ``full``, ``summary`` or ``hidden`` for custom-model output."""
+
+    full = bool(auth.get_reasoning_output_settings().get("enabled"))
+    explicit: list[bool] = []
+    for key in ("thinking", "include_reasoning"):
+        if not isinstance(options, Mapping) or key not in options:
+            continue
+        value = options.get(key)
+        if isinstance(value, Mapping):
+            if "enabled" in value:
+                value = value.get("enabled")
+            elif "enable" in value:
+                value = value.get("enable")
+            else:
+                value = value.get("type", value.get("mode"))
+        if isinstance(value, bool):
+            explicit.append(value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            explicit.append(bool(value))
+        elif isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"disabled", "disable", "off", "false", "0", "no"}:
+                explicit.append(False)
+            elif normalized in {
+                "enabled", "enable", "on", "true", "1", "yes",
+                "thinking", "reasoning", "summary",
+            }:
+                explicit.append(True)
+    if explicit and not all(explicit):
+        return "hidden"
+    return "full" if full else "summary"
+
+
+def _format_reasoning(value: str, mode: str) -> str:
+    if mode == "hidden":
+        return ""
+    return compact_reasoning_text(value, allow_full=mode == "full")
 
 
 def _copy_mapping(mapping: Optional[Mapping[str, Any]]) -> dict[str, Any]:
@@ -249,7 +291,21 @@ def _remote_custom_model(
     *,
     options: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
+    # Keep the exact live descriptor when a compatibility caller already
+    # resolved one.  Its reasoning_effort_config is the capability evidence
+    # needed by apply_reasoning_effort; the public model name alone cannot
+    # prove that a strength is accepted by this endpoint.
+    provided = _option(
+        options,
+        "custom_model",
+        "customModel",
+        "_traecode_model_descriptor",
+        "model_descriptor",
+        default=None,
+    )
+    result = dict(provided) if isinstance(provided, Mapping) else {}
+    result.update(
+        {
         "name": binding.config_name,
         "config_name": binding.config_name,
         "model_name": binding.raw_model_name,
@@ -260,7 +316,9 @@ def _remote_custom_model(
         ),
         "is_preset": bool(_option(options, "is_preset", "model_is_preset", default=True)),
         "provider": str(_option(options, "provider", default=binding.provider) or ""),
-    }
+        }
+    )
+    return result
 
 
 def build_remote_session_request(
@@ -316,11 +374,18 @@ def build_remote_session_request(
 
     if strategy == "manual":
         custom_model = _remote_custom_model(binding, options=options_dict)
+        custom_model, effort_level = apply_reasoning_effort(custom_model, options_dict)
         initial_message["model_name"] = binding.config_name
         initial_message["model_config_source"] = custom_model["config_source"]
         initial_message["model_is_preset"] = custom_model["is_preset"]
         initial_message["model_provider"] = custom_model["provider"]
         initial_message["custom_model"] = custom_model
+        trace = options_dict.get("_upstream_trace")
+        if isinstance(trace, dict):
+            if effort_level:
+                trace["reasoning_effort_applied"] = effort_level
+            else:
+                trace.pop("reasoning_effort_applied", None)
 
     body = {
         "mode": mode,
@@ -707,6 +772,7 @@ def normalize_inbound_request(
         "parallel_tool_calls",
         "parallelToolCalls",
         "thinking",
+        "include_reasoning",
         "reasoning_effort",
         "reasoningEffort",
         "max_tokens",
@@ -1328,6 +1394,10 @@ def _custom_usage_payload(
     }
     # Preserve only accounting fields understood by clients. Never copy the
     # complete upstream object because it may contain opaque provider data.
+    # Chat/Responses translators use nested standard detail objects while
+    # native Trae payloads commonly use flat cache_read_tokens fields. Read
+    # both shapes here so the TraeWork bridge does not erase an upstream hit.
+    details = usage_details(usage)
     for target, aliases in (
         ("cache_read_tokens", ("cache_read_tokens", "cacheReadTokens")),
         ("cache_write_tokens", ("cache_write_tokens", "cacheWriteTokens")),
@@ -1341,6 +1411,16 @@ def _custom_usage_payload(
             ),
         ),
     ):
+        canonical = (
+            details.get("cached_tokens")
+            if target == "cache_read_tokens"
+            else details.get("cache_write_tokens")
+            if target == "cache_write_tokens"
+            else None
+        )
+        if canonical is not None:
+            result[target] = canonical
+            continue
         for alias in aliases:
             value = usage.get(alias)
             if value is not None:
@@ -1355,9 +1435,11 @@ async def translate_openai_stream_to_traework(
     *,
     model: str = "auto",
     request_id: str = "",
+    reasoning_mode: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Translate relay OpenAI SSE into TraeWork's cumulative raw SSE contract."""
 
+    reasoning_mode = reasoning_mode or reasoning_output_mode()
     response_text = ""
     reasoning_text = ""
     calls: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -1474,7 +1556,7 @@ async def translate_openai_stream_to_traework(
                     reasoning_text = reasoning
                 else:
                     reasoning_text = previous_reasoning + reasoning
-            compact = compact_reasoning_text(reasoning_text)
+            compact = _format_reasoning(reasoning_text, reasoning_mode)
             if compact.startswith(reasoning_sent):
                 reasoning_delta = compact[len(reasoning_sent):]
             elif compact != reasoning_sent:
@@ -1498,7 +1580,7 @@ async def translate_openai_stream_to_traework(
             usage = current_usage
         if finish:
             finish_reason = finish
-        if text or reasoning or emitted_tool_deltas:
+        if text or (reasoning and reasoning_mode != "hidden") or emitted_tool_deltas:
             meaningful_output = True
         # The deferred relay stream deliberately starts with an empty
         # OpenAI delta. Preserve that as a real TraeWork output frame so
@@ -1578,11 +1660,11 @@ async def translate_openai_stream_to_traework(
         "model": model,
     }
     _apply_custom_identity(final, response_identity, model=model)
-    if reasoning_text:
-        # Reasoning is a presentation-only side channel. Keep the compact
-        # checkpoint summary in the final event rather than forwarding the
-        # cumulative upstream trace on every token.
-        final["reasoning_content"] = compact_reasoning_text(reasoning_text)
+    if reasoning_text and reasoning_mode != "hidden":
+        # Keep the selected reasoning presentation in its own side channel.
+        final["reasoning_content"] = _format_reasoning(
+            reasoning_text, reasoning_mode
+        )
     if calls:
         final["tool_calls"] = [dict(value) for value in calls.values()]
     if finish_reason:
@@ -1598,9 +1680,15 @@ async def translate_openai_stream_to_traework(
     yield custom_sse_event("done", final)
 
 
-def openai_completion_to_traework(payload: Mapping[str, Any], *, model: str = "auto") -> dict[str, Any]:
+def openai_completion_to_traework(
+    payload: Mapping[str, Any],
+    *,
+    model: str = "auto",
+    reasoning_mode: Optional[str] = None,
+) -> dict[str, Any]:
     """Convert one non-stream OpenAI completion to the raw custom shape."""
 
+    reasoning_mode = reasoning_mode or reasoning_output_mode()
     text, reasoning, calls, usage, finish = _custom_output_from_openai(payload)
     result: dict[str, Any] = {
         "response": text,
@@ -1609,8 +1697,8 @@ def openai_completion_to_traework(payload: Mapping[str, Any], *, model: str = "a
     }
     identity = _custom_response_identity(payload)
     _apply_custom_identity(result, identity, model=model)
-    if reasoning:
-        result["reasoning_content"] = compact_reasoning_text(reasoning)
+    if reasoning and reasoning_mode != "hidden":
+        result["reasoning_content"] = _format_reasoning(reasoning, reasoning_mode)
     if calls:
         result["tool_calls"] = [{key: value for key, value in call.items() if not key.startswith("_")} for call in calls]
         if len(calls) == 1:

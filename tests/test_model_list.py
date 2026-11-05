@@ -22,11 +22,19 @@ UPSTREAM = {
 
 
 class ModelListTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.cache_patch = patch.object(trae_client, "_WEB_MODEL_CACHE", {})
+        self.cache_patch.start()
+        self.addCleanup(self.cache_patch.stop)
+
     def _patches(self, fetch, solo=None):
+        async def bound_fetch(token_override, **kwargs):
+            return await fetch(token_override=token_override, **kwargs)
+
         return (
             patch.object(trae_client, "_MODEL_LIST_CACHE", {}),
             patch.object(trae_client, "_UPSTREAM_MODEL_CASE", {}),
-            patch.object(trae_client, "_fetch_web_model_configs", side_effect=fetch),
+            patch.object(trae_client, "_fetch_web_model_configs", side_effect=bound_fetch),
             patch.object(
                 trae_client,
                 "_fetch_solo_model_configs",

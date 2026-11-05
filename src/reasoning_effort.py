@@ -62,7 +62,10 @@ def requested_level(options: Optional[Mapping[str, Any]]) -> str:
 
     if not isinstance(options, Mapping):
         return ""
-    for key in ("reasoning_effort", "reasoningEffort", "thinking_effort"):
+    for key in (
+        "reasoning_effort", "reasoningEffort", "thinking_effort",
+        "reasoning_effort_level", "reasoningEffortLevel",
+    ):
         level = normalize_level(options.get(key))
         if level:
             return level
@@ -71,6 +74,12 @@ def requested_level(options: Optional[Mapping[str, Any]]) -> str:
         level = normalize_level(reasoning.get("effort"))
         if level:
             return level
+    for key in ("output_config", "outputConfig"):
+        output = options.get(key)
+        if isinstance(output, Mapping):
+            level = normalize_level(output.get("effort"))
+            if level:
+                return level
     thinking = options.get("thinking")
     if isinstance(thinking, Mapping):
         level = normalize_level(thinking.get("effort") or thinking.get("level"))
@@ -80,6 +89,16 @@ def requested_level(options: Optional[Mapping[str, Any]]) -> str:
         if level:
             return level
     return ""
+
+
+def normalize_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep client aliases usable by transports expecting reasoning_effort."""
+
+    result = dict(options)
+    level = requested_level(result)
+    if level and not normalize_level(result.get("reasoning_effort")):
+        result["reasoning_effort"] = level
+    return result
 
 
 def supported_levels(custom_model: Optional[Mapping[str, Any]]) -> list[str]:
@@ -109,15 +128,27 @@ def apply_reasoning_effort(
 ) -> tuple[Optional[dict[str, Any]], str]:
     """Return ``(custom_model_copy, applied_level)``.
 
-    The model object is returned unchanged (and level ``""``) when the caller
-    did not ask for a strength or the model does not support thinking levels.
+    The model object is returned unchanged when the caller did not ask for a
+    strength.  When a caller did ask but the descriptor does not explicitly
+    support thinking, any stale effort fields are removed and ``""`` is
+    returned.
     """
 
     if not isinstance(custom_model, Mapping):
         return (dict(custom_model) if custom_model else custom_model), ""
-    level = clamp_level(requested_level(options), supported_levels(custom_model))
-    if not level:
+    requested = requested_level(options)
+    if not requested:
         return dict(custom_model), ""
+    level = clamp_level(requested, supported_levels(custom_model))
+    if not level:
+        # A caller request must never leak an already-present effort field
+        # through a descriptor that does not explicitly support thinking.
+        # This also handles descriptors with incomplete capability metadata;
+        # model names alone are not evidence that the wire field is accepted.
+        updated = dict(custom_model)
+        updated.pop("reasoning_effort", None)
+        updated.pop("reasoning_effort_level", None)
+        return updated, ""
     updated = dict(custom_model)
     if "reasoning_effort_level" in updated:
         updated["reasoning_effort_level"] = level

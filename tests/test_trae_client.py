@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import os
 import threading
@@ -96,6 +97,84 @@ class ModelDescriptorCapabilityTests(unittest.TestCase):
         )
         self.assertIs(descriptor_multimodal(config), False)
         self.assertIs(config["multimodal"], False)
+
+
+class LegacyReasoningEffortTests(unittest.TestCase):
+    SUPPORTED = {
+        "config_name": "reasoning-model",
+        "reasoning_effort_config": {
+            "support_thinking": True,
+            "options": ["light", "high"],
+        },
+    }
+    UNSUPPORTED = {
+        "config_name": "text-only-model",
+        "reasoning_effort_config": {"support_thinking": False},
+    }
+
+    def test_legacy_builders_send_effort_only_for_supported_descriptor(self):
+        options = {
+            "reasoning_effort": "ultra",
+            "model_descriptor": self.SUPPORTED,
+        }
+
+        llm_body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "think"}],
+            "reasoning-model",
+            True,
+            options=options,
+        )
+        work_body = trae_client.build_work_agent_body(
+            [{"role": "user", "content": "think"}],
+            "reasoning-model",
+            True,
+            options=options,
+        )
+        _, ide_body = asyncio.run(
+            trae_client.build_trae_ide_request(
+                [{"role": "user", "content": "think"}],
+                "reasoning-model",
+                options=options,
+            )
+        )
+
+        for body in (llm_body, work_body, ide_body):
+            self.assertEqual(body["reasoning_effort"], "high")
+            self.assertNotIn("reasoning_effort_level", body)
+
+    def test_legacy_builders_strip_effort_for_unsupported_descriptor(self):
+        trace = {"reasoning_effort_applied": "high"}
+        options = {
+            "reasoning_effort": "high",
+            "reasoning_effort_level": "extra_high",
+            "model_descriptor": self.UNSUPPORTED,
+            "_upstream_trace": trace,
+        }
+
+        llm_body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "think"}],
+            "text-only-model",
+            True,
+            options=options,
+        )
+        work_body = trae_client.build_work_agent_body(
+            [{"role": "user", "content": "think"}],
+            "text-only-model",
+            True,
+            options=options,
+        )
+        _, ide_body = asyncio.run(
+            trae_client.build_trae_ide_request(
+                [{"role": "user", "content": "think"}],
+                "text-only-model",
+                options=options,
+            )
+        )
+
+        for body in (llm_body, work_body, ide_body):
+            self.assertNotIn("reasoning_effort", body)
+            self.assertNotIn("reasoning_effort_level", body)
+        self.assertNotIn("reasoning_effort_applied", trace)
 
 
 class ModelRequestParallelLimitTests(unittest.TestCase):
@@ -344,6 +423,148 @@ class CheckinDeviceTests(unittest.TestCase):
 
 
 class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_catalog_cache_isolates_gateway_and_provider_context(self):
+        fetch = AsyncMock(side_effect=[
+            {"model": {"config_name": name}}
+            for name in ("base", "remote", "native", "provider")
+        ])
+        contexts = (
+            ("https://remote-a.example", "https://native-a.example", {"region": "cn"}),
+            ("https://remote-b.example", "https://native-a.example", {"region": "cn"}),
+            ("https://remote-a.example", "https://native-b.example", {"region": "cn"}),
+            ("https://remote-a.example", "https://native-a.example", {"region": "global"}),
+        )
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=fetch),
+            patch.object(trae_client, "remote_base_url") as remote_gateway,
+            patch.object(trae_client, "_model_gateway_base") as native_gateway,
+        ):
+            names = []
+            for remote, native, provider in (*contexts, contexts[0]):
+                remote_gateway.return_value = remote
+                native_gateway.return_value = native
+                result = await trae_client._cached_model_catalog(
+                    "web", "token-context", user_id_override="account",
+                    provider_specific=provider,
+                )
+                names.append(result["model"]["config_name"])
+
+        self.assertEqual(names, ["base", "remote", "native", "provider", "base"])
+        self.assertEqual(fetch.await_count, 4)
+
+    async def test_catalog_cache_preserves_nested_snapshot_and_returns_copies(self):
+        upstream = {"model": {"capabilities": {"reasoning_effort": ["high"]}}}
+        fetch = AsyncMock(return_value=upstream)
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=fetch),
+        ):
+            first = await trae_client._cached_model_catalog(
+                "web", "token-copy", user_id_override="account",
+                provider_specific={},
+            )
+            first["model"]["capabilities"]["reasoning_effort"].append("caller")
+            upstream["model"]["capabilities"]["reasoning_effort"].append("upstream")
+            second = await trae_client._cached_model_catalog(
+                "web", "token-copy", user_id_override="account",
+                provider_specific={},
+            )
+            self.assertEqual(second["model"]["capabilities"]["reasoning_effort"], ["high"])
+            second["model"]["capabilities"]["reasoning_effort"].append("cached-caller")
+            third = await trae_client._cached_model_catalog(
+                "web", "token-copy", user_id_override="account",
+                provider_specific={},
+            )
+
+        self.assertEqual(third["model"]["capabilities"]["reasoning_effort"], ["high"])
+        self.assertEqual(fetch.await_count, 1)
+
+    async def test_catalog_cache_coalesces_simultaneous_cold_reads(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        fetch = AsyncMock()
+
+        async def fetch_catalog(_token, **_kwargs):
+            started.set()
+            await release.wait()
+            return {"same-model": {"config_name": "same-model"}}
+
+        fetch.side_effect = fetch_catalog
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=fetch),
+        ):
+            first = asyncio.create_task(
+                trae_client._cached_model_catalog("web", "token-coalesce", user_id_override="account")
+            )
+            second = asyncio.create_task(
+                trae_client._cached_model_catalog("web", "token-coalesce", user_id_override="account")
+            )
+            await started.wait()
+            release.set()
+            result_one, result_two = await asyncio.gather(first, second)
+
+        self.assertEqual(fetch.await_count, 1)
+        self.assertEqual(result_one, result_two)
+
+    async def test_cancelled_catalog_waiter_does_not_cancel_shared_fetch(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fetch_catalog(_token, **_kwargs):
+            started.set()
+            await release.wait()
+            return {"same-model": {"config_name": "same-model"}}
+
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=fetch_catalog),
+        ):
+            cancelled = asyncio.create_task(
+                trae_client._cached_model_catalog("web", "token-cancel", user_id_override="account")
+            )
+            survivor = asyncio.create_task(
+                trae_client._cached_model_catalog("web", "token-cancel", user_id_override="account")
+            )
+            await started.wait()
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            release.set()
+            result = await survivor
+
+        self.assertEqual(result["same-model"]["config_name"], "same-model")
+
+    async def test_warm_web_catalog_still_discovers_solo_only_model(self):
+        web_fetch = AsyncMock(return_value={
+            "remote-model": {"config_name": "remote-model"},
+        })
+        solo_fetch = AsyncMock(return_value={
+            "solo-only": {"config_name": "solo-only", "raw_model_name": "solo-only__dev"},
+        })
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=web_fetch),
+            patch.object(trae_client, "_fetch_solo_model_configs", new=solo_fetch),
+        ):
+            remote = await trae_client._get_web_custom_model(
+                "remote-model", token_override="token-solo", user_id_override="account"
+            )
+            solo = await trae_client._get_web_custom_model(
+                "solo-only", token_override="token-solo", user_id_override="account"
+            )
+
+        self.assertEqual(remote["config_name"], "remote-model")
+        self.assertEqual(solo["config_name"], "solo-only")
+        self.assertEqual(web_fetch.await_count, 1)
+        self.assertEqual(solo_fetch.await_count, 1)
+
     async def test_empty_catalog_is_retried_instead_of_cached(self):
         fetch = AsyncMock(
             side_effect=[
@@ -589,9 +810,78 @@ class SessionUsageTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             result,
-            {"credits_consumed": 0.92, "credits_source": "session_usage"},
+            {
+                "credits_consumed": 0.92,
+                "credits_source": "session_usage",
+                "prompt_tokens": 29558,
+                "completion_tokens": 11,
+                "total_tokens": 29569,
+            },
         )
         self.assertNotIn("extra_info", result)
+
+    async def test_fetch_session_usage_preserves_cache_aggregate_without_duplicate_details(self):
+        counters = {
+            "cache_read_token": 22784, "cache_write_token": 0,
+            "input_token": 22857, "output_token": 211,
+            "prompt": "sensitive prompt must not escape",
+        }
+        payload = {"user_usage_group_by_session": {
+            "credits_float": 0.11,
+            "extra_info": counters,
+            "usage_group_details": [{"extra_info": counters}],
+        }}
+        class Response:
+            status_code = 200
+            def json(self):
+                return payload
+
+        class Client:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                return False
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+        with patch("src.trae_client.httpx.AsyncClient", return_value=Client()):
+            result = await trae_client.fetch_session_usage("turn-cache", "jwt-token")
+        self.assertEqual(result, {
+            "credits_consumed": 0.11, "credits_source": "session_usage",
+            "prompt_tokens": 22857, "completion_tokens": 211,
+            "total_tokens": 23068,
+            "prompt_tokens_details": {"cached_tokens": 22784, "cache_write_tokens": 0},
+        })
+
+    def test_session_token_usage_rejects_invalid_and_missing_values(self):
+        for invalid in (True, False, -1, 1.5, float("nan"), float("inf"), "-2", "NaN", "secret"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(trae_client._session_token_usage({
+                    "extra_info": {"input_token": invalid, "cache_read_token": invalid},
+                    "usage_group_details": [{"extra_info": {"cache_read_token": 100}}],
+                }, "turn"), {})
+        self.assertEqual(trae_client._session_token_usage({"extra_info": {"input_token": 100}}, "turn"), {"prompt_tokens": 100})
+        self.assertEqual(trae_client._session_token_usage({"arbitrary_metadata": {"cache_read_token": 100}}, "turn"), {})
+
+    def test_session_token_usage_aggregate_zero_beats_detail_and_ignores_unrelated_data(self):
+        result = trae_client._session_token_usage({"data": {"usage": {
+            "userUsageGroupBySession": {
+                "extraInfo": {"cacheReadToken": "0", "cacheWriteToken": 0},
+                "usageGroupDetails": [{"extra_info": {"cache_read_token": 100}}],
+            }
+        }}}, "turn")
+        self.assertEqual(result, {"prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}})
+
+    def test_session_token_usage_detail_fallback_requires_turn_evidence_for_multiple_rows(self):
+        first = {"session_id": "turn", "extra_info": {"input_token": 100, "output_token": 10, "cache_read_token": 80}}
+        second = {"session_id": "turn", "extra_info": {"input_token": 200, "output_token": 20, "cache_read_token": 160}}
+        result = trae_client._session_token_usage({"usage_group_details": [first, second]}, "turn")
+        self.assertEqual(result, {"prompt_tokens": 300, "completion_tokens": 30, "total_tokens": 330, "prompt_tokens_details": {"cached_tokens": 240}})
+        for identity in (None, "other-turn"):
+            with self.subTest(identity=identity):
+                self.assertEqual(trae_client._session_token_usage({"usage_group_details": [first, {**second, "session_id": identity}]}, "turn"), {})
+        self.assertEqual(trae_client._session_token_usage({"usage_group_details": [first]}, "turn"), {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "prompt_tokens_details": {"cached_tokens": 80}})
+        self.assertEqual(trae_client._session_token_usage({"usage_group_details": [first]}, "different-turn"), {})
 
     async def test_fetch_session_usage_preserves_explicit_zero(self):
         class Response:
@@ -1172,6 +1462,11 @@ class IdeRequestContextTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].headers["Authorization"], "Cloud-IDE-JWT bound-token")
+        self.assertEqual(response.auth_token, "bound-token")
+        self.assertNotIn("bound-token", repr(response))
+        self.assertEqual(
+            response.usage_turn_id, calls[0].request[2]["json"]["session_id"]
+        )
         self.assertEqual(calls[0].headers["x-uid"], "charged-account")
         self.assertEqual(calls[0].request[1], "https://charged.example/api/agent/v3/llm_utils_chat")
         self.assertEqual(calls[0].headers["x-device-type"], trae_client.SOLO_DEVICE_TYPE)
@@ -1234,7 +1529,195 @@ class IdeRequestContextTests(unittest.TestCase):
             )
 
         refresh.assert_awaited_once()
+        self.assertEqual(response.auth_token, "selected-token")
         response.close()
+
+    def test_usage_turn_id_is_bound_only_for_successful_llm_utils_endpoint(self):
+        cases = (
+            ("/api/agent/v3/llm_utils_chat", False, True),
+            ("/api/ide/v1/chat", False, False),
+            ("/api/agent/v3/create_agent_task", False, False),
+            ("", True, False),
+        )
+        for endpoint, reject_first, has_turn_id in cases:
+            with self.subTest(endpoint=endpoint, fallback=reject_first):
+                requests = []
+
+                class FakeResponse:
+                    text = "unavailable"
+
+                    def __init__(self, status_code):
+                        self.status_code = status_code
+
+                    def read(self):
+                        return b"unavailable"
+
+                    def close(self):
+                        pass
+
+                class FakeClient:
+                    def __init__(self, **kwargs):
+                        pass
+
+                    def build_request(self, method, url, **kwargs):
+                        return (url, kwargs["json"])
+
+                    def send(self, request, stream=True):
+                        requests.append(request)
+                        status = 503 if reject_first and len(requests) == 1 else 200
+                        return FakeResponse(status)
+
+                    def close(self):
+                        pass
+
+                with (
+                    patch.object(trae_client, "_WEB_SLOTS", {}),
+                    patch("src.trae_client.auth.get_account_record", return_value={}),
+                    patch(
+                        "src.trae_client.auth.get_auth",
+                        return_value=SimpleNamespace(host="https://example.test"),
+                    ),
+                    patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+                    patch("src.trae_client.build_headers", return_value={}),
+                    patch(
+                        "src.trae_client._resolve_request_model_name",
+                        new=AsyncMock(return_value="auto"),
+                    ),
+                ):
+                    response = asyncio.run(
+                        trae_client.send_chat_request(
+                            [{"role": "user", "content": "hello"}],
+                            "auto",
+                            True,
+                            {
+                                "_account_id": "acct",
+                                "_auth_token": "bound-token-hidden",
+                                "_ide_endpoint": endpoint,
+                                "session_id": "request-session",
+                            },
+                        )
+                    )
+                    try:
+                        if has_turn_id:
+                            self.assertTrue(response.usage_turn_id)
+                            self.assertNotEqual(response.usage_turn_id, "request-session")
+                            self.assertEqual(
+                                response.usage_turn_id, requests[-1][1]["session_id"]
+                            )
+                            self.assertEqual(
+                                response.usage_turn_id, requests[-1][1]["request_id"]
+                            )
+                        else:
+                            self.assertEqual(response.usage_turn_id, "")
+                            self.assertEqual(requests[-1][1]["session_id"], "request-session")
+                        self.assertEqual(response.auth_token, "bound-token-hidden")
+                        self.assertNotIn("bound-token-hidden", repr(response))
+                        self.assertEqual(len(requests), 2 if reject_first else 1)
+                    finally:
+                        response.close()
+
+    def test_legacy_requests_use_distinct_bill_ids_without_mutating_tool_history(self):
+        bodies = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                pass
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def build_request(self, method, url, **kwargs):
+                bodies.append(kwargs["json"])
+                return object()
+
+            def send(self, request, stream=True):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        tool_call = {
+            "id": "call_marker_1",
+            "type": "function",
+            "function": {"name": "marker", "arguments": '{"value":"one"}'},
+        }
+        messages = [
+            {"role": "user", "content": "Read the marker."},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_marker_1", "content": "one"},
+        ]
+        options = {
+            "_account_id": "acct",
+            "_auth_token": "bound-token",
+            "_ide_endpoint": "/api/agent/v3/llm_utils_chat",
+            "session_id": "logical-conversation",
+            "_legacy_usage_turn_id": "caller-stale-turn",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "marker", "parameters": {"type": "object"}},
+            }],
+        }
+        before_messages = copy.deepcopy(messages)
+        before_options = copy.deepcopy(options)
+        bill_ids = []
+        with (
+            patch.object(trae_client, "_WEB_SLOTS", {}),
+            patch("src.trae_client.auth.get_account_record", return_value={}),
+            patch(
+                "src.trae_client.auth.get_auth",
+                return_value=SimpleNamespace(host="https://example.test"),
+            ),
+            patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch(
+                "src.trae_client._resolve_request_model_name",
+                new=AsyncMock(return_value="auto"),
+            ),
+        ):
+            for _ in range(2):
+                response = asyncio.run(
+                    trae_client.send_chat_request(messages, "auto", True, options)
+                )
+                bill_ids.append(response.usage_turn_id)
+                response.close()
+
+        self.assertEqual(len(set(bill_ids)), 2)
+        self.assertNotIn("logical-conversation", bill_ids)
+        self.assertNotIn("caller-stale-turn", bill_ids)
+        self.assertEqual(messages, before_messages)
+        self.assertEqual(options, before_options)
+        self.assertEqual(bodies[0]["messages"], bodies[1]["messages"])
+        for body, bill_id in zip(bodies, bill_ids):
+            self.assertEqual(body["session_id"], bill_id)
+            self.assertEqual(body["request_id"], bill_id)
+            assistant = next(item for item in body["messages"] if item["role"] == "assistant")
+            result = next(item for item in body["messages"] if item["role"] == "tool")
+            self.assertEqual(len(assistant["tool_calls"]), 1)
+            self.assertEqual(assistant["tool_calls"][0]["id"], tool_call["id"])
+            self.assertEqual(
+                assistant["tool_calls"][0]["function_call"], tool_call["function"]
+            )
+            self.assertEqual(result["tool_call_id"], "call_marker_1")
+            self.assertEqual(result["content"], [{"type": "text", "text": "one"}])
+            self.assertEqual(len(body["tools"]), 1)
+            self.assertEqual(body["tools"][0]["function"]["name"], "marker")
+            self.assertEqual(
+                json.loads(body["tools"][0]["function"]["parameters"]),
+                options["tools"][0]["function"]["parameters"],
+            )
+
+    def test_llm_body_preserves_explicit_session_without_internal_bill_override(self):
+        body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "auto",
+            True,
+            options={"session_id": "caller-session"},
+        )
+        self.assertEqual(body["session_id"], "caller-session")
+        self.assertEqual(body["request_id"], "caller-session")
 
     def test_uses_caller_workspace_and_terminal_context(self):
         _, request = asyncio.run(
@@ -1304,6 +1787,46 @@ class IdeRequestContextTests(unittest.TestCase):
         self.assertEqual(body["session_id"], "solo-session")
         self.assertEqual(body["request_id"], "solo-session")
         self.assertTrue(body["stream"])
+
+    def test_legacy_bodies_gate_reasoning_by_model_descriptor(self):
+        unsupported = {
+            "config_name": "text-only",
+            "reasoning_effort_config": {"support_thinking": False},
+        }
+        unsupported_body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "text-only",
+            True,
+            options={
+                "reasoning_effort": "high",
+                "_traecode_model_descriptor": unsupported,
+            },
+        )
+        self.assertNotIn("reasoning_effort", unsupported_body)
+        self.assertNotIn("reasoning_effort_level", unsupported_body)
+
+        supported = {
+            "config_name": "thinking-model",
+            "reasoning_effort_level": "high",
+            "reasoning_effort_config": {
+                "support_thinking": True,
+                "options": ["light", "high"],
+            },
+        }
+        trace = {}
+        supported_body = trae_client.build_work_agent_body(
+            [{"role": "user", "content": "hello"}],
+            "thinking-model",
+            True,
+            options={
+                "reasoning_effort": "ultra",
+                "_traecode_model_descriptor": supported,
+                "_upstream_trace": trace,
+            },
+        )
+        self.assertEqual(supported_body["reasoning_effort_level"], "high")
+        self.assertNotIn("reasoning_effort", supported_body)
+        self.assertEqual(trace["reasoning_effort_applied"], "high")
 
     def test_solo_body_serializes_tool_schema_and_normalizes_choice(self):
         body = trae_client.build_llm_chat_body(

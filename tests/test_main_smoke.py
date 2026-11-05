@@ -2800,7 +2800,7 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(choice["finish_reason"], "stop")
         self.assertIn("fake reply", choice["message"]["content"])
 
-    def test_auto_tools_do_not_fall_back_when_raw_fails(self):
+    def test_auto_tools_route_to_ide_native(self):
         tools = [
             {
                 "type": "function",
@@ -2810,10 +2810,10 @@ class MainCliSmokeTests(unittest.TestCase):
                 },
             }
         ]
-        raw = AsyncMock(side_effect=RuntimeError("raw unavailable"))
+        raw = AsyncMock(side_effect=AssertionError("global raw must route tools to IDE"))
         cli = AsyncMock(return_value=JSONResponse({"route": "cli"}))
         web = AsyncMock(side_effect=AssertionError("web must not run external tools"))
-        ide = AsyncMock(side_effect=AssertionError("ide must not run external tools"))
+        ide = AsyncMock(return_value=JSONResponse({"route": "ide"}))
 
         with (
             patch("src.main.UPSTREAM_MODE", "auto"),
@@ -2832,18 +2832,19 @@ class MainCliSmokeTests(unittest.TestCase):
                 headers=AUTH_HEADERS,
             )
 
-        self.assertEqual(response.status_code, 502)
-        self.assertIn("raw: raw unavailable", response.json()["error"]["message"])
-        raw.assert_awaited_once()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"route": "ide"})
+        raw.assert_not_awaited()
         cli.assert_not_awaited()
         web.assert_not_awaited()
-        ide.assert_not_awaited()
+        ide.assert_awaited_once()
+        self.assertTrue(ide.await_args.args[3]["_traecode_native_tools"])
 
-    def test_auto_tools_never_fall_back_to_web_or_ide_after_failures(self):
-        raw = AsyncMock(side_effect=RuntimeError("raw unavailable"))
+    def test_auto_ide_tool_failure_does_not_fall_back(self):
+        raw = AsyncMock(side_effect=AssertionError("global raw must route tools to IDE"))
         cli = AsyncMock(side_effect=RuntimeError("cli unavailable"))
         web = AsyncMock(side_effect=AssertionError("web must not run external tools"))
-        ide = AsyncMock(side_effect=AssertionError("ide must not run external tools"))
+        ide = AsyncMock(side_effect=RuntimeError("ide unavailable"))
 
         with (
             patch("src.main.UPSTREAM_MODE", "auto"),
@@ -2872,20 +2873,20 @@ class MainCliSmokeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         message = response.json()["error"]["message"]
-        self.assertIn("raw: raw unavailable", message)
+        self.assertIn("ide: ide unavailable", message)
+        self.assertNotIn("raw:", message)
         self.assertNotIn("cli:", message)
         self.assertNotIn("web:", message)
-        self.assertNotIn("ide:", message)
-        raw.assert_awaited_once()
+        raw.assert_not_awaited()
         cli.assert_not_awaited()
         web.assert_not_awaited()
-        ide.assert_not_awaited()
+        ide.assert_awaited_once()
 
-    def test_empty_tools_and_none_choice_still_use_only_safe_routes(self):
-        raw = AsyncMock(side_effect=RuntimeError("raw unavailable"))
+    def test_empty_tools_and_none_choice_route_to_ide_native(self):
+        raw = AsyncMock(side_effect=AssertionError("tool options route to IDE"))
         cli = AsyncMock(return_value=JSONResponse({"route": "cli"}))
         web = AsyncMock(side_effect=AssertionError("web must not run tool policy"))
-        ide = AsyncMock(side_effect=AssertionError("ide must not run tool policy"))
+        ide = AsyncMock(return_value=JSONResponse({"route": "ide"}))
 
         with (
             patch("src.main.UPSTREAM_MODE", "auto"),
@@ -2905,18 +2906,21 @@ class MainCliSmokeTests(unittest.TestCase):
                 headers=AUTH_HEADERS,
             )
 
-        self.assertEqual(response.status_code, 502)
-        self.assertIn("raw: raw unavailable", response.json()["error"]["message"])
-        raw.assert_awaited_once()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"route": "ide"})
+        raw.assert_not_awaited()
         cli.assert_not_awaited()
         web.assert_not_awaited()
-        ide.assert_not_awaited()
+        ide.assert_awaited_once()
+        self.assertTrue(ide.await_args.args[3]["_traecode_native_tools"])
+        self.assertEqual(ide.await_args.args[3]["tools"], [])
+        self.assertEqual(ide.await_args.args[3]["tool_choice"], "none")
 
-    def test_tool_result_continuation_without_tools_stays_on_safe_routes(self):
-        raw = AsyncMock(side_effect=RuntimeError("raw unavailable"))
+    def test_tool_result_continuation_routes_to_ide_and_does_not_fall_back(self):
+        raw = AsyncMock(side_effect=AssertionError("tool history routes to IDE"))
         cli = AsyncMock(return_value=JSONResponse({"route": "cli"}))
         web = AsyncMock(side_effect=AssertionError("web must not run tool history"))
-        ide = AsyncMock(side_effect=AssertionError("ide must not run tool history"))
+        ide = AsyncMock(side_effect=RuntimeError("ide unavailable"))
         messages = [
             {"role": "user", "content": "read it"},
             {
@@ -2955,10 +2959,11 @@ class MainCliSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 502)
-        raw.assert_awaited_once()
+        self.assertIn("ide: ide unavailable", response.json()["error"]["message"])
+        raw.assert_not_awaited()
         cli.assert_not_awaited()
         web.assert_not_awaited()
-        ide.assert_not_awaited()
+        ide.assert_awaited_once()
 
     def test_auto_plain_chat_uses_only_raw(self):
         raw = AsyncMock(return_value=JSONResponse({"route": "raw"}))
@@ -2982,10 +2987,13 @@ class MainCliSmokeTests(unittest.TestCase):
         remote.assert_not_awaited()
         cli.assert_not_awaited()
 
-    def test_web_mode_accepts_caller_owned_tools(self):
-        web = AsyncMock(return_value=JSONResponse({"route": "web"}))
-        with patch("src.main.UPSTREAM_MODE", "web"), patch(
-            "src.main._run_web_with_retry", web
+    def test_web_mode_routes_caller_owned_tools_to_ide(self):
+        web = AsyncMock(side_effect=AssertionError("caller tools require native IDE"))
+        ide = AsyncMock(return_value=JSONResponse({"route": "ide"}))
+        with (
+            patch("src.main.UPSTREAM_MODE", "web"),
+            patch("src.main._run_web_with_retry", web),
+            patch("src.main.run_ide_chat", ide),
         ):
             response = self.client.post(
                 "/v1/chat/completions",
@@ -3006,7 +3014,10 @@ class MainCliSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        web.assert_awaited_once()
+        self.assertEqual(response.json(), {"route": "ide"})
+        ide.assert_awaited_once()
+        self.assertTrue(ide.await_args.args[3]["_traecode_native_tools"])
+        web.assert_not_awaited()
 
     def test_ide_mode_accepts_caller_owned_tools(self):
         ide = AsyncMock(return_value=JSONResponse({"route": "ide"}))
@@ -3034,10 +3045,13 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         ide.assert_awaited_once()
 
-    def test_web_mode_accepts_empty_tool_policy(self):
-        web = AsyncMock(return_value=JSONResponse({"route": "web"}))
-        with patch("src.main.UPSTREAM_MODE", "web"), patch(
-            "src.main._run_web_with_retry", web
+    def test_web_mode_routes_empty_tool_policy_to_ide(self):
+        web = AsyncMock(side_effect=AssertionError("tool policy requires native IDE"))
+        ide = AsyncMock(return_value=JSONResponse({"route": "ide"}))
+        with (
+            patch("src.main.UPSTREAM_MODE", "web"),
+            patch("src.main._run_web_with_retry", web),
+            patch("src.main.run_ide_chat", ide),
         ):
             response = self.client.post(
                 "/v1/chat/completions",
@@ -3051,7 +3065,11 @@ class MainCliSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        web.assert_awaited_once()
+        self.assertEqual(response.json(), {"route": "ide"})
+        ide.assert_awaited_once()
+        self.assertEqual(ide.await_args.args[3]["tools"], [])
+        self.assertEqual(ide.await_args.args[3]["tool_choice"], "none")
+        web.assert_not_awaited()
 
     def test_malformed_tools_are_rejected_before_upstream_routing(self):
         raw = AsyncMock(side_effect=AssertionError("raw must not receive invalid tools"))
@@ -3088,7 +3106,7 @@ class MainCliSmokeTests(unittest.TestCase):
         ]
         captured = {}
 
-        async def fake_raw(messages, model, stream=False, options=None):
+        async def fake_ide(messages, model, stream=False, options=None):
             captured["messages"] = messages
             captured["model"] = model
             captured["options"] = options
@@ -3103,7 +3121,7 @@ class MainCliSmokeTests(unittest.TestCase):
 
         with (
             patch.object(main_module, "UPSTREAM_MODE", "raw"),
-            patch("src.main.run_raw_chat", new=fake_raw),
+            patch("src.main.run_ide_chat", new=fake_ide),
         ):
             response = self.client.post(
                 "/v1/chat/completions",
@@ -3113,6 +3131,7 @@ class MainCliSmokeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(captured["options"]["tools"][0]["function"]["name"], "read_file")
+        self.assertTrue(captured["options"]["_traecode_native_tools"])
 
     def test_tool_choice_must_reference_a_declared_tool(self):
         response = self.client.post(
@@ -3195,6 +3214,9 @@ class MainCliSmokeTests(unittest.TestCase):
 
         with (
             patch("src.main.UPSTREAM_MODE", "raw"),
+            # This focused parser test bypasses endpoint policy so it can keep
+            # exercising the explicit raw diagnostic transport.
+            patch("src.main._apply_auto_route", side_effect=lambda messages, options: options),
             patch("src.main.raw_client.send_raw_chat_request", send_raw),
             self.client.stream(
                 "POST",
@@ -3515,6 +3537,9 @@ class MainCliSmokeTests(unittest.TestCase):
 
         with (
             patch("src.main.UPSTREAM_MODE", "raw"),
+            # Keep this parser regression on the explicit raw diagnostic
+            # transport; global tool requests are intentionally rerouted.
+            patch("src.main._apply_auto_route", side_effect=lambda messages, options: options),
             patch("src.main.raw_client.send_raw_chat_request", send_raw),
         ):
             response = self.client.post(
@@ -3769,7 +3794,15 @@ class MainCliSmokeTests(unittest.TestCase):
                             "finish_reason": "stop",
                         }
                     ],
-                    "usage": {"completion_tokens_details": {"reasoning_tokens": 7}},
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 8,
+                        "completion_tokens_details": {"reasoning_tokens": 7},
+                        "prompt_tokens_details": {
+                            "cached_tokens": 60,
+                            "cache_write_tokens": 40,
+                        },
+                    },
                 }
             )
 
@@ -3785,6 +3818,8 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(body["reasoning_effort_applied"], "light")
         self.assertEqual(body["reasoning"], "17*23")
         self.assertEqual(body["usage"]["reasoning_tokens"], 7)
+        self.assertEqual(body["usage"]["cached_tokens"], 60)
+        self.assertEqual(body["usage"]["cache_write_tokens"], 40)
 
         ultra = self.client.post(
             "/api/model-test",

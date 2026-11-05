@@ -23,6 +23,61 @@ def _jwt(payload):
 
 
 class TraeCodeRawBodyTests(unittest.TestCase):
+    def test_enterprise_body_forces_enterprise_config_source(self):
+        body = raw_client.build_traecode_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "glm-5.2",
+            options={
+                "_enterprise_mode": True,
+                "application_config": {"app_id": "enterprise-app"},
+            },
+            session_id="enterprise-session",
+        )
+
+        self.assertEqual(body["config_source"], 2)
+        self.assertEqual(
+            body["application_config"],
+            {"app_id": "enterprise-app"},
+        )
+
+    def test_prompt_cache_key_affinity_overrides_relay_local_session(self):
+        model = raw_client.RawModel("glm-5.2", "glm-5.2", "glm-5.2")
+        common = {
+            "_billing_id": "account-1",
+            "session_id": "relay-random-session",
+            "_prompt_cache_key_affinity": "stable-prefix-a",
+        }
+        first = raw_client.traecode_session_id(model, common)
+        second = raw_client.traecode_session_id(
+            model,
+            {**common, "session_id": "another-relay-session"},
+        )
+        other = raw_client.traecode_session_id(
+            model,
+            {**common, "_prompt_cache_key_affinity": "stable-prefix-b"},
+        )
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertNotEqual(first, "relay-random-session")
+        self.assertEqual(
+            raw_client.traecode_session_id(
+                model,
+                {**common, "_prompt_cache_key_affinity": None},
+            ),
+            "relay-random-session",
+        )
+
+    def test_raw_session_id_includes_prompt_cache_affinity_only_when_present(self):
+        model = raw_client.RawModel("glm-5.2", "glm-5.2", "glm-5.2")
+        base = {"_billing_id": "account-1"}
+        self.assertNotEqual(
+            raw_client.raw_session_id(model, base),
+            raw_client.raw_session_id(
+                model,
+                {**base, "_prompt_cache_key_affinity": "stable-prefix-a"},
+            ),
+        )
+
     def test_ide_body_uses_traecode_function_and_provider_model_id(self):
         body = raw_client.build_traecode_chat_body(
             [{"role": "user", "content": "hello"}],
@@ -155,6 +210,61 @@ class TraeCodeRawBodyTests(unittest.TestCase):
         )
 
         self.assertEqual(body["reasoning_effort"], "ultra")
+
+    def test_live_descriptor_clamps_effort_and_uses_declared_wire_key(self):
+        descriptor = {
+            "config_name": "deepseek-v4.1-flash",
+            "reasoning_effort_config": {
+                "support_thinking": True,
+                "options": ["light", "high"],
+            },
+            "reasoning_effort_level": "light",
+        }
+        trace = {}
+        options = {
+            "reasoning_effort": "ultra",
+            "_traecode_model_descriptor": descriptor,
+            "_upstream_trace": trace,
+        }
+        body = raw_client.build_traecode_chat_body(
+            [{"role": "user", "content": "think"}],
+            "deepseek-v4.1-flash",
+            options=options,
+            session_id="descriptor-effort-session",
+        )
+
+        self.assertEqual(body["reasoning_effort_level"], "high")
+        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(trace["reasoning_effort_applied"], "high")
+        self.assertEqual(descriptor["reasoning_effort_level"], "light")
+        self.assertNotIn("reasoning_effort", descriptor)
+        self.assertEqual(options["_traecode_model_descriptor"], descriptor)
+
+    def test_unsupported_live_descriptor_omits_effort_and_clears_applied_trace(self):
+        descriptor = {
+            "config_name": "text-only-model",
+            "reasoning_effort_config": {
+                "support_thinking": False,
+                "options": ["high", "extra_high"],
+            },
+        }
+        trace = {"reasoning_effort_applied": "extra_high"}
+        body = raw_client.build_traecode_chat_body(
+            [{"role": "user", "content": "think"}],
+            "text-only-model",
+            options={
+                "reasoning_effort": "high",
+                "reasoning_effort_level": "extra_high",
+                "_traecode_model_descriptor": descriptor,
+                "_upstream_trace": trace,
+            },
+            session_id="unsupported-effort-session",
+        )
+
+        self.assertNotIn("reasoning_effort", body)
+        self.assertNotIn("reasoning_effort_level", body)
+        self.assertNotIn("reasoning_effort_applied", trace)
+        self.assertEqual(descriptor["reasoning_effort_config"]["support_thinking"], False)
 
     def test_expanded_raw_v2_fields_are_whitelisted_and_deep_copied(self):
         metadata = {"nested": {"source": "test"}}
@@ -800,6 +910,9 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
                         "display_name": "GLM-5.2",
                         "config_source": 1,
                         "provider": "glm-5",
+                        "reasoning_effort_config": {
+                            "support_thinking": False,
+                        },
                     }
                 ),
             ) as lookup,
@@ -823,6 +936,7 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.config_name, "glm-5")
         self.assertEqual(resolved.raw_model_name, "glm-5__dev")
         self.assertEqual(resolved.display_name, "GLM-5.2")
+        self.assertFalse(resolved.descriptor["reasoning_effort_config"]["support_thinking"])
         lookup.assert_awaited_once()
         self.assertEqual(lookup.await_args.kwargs["raw_chat_function"], "chat_v3")
 

@@ -917,6 +917,10 @@ class ContinuationNonstreamTests(unittest.TestCase):
                     "prompt_tokens": 10,
                     "completion_tokens": 4,
                     "total_tokens": 14,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 6,
+                        "cache_write_tokens": 4,
+                    },
                 },
             },
             {
@@ -934,6 +938,10 @@ class ContinuationNonstreamTests(unittest.TestCase):
                     "prompt_tokens": 12,
                     "completion_tokens": 5,
                     "total_tokens": 17,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 8,
+                        "cache_write_tokens": 4,
+                    },
                 },
             },
         ]
@@ -974,6 +982,10 @@ class ContinuationNonstreamTests(unittest.TestCase):
             payload["choices"][0]["message"]["content"], "part one, part two."
         )
         self.assertEqual(payload["usage"]["completion_tokens"], 9)
+        self.assertEqual(
+            payload["usage"]["prompt_tokens_details"],
+            {"cached_tokens": 14, "cache_write_tokens": 8},
+        )
         self.assertEqual(len(calls), 2)
 
 

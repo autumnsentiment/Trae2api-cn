@@ -147,46 +147,24 @@ class IdeNativeIngressTests(unittest.TestCase):
 
     def assert_native_second_round(self):
         history = self.bodies[1]["messages"]
-        # The public IDE bridge deliberately uses TraeCode's prompt tool
-        # contract (the native raw endpoint has no stable tools field in this
-        # mode), so tool history is serialized into assistant/user text.
+        # Retain native call and result ids across public ingress turns.
         assistant = next(message for message in history if message["role"] == "assistant")
-        assistant_text = "\n".join(
-            block.get("text", "")
-            for block in assistant.get("content", [])
-            if isinstance(block, dict)
-        )
-        self.assertIn(CALL["id"], assistant_text)
-        self.assertIn(CALL["function"]["name"], assistant_text)
-        self.assertIn(CALL["function"]["arguments"], assistant_text)
-        result = next(
-            message
-            for message in history
-            if message["role"] == "user"
-            and "Client tool result" in "\n".join(
-                block.get("text", "")
-                for block in message.get("content", [])
-                if isinstance(block, dict)
-            )
-        )
+        self.assertEqual(assistant["tool_calls"], [CALL])
+        result = next(message for message in history if message["role"] == "tool")
         result_text = "\n".join(
             block.get("text", "")
             for block in result.get("content", [])
             if isinstance(block, dict)
         )
-        self.assertIn(CALL["id"], result_text)
+        self.assertEqual(result["tool_call_id"], CALL["id"])
         self.assertIn("nonce-confirmed", result_text)
         for body in self.bodies:
             self.assertEqual(body["raw_chat_function"], "chat_v3")
-            self.assertNotIn("tools", body)
-            prompt = "\n".join(
-                block.get("text", "")
-                for message in body["messages"]
-                for block in message.get("content", [])
-                if isinstance(block, dict)
+            self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
+            self.assertEqual(
+                body["tools"][0]["function"]["parameters"], FUNCTION["parameters"]
             )
-            self.assertIn("read_file", prompt)
-            self.assertIn("opencode_tool_call", prompt)
+            self.assertFalse(body["parallel_tool_calls"])
         for close in self.closers:
             close.assert_called_once()
 

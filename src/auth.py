@@ -205,6 +205,7 @@ def init_auth() -> AuthState:
                 state.log_summary()
                 state.source = "env"
                 _auth = state
+                _bootstrap_account_store()
                 _save_env_snapshot()
                 return state
 
@@ -218,6 +219,7 @@ def init_auth() -> AuthState:
                 _load_web_provider_specific(state)
                 _load_env_overrides(state)
                 _auth = state
+                _bootstrap_account_store()
                 state.log_summary()
                 return state
 
@@ -1344,12 +1346,14 @@ def reserve_model_account(
     preferred_account_id: str = "",
     require_polling: bool = False,
     excluded_account_ids: Optional[set[str]] = None,
+    activate: bool = True,
 ) -> tuple[str, dict]:
     """Atomically choose an eligible account and reserve one model slot.
 
     A preferred id is honored only when it has capacity (used for a pinned
     continuation).  New requests use credit-priority ordering when enabled;
-    round-robin ordering remains available and skips full accounts.
+    round-robin ordering remains available and skips full accounts.  Dedicated
+    account routes can reserve without changing the ordinary active selection.
     """
     global _active_account, _rotation_cursor
     preferred_account_id = (
@@ -1425,8 +1429,9 @@ def reserve_model_account(
         _MODEL_ACCOUNT_INFLIGHT[aid] = _MODEL_ACCOUNT_INFLIGHT.get(aid, 0) + 1
         _MODEL_ACCOUNT_RESERVED[aid] = _MODEL_ACCOUNT_RESERVED.get(aid, 0) + 1
         _MODEL_ACCOUNT_RESERVATION_OWNERS[reservation_id] = aid
-        _active_account = aid
-        _switch_record(rec)
+        if activate:
+            _active_account = aid
+            _switch_record(rec)
         snapshot = dict(rec)
         snapshot["_slot_reservation_id"] = reservation_id
         return aid, snapshot
@@ -1970,6 +1975,8 @@ def get_settings() -> dict:
             'endpoint_id': _settings.get('endpoint_id', ''),
             'relay_port': _settings.get('relay_port', 0),
             'poll_enabled': _poll_enabled,
+            'reasoning_output': get_reasoning_output_settings(),
+            'enterprise': get_enterprise_settings(),
         }
 
 
@@ -2136,6 +2143,96 @@ def set_auto_route_settings(enabled: bool) -> dict:
     os.environ[_AUTO_ROUTE_ENV] = '1' if enabled else '0'
     _write_env_values({_AUTO_ROUTE_ENV: '1' if enabled else '0'})
     return get_auto_route_settings()
+
+
+_REASONING_OUTPUT_ENV = 'TRAE_VERBOSE_REASONING'
+_ENTERPRISE_ENABLED_ENV = 'TRAE_ENTERPRISE_ENABLED'
+_ENTERPRISE_ACCOUNT_ENV = 'TRAE_ENTERPRISE_ACCOUNT_ID'
+
+
+def get_reasoning_output_settings() -> dict:
+    """Return whether upstream reasoning text may be emitted to clients."""
+    with _STORE_LOCK:
+        saved = _settings.get('reasoning_output')
+        if isinstance(saved, dict):
+            return {'enabled': bool(saved.get('enabled')), 'source': 'console'}
+    enabled = os.environ.get(_REASONING_OUTPUT_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on',
+    )
+    return {'enabled': enabled, 'source': 'env'}
+
+
+def set_reasoning_output_settings(enabled: bool) -> dict:
+    if not isinstance(enabled, bool):
+        raise ValueError('enabled must be a boolean')
+    with _STORE_LOCK:
+        _settings['reasoning_output'] = {'enabled': enabled}
+        _save_accounts()
+    env_value = '1' if enabled else '0'
+    os.environ[_REASONING_OUTPUT_ENV] = env_value
+    _write_env_values({_REASONING_OUTPUT_ENV: env_value})
+    return get_reasoning_output_settings()
+
+
+def get_enterprise_settings() -> dict:
+    """Return the explicitly selected enterprise credential and mode switch."""
+    with _STORE_LOCK:
+        saved = _settings.get('enterprise')
+        if isinstance(saved, dict):
+            return {
+                'enabled': bool(saved.get('enabled')),
+                'account_id': str(saved.get('account_id') or '').strip(),
+                'source': 'console',
+            }
+    enabled = os.environ.get(_ENTERPRISE_ENABLED_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on',
+    )
+    return {
+        'enabled': enabled,
+        'account_id': os.environ.get(_ENTERPRISE_ACCOUNT_ENV, '').strip(),
+        'source': 'env',
+    }
+
+
+def set_enterprise_settings(
+    enabled: bool, account_id: str | None = None,
+) -> dict:
+    """Select an operator-provided JWT without inferring enterprise status."""
+    if not isinstance(enabled, bool):
+        raise ValueError('enabled must be a boolean')
+    if account_id is not None and not isinstance(account_id, str):
+        raise ValueError('account_id must be a string')
+    with _STORE_LOCK:
+        selected = (
+            get_enterprise_settings()['account_id']
+            if account_id is None
+            else account_id.strip()
+        )
+        if '\r' in selected or '\n' in selected:
+            raise ValueError('account_id must be a single line')
+        if enabled:
+            record = _accounts.get(selected)
+            if (
+                not record
+                or str(record.get('source') or '').strip().lower() == 'cli'
+                or not _record_model_eligible(record)
+            ):
+                raise ValueError(
+                    'Enterprise mode requires an enabled account with a valid '
+                    'Cloud-IDE-JWT'
+                )
+        _settings['enterprise'] = {
+            'enabled': enabled,
+            'account_id': selected,
+        }
+        _save_accounts()
+    values = {
+        _ENTERPRISE_ENABLED_ENV: '1' if enabled else '0',
+        _ENTERPRISE_ACCOUNT_ENV: selected,
+    }
+    os.environ.update(values)
+    _write_env_values(values)
+    return get_enterprise_settings()
 
 
 _AUTO_CHECKIN_ENV = 'TRAE_AUTO_CHECKIN'

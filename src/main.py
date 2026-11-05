@@ -98,6 +98,9 @@ from .sse import (
     translate_ide_stream,
     translate_web_events,
 )
+from .token_usage import usage_details
+from .session_usage import enrich_remote_events, legacy_usage_enricher
+from .reasoning_effort import normalize_options as normalize_reasoning_options
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("trae-cn-relay")
@@ -191,14 +194,20 @@ def _restore_persisted_relay_settings() -> dict:
         model_base = DEFAULT_MODEL_GATEWAY_URL
     if model_base:
         os.environ["TRAE_MODEL_API_HOST"] = model_base
-        if mode in {"work", "work-agent"}:
+        if mode in {"raw", "direct"}:
+            os.environ["TRAE_RAW_BASE_URL"] = model_base
+            os.environ["TRAE_ENTERPRISE_BASE_URL"] = model_base
+        elif mode in {"work", "work-agent"}:
             os.environ["TRAE_RAW_BASE_URL"] = model_base
             os.environ["TRAE_WORK_BASE_URL"] = model_base
         elif mode in {"ide", "solo"}:
             os.environ["TRAE_CODE_BASE_URL"] = model_base
     else:
         os.environ.pop("TRAE_MODEL_API_HOST", None)
-        if mode in {"work", "work-agent"}:
+        if mode in {"raw", "direct"}:
+            os.environ.pop("TRAE_RAW_BASE_URL", None)
+            os.environ.pop("TRAE_ENTERPRISE_BASE_URL", None)
+        elif mode in {"work", "work-agent"}:
             os.environ.pop("TRAE_RAW_BASE_URL", None)
             os.environ.pop("TRAE_WORK_BASE_URL", None)
         elif mode in {"ide", "solo"}:
@@ -262,8 +271,23 @@ DEFAULT_MODEL_GATEWAY_URL = (
     os.environ.get("TRAE_CODE_BASE_URL")
     or "https://trae-api-cn.mchost.guru"
 ).rstrip("/")
+DEFAULT_ENTERPRISE_MODEL_GATEWAY_URL = (
+    os.environ.get("TRAE_ENTERPRISE_BASE_URL")
+    or os.environ.get("TRAE_RAW_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
 WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", DEFAULT_REMOTE_BASE_URL)).rstrip("/")
 UPSTREAM_ENDPOINT_PRESETS = (
+    {
+        "id": "raw",
+        "label": "企业版 / llm_raw_chat",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "model_base_url": DEFAULT_ENTERPRISE_MODEL_GATEWAY_URL,
+        "endpoint_url": DEFAULT_ENTERPRISE_MODEL_GATEWAY_URL + "/api/ide/v2/llm_raw_chat",
+        "endpoint_path": "/api/ide/v2/llm_raw_chat",
+        "mode": "raw",
+        "product": "trae",
+    },
     {
         "id": "remote",
         "label": "Remote / chat_sessions（trae remote）",
@@ -335,18 +359,32 @@ CHAT_OPTION_FIELDS = (
     "presence_penalty",
     "frequency_penalty",
     "seed",
-    # ``thinking`` is a client-visible presentation/request hint.  It must be
-    # retained through the relay even though the native raw body has no field
-    # for it; the SSE/Responses translators use it to expose a compact
-    # reasoning summary without leaking the full upstream trace.
+    # ``thinking`` controls presentation independently of generation effort.
+    # Translators follow the console output setting unless the caller opts out.
     "thinking",
     "reasoning_effort",
+    "reasoningEffort",
+    "reasoning_effort_level",
+    "reasoningEffortLevel",
+    "thinking_effort",
+    "reasoning",
+    "output_config",
+    "outputConfig",
+    "include_reasoning",
     # Per-request 1M max opt-in; the console switch is the global default.
     "trae_max_mode",
     "max_mode",
     "stream_options",
     "response_format",
     "service_tier",
+    # OpenAI/new-api prompt-cache affinity fields. Keep these through the
+    # relay so the selected upstream channel and conversation remain stable.
+    "prompt_cache_key",
+    "promptCacheKey",
+    "prompt_cache_options",
+    "promptCacheOptions",
+    "prompt_cache_retention",
+    "promptCacheRetention",
     "user",
     "logprobs",
     "top_logprobs",
@@ -536,6 +574,7 @@ class _UpstreamSessionLease:
     last_client_activity: float
     active_streams: int = 0
     provider_specific: dict[str, Any] = field(default_factory=dict)
+    enterprise_account_id: str = ""
 
 
 _UPSTREAM_SESSION_LEASES: OrderedDict[str, _UpstreamSessionLease] = OrderedDict()
@@ -640,6 +679,8 @@ PUBLIC_PATHS = {
     "/api/max-mode",
     "/api/max-mode/models",
     "/api/auto-route",
+    "/api/reasoning-output",
+    "/api/enterprise",
     "/api/auto-checkin",
     "/api/auto-checkin/run",
     "/api/checkin/status",
@@ -1696,9 +1737,16 @@ def _web_login_html() -> str:
     polling = auth.get_polling_status()
     settings = auth.get_settings()
     auto_route_on = _auto_route_enabled()
+    reasoning_output = auth.get_reasoning_output_settings()
+    enterprise_settings = auth.get_enterprise_settings()
+    enterprise_on = bool(enterprise_settings.get("enabled"))
 
     # Header status chips; the active-user chip is updated in place by JS.
-    upstream_label = AUTO_ROUTE_MODE if auto_route_on else _current_upstream_mode()
+    upstream_label = (
+        "enterprise / raw"
+        if enterprise_on
+        else AUTO_ROUTE_MODE if auto_route_on else _current_upstream_mode()
+    )
     status_html = f"""
     <div class="status-chips">
       {_status_badge()}
@@ -1943,17 +1991,58 @@ def _web_login_html() -> str:
     max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
     auto_route_checked = 'checked' if auto_route_on else ''
     auto_route_state_text = '已开启' if auto_route_on else '已关闭'
-    # While auto routing is enabled the dispatcher ignores the manual endpoint
-    # selection, so the settings form renders those fields read-only instead of
-    # letting the console show a channel that will never be used.
-    endpoint_lock_pill = ' lock' if auto_route_on else ''
-    endpoint_lock_text = '自动路由已接管' if auto_route_on else '手动选择'
-    endpoint_fields_class = 'endpoint-locked' if auto_route_on else ''
+    reasoning_output_on = bool(reasoning_output.get("enabled"))
+    reasoning_output_checked = 'checked' if reasoning_output_on else ''
+    reasoning_output_pill = ' on' if reasoning_output_on else ''
+    reasoning_output_state_text = '完整思考' if reasoning_output_on else '关键节点'
+    enterprise_checked = 'checked' if enterprise_on else ''
+    enterprise_pill = ' on' if enterprise_on else ''
+    enterprise_state_text = '已开启' if enterprise_on else '已关闭'
+    enterprise_account_id = str(enterprise_settings.get("account_id") or "")
+    enterprise_account_options = ['<option value="">选择企业版账号</option>']
+    enterprise_account_found = False
+    for account in accounts:
+        account_id = str(account.get("id") or "")
+        if not account_id:
+            continue
+        selected = account_id == enterprise_account_id
+        enterprise_account_found = enterprise_account_found or selected
+        eligible = (
+            bool(account.get("model_eligible", account.get("is_valid")))
+            and account.get("source") != "cli"
+        )
+        label = str(account.get("label") or account.get("user_id") or account_id)
+        if not eligible:
+            label += "（不可用于模型请求）"
+        enterprise_account_options.append(
+            f'<option value="{html_mod.escape(account_id, quote=True)}"'
+            f'{" selected" if selected else ""}{" disabled" if not eligible else ""}>'
+            f'{html_mod.escape(label)}</option>'
+        )
+    if enterprise_account_id and not enterprise_account_found:
+        enterprise_account_options.append(
+            f'<option value="{html_mod.escape(enterprise_account_id, quote=True)}"'
+            ' selected disabled>已保存账号不可用，请重新选择</option>'
+        )
+    enterprise_account_options_html = "".join(enterprise_account_options)
+    enterprise_state_json = json.dumps(
+        {"enabled": enterprise_on, "account_id": enterprise_account_id},
+        ensure_ascii=True,
+    ).replace("<", "\\u003c")
+    # Enterprise mode and automatic routing own endpoint selection without
+    # overwriting the saved personal-account endpoint.
+    endpoint_locked = enterprise_on or auto_route_on
+    endpoint_lock_pill = ' lock' if endpoint_locked else ''
+    endpoint_lock_text = (
+        '企业账号已接管' if enterprise_on
+        else '自动路由已接管' if auto_route_on else '手动选择'
+    )
+    endpoint_fields_class = 'endpoint-locked' if endpoint_locked else ''
     # Render the disabled state on the first response as well as in
     # ``applyEndpointLock``.  This prevents a brief interactive window before
     # the browser evaluates the settings script after a refresh.
     endpoint_disabled_attr = (
-        ' disabled aria-disabled="true"' if auto_route_on else ' aria-disabled="false"'
+        ' disabled aria-disabled="true"' if endpoint_locked else ' aria-disabled="false"'
     )
     auto_checkin = auth.get_auto_checkin_settings()
     auto_checkin_checked = 'checked' if auto_checkin.get('enabled') else ''
@@ -2226,7 +2315,7 @@ def _web_login_html() -> str:
   </div>
   <div id="endpoint-lock-note" class="lock-note" hidden>
     {ic['lock']}
-    <div><strong>自动路由已开启，手动端点选择已锁定。</strong>当前由自动路由决定实际通道：工具或图片请求走 IDE Agent，纯文字聊天走 Remote，失败保底回落 Remote。如需手动指定端点，请先在下方关闭自动路由。</div>
+    <div id="endpoint-lock-detail">自动路由已开启，手动端点选择已锁定。</div>
   </div>
   <div id="endpoint-fields" class="{endpoint_fields_class}">
   <div class="form-group">
@@ -2243,7 +2332,7 @@ def _web_login_html() -> str:
   </div>
   <div class="form-row">
     <div class="form-group">
-      <label for="settings-model-base">模型网关地址（IDE Agent / Solo）</label>
+      <label for="settings-model-base">模型网关地址（IDE Agent / Solo / 企业版）</label>
     <input id="settings-model-base" class="mono-input" value="{html_mod.escape(settings_model_base)}" placeholder="https://trae-api-cn.mchost.guru"{endpoint_disabled_attr} oninput="markEndpointDirty()">
     </div>
   </div>
@@ -2272,7 +2361,7 @@ def _web_login_html() -> str:
     <span id="auto-route-state" class="state-pill{auto_route_pill}">{auto_route_state_text}</span>
   </div>
   <div class="switch-row">
-    <div class="switch-text"><strong>启用自动路由</strong><span>工具或图片请求走 IDE Agent，纯文字聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
+    <div class="switch-text"><strong>启用自动路由</strong><span>工具或图片请求走 IDE Agent，纯文字走 Remote；企业账号模式优先</span></div>
     <label class="switch" title="启用自动路由">
       <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="markAutoRouteDirty()" aria-label="启用自动路由"><span class="track"></span>
     </label>
@@ -2281,6 +2370,42 @@ def _web_login_html() -> str:
     <button class="btn btn-primary btn-sm" id="auto-route-save-btn" onclick="saveAutoRoute()" disabled>{ic['save']}保存自动路由</button>
   </div>
   <div id="auto-route-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
+<div class="panel-card" id="reasoning-output-panel">
+  <div class="section-head">
+    <div class="section-title">思考链路输出</div>
+    <span id="reasoning-output-state" class="state-pill{reasoning_output_pill}">{reasoning_output_state_text}</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>输出完整思考文本</strong><span>关闭时保留关键节点；单次请求明确关闭思考输出时优先遵循请求</span></div>
+    <label class="switch" title="输出完整思考文本">
+      <input type="checkbox" id="reasoning-output-toggle" {reasoning_output_checked} onchange="markReasoningOutputDirty()" aria-label="输出完整思考文本"><span class="track"></span>
+    </label>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="reasoning-output-save-btn" onclick="saveReasoningOutput()" disabled>{ic['save']}保存</button>
+  </div>
+  <div id="reasoning-output-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
+<div class="panel-card" id="enterprise-panel">
+  <div class="section-head">
+    <div class="section-title">企业版入口</div>
+    <span id="enterprise-state" class="state-pill{enterprise_pill}">{enterprise_state_text}</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>使用企业版账户</strong><span>仅使用所选账号的企业 Raw 通道；关闭后恢复普通路由</span></div>
+    <label class="switch" title="使用企业版账户">
+      <input type="checkbox" id="enterprise-toggle" {enterprise_checked} onchange="markEnterpriseDirty()" aria-label="使用企业版账户"><span class="track"></span>
+    </label>
+  </div>
+  <div class="form-group">
+    <label for="enterprise-account">企业版账号</label>
+    <select id="enterprise-account" onchange="markEnterpriseDirty()">{enterprise_account_options_html}</select>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="enterprise-save-btn" onclick="saveEnterprise()" disabled>{ic['save']}保存</button>
+  </div>
+  <div id="enterprise-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
 <div class="panel-card" id="max-mode-panel">
   <div class="section-head">
@@ -2327,6 +2452,7 @@ def _web_login_html() -> str:
         <option value="work">TraeWork / chat_sessions（Work tier）</option>
         <option value="solo">TraeCode Solo / llm_raw_chat</option>
         <option value="ide">TraeCode IDE / llm_raw_chat</option>
+        <option value="raw">企业版 / llm_raw_chat</option>
       </select>
     </div>
   </div>
@@ -3042,7 +3168,7 @@ function renderOverview(){{
   setOvPill('ov-token',s.token_ok,s.token_ok?'有效':'失效');
   setOv('ov-version','v'+s.version);
   setOv('ov-uptime',fmtUptime(s.uptime_seconds));
-  setOv('ov-upstream',s.auto_route?'自动路由':s.upstream_mode);
+  setOv('ov-upstream',s.enterprise&&s.enterprise.enabled?'企业版 / raw':(s.auto_route?'自动路由':s.upstream_mode));
   setOvPill('ov-polling',s.polling,s.polling?(s.polling_mode==='credit-priority'?'积分优先':'顺序轮询'):'关');
   setOvPill('ov-max',s.max_mode,s.max_mode?'开':'关');
   var ac=s.auto_checkin||{{}};
@@ -3831,6 +3957,8 @@ function endpointPreviewText(state){{
     parts.push('function=solo_work_lite');
     parts.push('raw 诊断 '+(model||'https://trae-api-cn.mchost.guru')+'/api/ide/v2/llm_raw_chat');
     parts.push('Remote 回落 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
+  }}else if(entry&&entry.mode==='raw'){{
+    parts.push('企业模型请求 '+(model||'https://trae-api-cn.mchost.guru')+'/api/ide/v2/llm_raw_chat');
   }}else{{
     parts.push('会话请求 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
     parts.push('模型目录 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/models');
@@ -3936,9 +4064,12 @@ function markAutoRouteDirty(){{
 // switch change, and re-applied after each save so the two panels can never
 // disagree about which channel is actually in use.
 function applyEndpointLock(enabled){{
-  enabled=!!enabled;
+  var enterpriseToggle=document.getElementById('enterprise-toggle');
+  var enterprise=!!(enterpriseToggle&&enterpriseToggle.checked);
+  enabled=!!enabled||enterprise;
   var fields=document.getElementById('endpoint-fields');
   var note=document.getElementById('endpoint-lock-note');
+  var detail=document.getElementById('endpoint-lock-detail');
   var pill=document.getElementById('endpoint-lock-state');
   if(fields) fields.classList.toggle('endpoint-locked',enabled);
   ['settings-endpoint-preset','settings-web','settings-model-base'].forEach(function(id){{
@@ -3946,11 +4077,12 @@ function applyEndpointLock(enabled){{
     if(!el) return;
     el.disabled=enabled;
     el.setAttribute('aria-disabled',enabled?'true':'false');
-    el.title=enabled?'自动路由开启时由路由自动决定端点':'';
+    el.title=enabled?(enterprise?'企业版账号模式使用企业 Raw 端点':'自动路由开启时由路由自动决定端点'):'';
   }});
   if(note) note.hidden=!enabled;
+  if(detail) detail.textContent=enterprise?'企业版账号模式已开启，使用所选企业账号的 Raw 通道。关闭企业模式后恢复已保存的普通端点及自动路由设置。':'自动路由已开启，工具或图片请求走 IDE Agent，纯文字走 Remote。关闭自动路由后可手动选择端点。';
   if(pill){{
-    pill.textContent=enabled?'自动路由已接管':'手动选择';
+    pill.textContent=enterprise?'企业账号已接管':(enabled?'自动路由已接管':'手动选择');
     pill.classList.toggle('lock',enabled);
   }}
   var saveButton=document.getElementById('settings-save-btn');
@@ -3971,6 +4103,74 @@ async function saveAutoRoute(){{
     showMsg('auto-route-msg',d.enabled?'自动路由已开启，上游端点选择已锁定':'自动路由已关闭，可手动选择上游端点',true,3000);
   }} else {{
     showMsg('auto-route-msg',d.error||'保存失败',false);
+  }}
+}}
+let reasoningOutputSaved={str(reasoning_output_on).lower()};
+let reasoningOutputSaving=false;
+function markReasoningOutputDirty(){{
+  var button=document.getElementById('reasoning-output-save-btn');
+  if(button) button.disabled=reasoningOutputSaving;
+  showMsg('reasoning-output-msg','思考输出设置已修改，保存后生效',true,0);
+}}
+async function saveReasoningOutput(){{
+  if(reasoningOutputSaving) return;
+  var toggle=document.getElementById('reasoning-output-toggle');
+  var button=document.getElementById('reasoning-output-save-btn');
+  reasoningOutputSaving=true;
+  toggle.disabled=true;
+  button.disabled=true;
+  try{{
+    var d=await postJSON('/api/reasoning-output',{{enabled:toggle.checked}});
+    if(!d||!d.success) throw new Error(d&&d.error||'保存失败');
+    reasoningOutputSaved=!!d.enabled;
+    setStatePill('reasoning-output-state',d.enabled?'完整思考':'关键节点',d.enabled);
+    showMsg('reasoning-output-msg',d.enabled?'完整思考输出已开启':'已恢复关键节点输出',true,3000);
+  }}catch(error){{
+    showMsg('reasoning-output-msg',String(error||'保存失败'),false);
+  }}finally{{
+    toggle.checked=reasoningOutputSaved;
+    toggle.disabled=false;
+    reasoningOutputSaving=false;
+  }}
+}}
+let enterpriseSaved={enterprise_state_json};
+let enterpriseSaving=false;
+function markEnterpriseDirty(){{
+  var button=document.getElementById('enterprise-save-btn');
+  if(button) button.disabled=enterpriseSaving;
+  var autoRoute=document.getElementById('auto-route-toggle');
+  applyEndpointLock(autoRoute&&autoRoute.checked);
+  showMsg('enterprise-msg','企业账号设置已修改，保存后生效',true,0);
+}}
+async function saveEnterprise(){{
+  if(enterpriseSaving) return;
+  var toggle=document.getElementById('enterprise-toggle');
+  var account=document.getElementById('enterprise-account');
+  var button=document.getElementById('enterprise-save-btn');
+  if(toggle.checked&&!account.value){{
+    showMsg('enterprise-msg','请选择具有企业版权限的账号',false);
+    return;
+  }}
+  enterpriseSaving=true;
+  toggle.disabled=true;
+  account.disabled=true;
+  button.disabled=true;
+  try{{
+    var d=await postJSON('/api/enterprise',{{enabled:toggle.checked,account_id:account.value}});
+    if(!d||!d.success) throw new Error(d&&d.error||'保存失败');
+    enterpriseSaved={{enabled:!!d.enabled,account_id:d.account_id||''}};
+    setStatePill('enterprise-state',d.enabled?'已开启':'已关闭',d.enabled);
+    showMsg('enterprise-msg',d.enabled?'企业版账号已启用':'已恢复普通账号路由',true,3000);
+  }}catch(error){{
+    showMsg('enterprise-msg',String(error||'保存失败'),false);
+  }}finally{{
+    toggle.checked=enterpriseSaved.enabled;
+    account.value=enterpriseSaved.account_id;
+    toggle.disabled=false;
+    account.disabled=false;
+    enterpriseSaving=false;
+    var autoRoute=document.getElementById('auto-route-toggle');
+    applyEndpointLock(autoRoute&&autoRoute.checked);
   }}
 }}
 function markMaxModeDirty(){{
@@ -5003,6 +5203,33 @@ async def _nonstream_with_continuation(
                         merged_usage[key] = int(merged_usage.get(key) or 0) + int(
                             round_usage.get(key) or 0
                         )
+                    # Each continuation is a separate upstream request. Keep
+                    # its cache/read/write and reasoning details in the final
+                    # response instead of only summing the headline totals.
+                    for key in (
+                        "prompt_tokens_details",
+                        "input_tokens_details",
+                        "completion_tokens_details",
+                        "output_tokens_details",
+                    ):
+                        round_details = round_usage.get(key)
+                        if not isinstance(round_details, Mapping):
+                            continue
+                        current_details = merged_usage.get(key)
+                        if not isinstance(current_details, Mapping):
+                            current_details = {}
+                        combined_details = dict(current_details)
+                        for detail_key, detail_value in round_details.items():
+                            if (
+                                isinstance(detail_value, (int, float))
+                                and not isinstance(detail_value, bool)
+                            ):
+                                combined_details[detail_key] = int(
+                                    combined_details.get(detail_key) or 0
+                                ) + int(detail_value)
+                            else:
+                                combined_details[detail_key] = detail_value
+                        merged_usage[key] = combined_details
 
             text_total += round_text
             reasoning_total += round_reasoning
@@ -5200,7 +5427,7 @@ def _tool_translation_options(
         "parallel_tool_calls": options.get("parallel_tool_calls"),
         # Keep reasoning presentation separate from the raw upstream request.
         # ``thinking`` is intentionally consumed only by the translators.
-        "include_reasoning": responses_api.thinking_requested(options),
+        "include_reasoning": responses_api.reasoning_output_requested(options),
         # Protect the continuation turn from an upstream model that echoes an
         # already completed call with a fresh id. A new user message after the
         # result clears this set in cli_client.completed_tool_signatures().
@@ -5299,6 +5526,29 @@ def _request_session_hint(req: Request, body: Mapping[str, Any]) -> str:
         if value and value.strip():
             return value.strip()
     return ""
+
+
+def _prompt_cache_key(options: Mapping[str, Any]) -> str:
+    """Return a bounded prompt-cache affinity key without exposing its value."""
+
+    for key in ("_prompt_cache_key_affinity", "prompt_cache_key", "promptCacheKey"):
+        value = options.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:1024]
+    return ""
+
+
+def _mark_prompt_cache_affinity(
+    options: Mapping[str, Any], *, explicit_session: str = ""
+) -> dict:
+    """Mark key-based affinity only when the caller did not choose a session."""
+
+    bound = dict(options)
+    if not explicit_session and not bound.get("session_id") and not bound.get("sessionId"):
+        cache_key = _prompt_cache_key(bound)
+        if cache_key:
+            bound["_prompt_cache_key_affinity"] = cache_key
+    return bound
 
 
 def _apply_tool_header_hints(req: Request, options: dict) -> dict:
@@ -5521,20 +5771,62 @@ def _bind_chat_session(
     rotate_for_new: bool = True,
 ) -> dict:
     """Attach a stable upstream session and account to one API request."""
+    enterprise = auth.get_enterprise_settings()
+    enterprise_enabled = bool(enterprise.get("enabled"))
+    enterprise_account_id = (
+        str(enterprise.get("account_id") or "").strip() if enterprise_enabled else ""
+    )
+    enterprise_record = (
+        auth.get_account_record(enterprise_account_id) if enterprise_account_id else {}
+    )
+    if enterprise_enabled and (
+        not enterprise_account_id
+        or not auth._record_model_eligible(enterprise_record)
+        or str(
+            enterprise_record.get("source")
+            or enterprise_record.get("auth_source")
+            or ""
+        ).lower() == "cli"
+    ):
+        raise _ModelAccountUnavailable(
+            "The enterprise account is unavailable; select a valid, enabled "
+            "enterprise account in 设置"
+        )
     history_keys = _chat_history_prefix_keys(messages)
     history_key = history_keys[-1] if history_keys else _chat_history_key(messages)
+    if enterprise_account_id:
+        history_keys = [
+            f"enterprise:{enterprise_account_id}:{key}" for key in history_keys
+        ]
+        history_key = f"enterprise:{enterprise_account_id}:{history_key}"
     now = time.monotonic()
     with _CHAT_SESSION_LOCK:
         _prune_chat_sessions(now)
         polling_enabled = bool(auth.get_polling_status().get("enabled"))
         session_id = requested_session_id.strip()
+        if session_id:
+            previous_lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+            if (
+                previous_lease is not None
+                and previous_lease.enterprise_account_id != enterprise_account_id
+            ) or (previous_lease is None and enterprise_enabled):
+                # The same client conversation can be replayed after a mode
+                # switch, but its upstream credential/session must stay isolated.
+                scope = f"enterprise:{enterprise_account_id}" if enterprise_enabled else "regular"
+                session_id = hashlib.sha256(
+                    f"{scope}:{session_id}".encode("utf-8")
+                ).hexdigest()[:32]
         inferred_account_snapshot: tuple[str, dict] | None = None
         if not session_id and _chat_has_prior_turn(messages):
             # Capture the currently selected account once for an inferred
             # replay. This both makes the account comparison atomic and lets a
             # manual account switch take effect without consulting the mutable
             # legacy getters separately.
-            inferred_account_snapshot = auth.get_active_account_snapshot()
+            inferred_account_snapshot = (
+                (enterprise_account_id, enterprise_record)
+                if enterprise_enabled
+                else auth.get_active_account_snapshot()
+            )
             # Prefer the most specific known prefix, then fall back to the full
             # replay for idempotent retries of the same request.
             for prefix_key in reversed(history_keys):
@@ -5542,6 +5834,11 @@ def _bind_chat_session(
                 if found is not None:
                     candidate_id = found[0]
                     candidate_lease = _UPSTREAM_SESSION_LEASES.get(candidate_id)
+                    if (
+                        candidate_lease is not None
+                        and candidate_lease.enterprise_account_id != enterprise_account_id
+                    ):
+                        continue
                     # A client that switched accounts and then replayed a full
                     # OpenAI history without a relay session id must start a
                     # fresh upstream conversation. Explicit session ids (used
@@ -5572,7 +5869,7 @@ def _bind_chat_session(
         slot_reservation_account = ""
         slot_reservation_id = ""
         if lease is None:
-            upstream_mode = _current_upstream_mode()
+            upstream_mode = "raw" if enterprise_enabled else _current_upstream_mode()
             slot_mode = upstream_mode not in ("", "cli")
             selected_snapshot: tuple[str, dict] | None = None
             account_rows = auth.get_accounts_raw() if slot_mode else []
@@ -5581,7 +5878,14 @@ def _bind_chat_session(
                 # lets credit-priority polling fill every entitlement slot on
                 # the richest account before moving to the next account.
                 selected_snapshot = auth.reserve_model_account(
-                    require_polling=polling_enabled
+                    require_polling=polling_enabled,
+                    **(
+                        {
+                            "preferred_account_id": enterprise_account_id,
+                            "activate": False,
+                        }
+                        if enterprise_enabled else {}
+                    ),
                 )
                 if selected_snapshot[0]:
                     slot_reserved = True
@@ -5589,7 +5893,12 @@ def _bind_chat_session(
                     slot_reservation_id = str(
                         selected_snapshot[1].get("_slot_reservation_id") or ""
                     )
-            if rotate_for_new and selected_snapshot is None and upstream_mode in (
+                elif enterprise_enabled:
+                    raise _ModelAccountUnavailable(
+                        "The selected enterprise account has no available "
+                        "concurrent model slot"
+                    )
+            if not enterprise_enabled and rotate_for_new and selected_snapshot is None and upstream_mode in (
                 "raw",
                 "direct",
                 "web",
@@ -5611,6 +5920,8 @@ def _bind_chat_session(
             # account id to a different account's token.
             if selected_snapshot is not None and selected_snapshot[0]:
                 account_id, record = selected_snapshot
+            elif enterprise_enabled:
+                account_id, record = enterprise_account_id, enterprise_record
             elif inferred_account_snapshot is not None and not polling_enabled:
                 account_id, record = inferred_account_snapshot
             else:
@@ -5618,7 +5929,9 @@ def _bind_chat_session(
             # A disabled account may remain selected for check-in management.
             # New sessions can select another enabled account; continuations
             # keep their credential and are refused while it is disabled.
-            if not account_id or not auth._record_model_enabled(record):
+            if not enterprise_enabled and (
+                not account_id or not auth._record_model_enabled(record)
+            ):
                 account_id, record = auth.get_model_account_snapshot()
             # Keep compatibility with integrations/tests that replace the
             # legacy getters while still preferring the atomic snapshot in
@@ -5668,6 +5981,7 @@ def _bind_chat_session(
                     or record.get("providerSpecificData")
                     or {}
                 ),
+                enterprise_account_id=enterprise_account_id,
             )
             _UPSTREAM_SESSION_LEASES[session_id] = lease
         else:
@@ -5675,20 +5989,26 @@ def _bind_chat_session(
             # turn. Do not rotate accounts, call refresh, or mutate global auth.
             _ensure_model_account_enabled(lease.account_id, lease.auth_token)
             if (
-                _current_upstream_mode() not in ("", "cli")
+                (enterprise_enabled or _current_upstream_mode() not in ("", "cli"))
                 and auth.get_accounts_raw()
             ):
                 # A logical session can have multiple simultaneous turns.  Each
                 # turn therefore reserves its own account slot while retaining
                 # the session's credential affinity.
                 selected_snapshot = auth.reserve_model_account(
-                    preferred_account_id=lease.account_id
+                    preferred_account_id=lease.account_id,
+                    **({"activate": False} if enterprise_enabled else {}),
                 )
                 if selected_snapshot[0]:
                     slot_reserved = True
                     slot_reservation_account = selected_snapshot[0]
                     slot_reservation_id = str(
                         selected_snapshot[1].get("_slot_reservation_id") or ""
+                    )
+                elif enterprise_enabled:
+                    raise _ModelAccountUnavailable(
+                        "The selected enterprise account has no available "
+                        "concurrent model slot"
                     )
             lease.last_client_activity = now
             _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
@@ -5697,6 +6017,15 @@ def _bind_chat_session(
         _CHAT_HISTORY_SESSIONS.move_to_end(history_key)
 
     bound = dict(options)
+    bound["_enterprise_mode"] = enterprise_enabled
+    if enterprise_enabled:
+        bound["_enterprise_account_id"] = enterprise_account_id
+        # Enterprise chat requests must carry the tenant's model
+        # application configuration.  Without config_source=2 the gateway
+        # resolves the personal app config and returns
+        # "failed to get app config: record not found".
+        bound["config_source"] = 2
+        bound.setdefault("_traecode_raw_chat_function", "chat_v3")
     bound["session_id"] = session_id
     if slot_reserved:
         bound["_account_slot_reserved"] = True
@@ -5706,13 +6035,13 @@ def _bind_chat_session(
         bound["_account_slot_reservation_id"] = slot_reservation_id
     if lease.account_id:
         bound["_account_id"] = lease.account_id
-        if _current_upstream_mode() in ("raw", "direct", "auto"):
+        if enterprise_enabled or _current_upstream_mode() in ("raw", "direct", "auto"):
             bound["_auth_user_id"] = lease.billing_id or lease.account_id
     if lease.billing_id:
         bound["_billing_id"] = lease.billing_id
     if lease.auth_token:
         bound["_auth_token"] = lease.auth_token
-    if _current_upstream_mode() != "cli":
+    if enterprise_enabled or _current_upstream_mode() != "cli":
         # Keep account metadata pinned with the credential. The global auth
         # state may switch before the remote request has built its headers.
         # An explicit empty mapping prevents fallback to another account's
@@ -6000,18 +6329,7 @@ def _usage_values(usage: Any) -> dict[str, Any]:
     if total is None:
         total = prompt + completion
     credits = _nested_credit_value(usage)
-    cached = _first_number(
-        usage,
-        "cached_tokens",
-        "cache_read_tokens",
-        "cacheReadTokens",
-        "cachedTokens",
-        "cache_read_input_tokens",
-    )
-    for details_key in ("prompt_tokens_details", "input_tokens_details"):
-        details = usage.get(details_key)
-        if cached is None and isinstance(details, Mapping):
-            cached = _first_number(details, "cached_tokens", "cache_read_tokens")
+    cached = usage_details(usage).get("cached_tokens", 0)
     return {
         "prompt_tokens": int(prompt),
         "completion_tokens": int(completion),
@@ -6165,7 +6483,10 @@ def _requested_reasoning_effort(options: Optional[Mapping[str, Any]]) -> str | N
     """Extract the caller-facing thinking strength without normalizing labels."""
 
     options = options or {}
-    for key in ("reasoning_effort", "reasoningEffort", "thinking_effort"):
+    for key in (
+        "reasoning_effort", "reasoningEffort", "thinking_effort",
+        "reasoning_effort_level", "reasoningEffortLevel",
+    ):
         value = options.get(key)
         if value not in (None, ""):
             return str(value).strip() or None
@@ -6174,6 +6495,10 @@ def _requested_reasoning_effort(options: Optional[Mapping[str, Any]]) -> str | N
         value = reasoning.get("effort") or reasoning.get("level")
         if value not in (None, ""):
             return str(value).strip() or None
+    for key in ("output_config", "outputConfig"):
+        output = options.get(key)
+        if isinstance(output, Mapping) and output.get("effort") not in (None, ""):
+            return str(output["effort"]).strip() or None
     thinking = options.get("thinking")
     if isinstance(thinking, Mapping):
         value = (
@@ -7717,10 +8042,12 @@ def _remote_fallback_allowed_for_request(
     is intentionally kept intact.  When that attachment alone leaves the
     flattened query above Remote's hard input cap, retrying the same payload
     would only replace a useful IDE error with a deterministic 413 (and may
-    replay it across polling accounts).  Text, tool requests, and images that
-    fit after compaction retain the normal fallback behavior.
+    replay it across polling accounts). Caller tools require a native tool
+    transport and cannot downgrade to the Remote agent's own tool runtime.
     """
 
+    if _tool_protocol_requested(options, messages):
+        return False
     if not images.messages_have_images(messages):
         return True
     try:
@@ -8661,6 +8988,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             message_id,
             options=remote_options,
         )
+        event_iter = enrich_remote_events(event_iter, token, message_id)
         if stream:
             async def gen():
                 nonlocal work_fallback_used
@@ -8873,6 +9201,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 retry_message_id,
                                 options=retry_options,
                             )
+                            retry_event_iter = enrich_remote_events(
+                                retry_event_iter, retry_token, retry_message_id
+                            )
                             async for chunk in translate_web_events(
                                 retry_event_iter,
                                 model,
@@ -8988,6 +9319,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 message_id,
                 options=remote_options,
             )
+            fallback_events = enrich_remote_events(fallback_events, token, message_id)
             result = await collect_nonstream_web(
                 fallback_events,
                 model,
@@ -9016,7 +9348,7 @@ def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
         # field, so the diagnostic must name the actual protocol.
         return "当前 TraeCode IDE/SOLO raw 配置未声明可写思考档位"
     if mode == "raw":
-        return "raw 端点需要企业 PAT"
+        return "企业 Raw 请求链路未完整验证，请检查企业账号及 App 配置"
     return "该模型未声明 reasoning_effort_config"
 
 
@@ -9155,6 +9487,9 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                         FORWARD_USAGE,
                         fail_on_empty=True,
                         upstream_metadata=upstream_metadata,
+                        usage_enricher=legacy_usage_enricher(
+                            current_wrapper, upstream_metadata
+                        ),
                         **translation_options,
                     ):
                         if (
@@ -9214,6 +9549,9 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                 model,
                 fail_on_empty=True,
                 upstream_metadata=upstream_metadata,
+                usage_enricher=legacy_usage_enricher(
+                    response_wrapper, upstream_metadata
+                ),
                 **translation_options,
             )
             _bind_usage_turn_from_metadata(upstream_metadata)
@@ -11231,6 +11569,28 @@ AUTO_ROUTE_MODE = "auto-route"
 AUTO_ROUTE_TOOL_ENDPOINT = "ide"
 AUTO_ROUTE_CHAT_ENDPOINT = "remote"
 
+# These native transports preserve the caller-owned tool protocol end to end.
+# Raw/direct use the legacy text bridge, so only an explicit diagnostic
+# override may keep tool requests there. Remote/Web Agent routes can consume
+# their own tools and cannot substitute for returning the caller's tool call.
+_CALLER_TOOL_SAFE_MODES = {
+    "ide",
+    "solo",
+    "cli",
+    "traework-native",
+    "native",
+    "traework",
+}
+_CALLER_TOOL_UNSAFE_MODES = {
+    "auto",
+    "remote",
+    "9router",
+    "trae-remote",
+    "web",
+    "work",
+    "work-agent",
+}
+
 
 def _auto_route_enabled() -> bool:
     try:
@@ -11455,10 +11815,18 @@ def _task_catalog_model_names(
         for agent_type in agent_types:
             if not isinstance(cache, Mapping):
                 continue
-            prefix = f"{account_key}:{agent_type}:"
-            for cache_key, cached in cache.items():
-                if str(cache_key) != prefix[:-1] and not str(cache_key).startswith(prefix):
-                    continue
+            function = str(
+                options.get("raw_chat_function")
+                or options.get("_trae_raw_chat_function") or agent_type
+            ).strip()
+            provider = options.get("provider_specific", options.get("providerSpecificData"))
+            exact_key = trae_client._model_catalog_cache_key(
+                str(options.get("_auth_token") or ""), account_key,
+                agent_type=agent_type, raw_chat_function=function,
+                provider_specific=provider if isinstance(provider, Mapping) else None,
+            )
+            for cache_key in (exact_key,):
+                cached = cache.get(cache_key)
                 if (
                     isinstance(cached, tuple)
                     and len(cached) > 1
@@ -11795,28 +12163,75 @@ def _apply_auto_route(
 ) -> dict:
     """Resolve the endpoint for one request when auto routing applies.
 
-    Auto routing runs when the caller asked for ``auto-route`` explicitly, or
-    when the console switch is on and the request carries no explicit
-    endpoint. Tool and image requests go to IDE Agent, where media travels
-    natively instead of inflating Remote's flattened query. Plain text chat
-    goes to Remote; the existing dispatcher owns endpoint fallback.
+    Caller tools constrain the transport even when optional auto routing is
+    disabled. Other requests follow the console switch or explicit endpoint.
     """
 
     options = dict(options or {})
     explicit = str(options.get("_upstream_mode") or "").strip().lower()
-    if explicit and explicit != AUTO_ROUTE_MODE:
-        return options
     if options.get("_traework_custom_model"):
         return options
+    enterprise = auth.get_enterprise_settings()
+    if enterprise.get("enabled"):
+        # Enterprise mode is an explicit operator choice. Pin the request to
+        # the restored Raw entrance and prevent a personal Remote/IDE
+        # fallback from silently receiving the enterprise conversation.
+        options["_upstream_mode"] = "raw"
+        options["_disable_upstream_fallback"] = True
+        options["_enterprise_mode"] = True
+        options["_auto_route"] = "enterprise"
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                auto_route=True,
+                auto_route_reason="enterprise",
+                requested_mode="raw",
+                requested_endpoint="/api/ide/v2/llm_raw_chat",
+            )
+        return options
+    uses_tools = _tool_protocol_requested(options, messages)
+
+    # Tool calls are a protocol constraint, rather than an optional balancing
+    # hint.  An explicitly selected Web/Remote/Work endpoint cannot preserve
+    # caller-owned tools, so correct it to the native IDE endpoint.  Explicit
+    # IDE/CLI/native modes remain available, as do explicit raw/direct
+    # diagnostic overrides. ``auto`` is not a concrete native transport.
+    if uses_tools and explicit in _CALLER_TOOL_UNSAFE_MODES:
+        options["_upstream_mode"] = AUTO_ROUTE_TOOL_ENDPOINT
+        options["_auto_route"] = "tools"
+        options["_auto_route_from"] = explicit
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                auto_route=True,
+                auto_route_reason="tools",
+                auto_route_from=explicit,
+            )
+        logger.info(
+            "tool protocol rerouted id=%s from=%s endpoint=%s",
+            str(options.get("_relay_request_id") or ""),
+            explicit,
+            AUTO_ROUTE_TOOL_ENDPOINT,
+        )
+        return options
+
+    # An explicit safe endpoint (including raw/direct) wins.  For requests
+    # without a per-request endpoint, preserve a globally selected native
+    # transport (IDE/CLI/native), but correct a Raw/Remote/Web/Work preset to
+    # IDE even when the console switch is off.
+    if explicit and explicit != AUTO_ROUTE_MODE:
+        return options
     if not explicit:
-        if not _auto_route_enabled():
+        current_mode = str(_current_upstream_mode() or "").strip().lower()
+        if uses_tools and current_mode in _CALLER_TOOL_SAFE_MODES and not _auto_route_enabled():
+            return options
+        if not uses_tools and not _auto_route_enabled():
             return options
         # Local CLI / native helper modes are host-specific; leave them alone.
         if _current_upstream_mode() in (
             "cli", "traework-native", "native", "traework"
-        ):
+        ) and not uses_tools:
             return options
-    uses_tools = _tool_protocol_requested(options, messages)
     has_images = images.messages_have_images(messages)
     endpoint = (
         AUTO_ROUTE_TOOL_ENDPOINT
@@ -11866,7 +12281,7 @@ def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
 
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
     requested_model = model
-    options = dict(options or {})
+    options = normalize_reasoning_options(options or {})
     options.setdefault("_requested_model", str(requested_model or "").strip())
     options = _apply_auto_route(messages, options)
     # Resolve the concrete endpoint before selecting an automatic task model.
@@ -12020,14 +12435,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             "Unsupported TRAEWORK_CUSTOM_UPSTREAM_MODE: " + custom_mode
         )
 
-    # External tools always execute on the API caller.  Web/IDE agent routes
-    # may execute their own tools on the relay host, so they are never valid
-    # fallbacks for a request that advertises caller-owned tools.
+    # Caller tools must remain on a transport that returns those calls.
     tool_protocol_requested = _tool_protocol_requested(options, messages)
-    # Caller-owned tools are now supported on all upstream paths.
-    # Remote/web routes inject tool definitions as a system prompt via
-    # `_messages_with_client_runtime` and filter tool calls from the
-    # upstream text response with `_filter_tool_calls`.
     if tool_protocol_requested:
         logger.info(
             "dispatch tool protocol id=%s mode=%s model=%s",
@@ -12038,12 +12447,17 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
 
     # Raw v2 is the default for every model. Operators can opt specific models
     # (or ``*``) into the account-bound remote executor for diagnostics.
-    if not options.get("_disable_upstream_fallback") and _requires_remote_model(model) and active_mode in (
-        "raw",
-        "direct",
-        "auto",
-        "ide",
-        "solo",
+    if (
+        not options.get("_disable_upstream_fallback")
+        and not _tool_protocol_requested(options, messages)
+        and _requires_remote_model(model)
+        and active_mode in (
+            "raw",
+            "direct",
+            "auto",
+            "ide",
+            "solo",
+        )
     ):
         logger.info(
             "dispatch remote-only model id=%s model=%s account=%s",
@@ -12098,12 +12512,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     else:
         modes = ["raw"]
 
-    # Native IDE/Work/Raw paths are useful diagnostics, but the current CN
-    # gateway does not expose all three paths for every account.  Keep the
-    # selected path first and automatically try the verified Remote transport
-    # for both plain and caller-owned-tool requests.  The old implementation
-    # excluded tool requests here, which turned a transient native rejection
-    # into a guaranteed 502 for Codex clients.
+    # Text requests may fall back to Remote. Caller tools stay on native/CLI
+    # paths because Remote may consume its own tools instead of returning them.
     fallback_enabled = not bool(options.get("_disable_upstream_fallback"))
     fallback_modes = {
         "raw",
@@ -12130,6 +12540,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         modes.append("remote")
     elif (
         fallback_enabled
+        and not tool_protocol_requested
         and active_mode in fallback_modes
         and "remote" not in modes
         and images.messages_have_images(messages)
@@ -12298,6 +12709,12 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 mode_options["_traecode_raw_chat_function"] = (
                     "solo_agent" if mode == "solo" else "chat_v3"
                 )
+                # Caller-owned tools must use TraeCode's native tool-aware
+                # message/body contract.  Keep an explicit caller override
+                # intact, while making the normal IDE/Solo dispatch carry the
+                # tools through instead of degrading to the legacy serializer.
+                if tool_protocol_requested:
+                    mode_options.setdefault("_traecode_native_tools", True)
                 if isinstance(trace, dict):
                     trace["product"] = "trae"
             result = await _run_ide_with_retry(
@@ -12464,7 +12881,10 @@ async def _handle_traework_custom(
                 yield chunk
 
         translated = traework_compat.translate_openai_stream_to_traework(
-            openai_source(), model=descriptor.model, request_id=request_id
+            openai_source(),
+            model=descriptor.model,
+            request_id=request_id,
+            reasoning_mode=traework_compat.reasoning_output_mode(options),
         )
         session_id = str(options.get("session_id") or descriptor.session_id)
         return StreamingResponse(
@@ -12487,7 +12907,9 @@ async def _handle_traework_custom(
     payload = _response_json_payload(response)
     return JSONResponse(
         traework_compat.openai_completion_to_traework(
-            payload, model=descriptor.model
+            payload,
+            model=descriptor.model,
+            reasoning_mode=traework_compat.reasoning_output_mode(options),
         )
     )
 
@@ -12560,6 +12982,9 @@ async def handle_chat(req: Request):
     requested_session_id = _request_session_hint(req, body)
     if requested_session_id and not options.get("session_id") and not options.get("sessionId"):
         options["session_id"] = requested_session_id
+    options = _mark_prompt_cache_affinity(
+        options, explicit_session=requested_session_id
+    )
 
     option_error = _validate_chat_options(options)
     if option_error is not None:
@@ -12646,6 +13071,12 @@ async def handle_responses(req: Request):
     # Responses response ids change on every turn.  The context retains the
     # first raw session id so multi-tool continuations stay in one upstream
     # Trae conversation even when the caller sends only function_call_output.
+    if (
+        not body.get("previous_response_id")
+        and not options.get("session_id")
+        and not options.get("sessionId")
+    ):
+        options = _mark_prompt_cache_affinity(options)
     if not options.get("session_id") and not options.get("sessionId"):
         options["session_id"] = context.upstream_session_id or context.response_id
     options = _bind_chat_session(
@@ -12743,6 +13174,9 @@ async def handle_anthropic_messages(req: Request):
     messages = cli_client.sanitize_assistant_history_messages(messages)
     model = str(body.get("model") or "auto")
     options = _apply_tool_header_hints(req, options)
+    options = _mark_prompt_cache_affinity(
+        options, explicit_session=_request_session_hint(req, body)
+    )
     option_error = _validate_chat_options(options)
     if option_error is not None:
         return option_error
@@ -13299,6 +13733,8 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
                 "uptime_seconds": round(time.time() - _PROCESS_STARTED_AT),
                 "upstream_mode": _current_upstream_mode(),
                 "auto_route": _auto_route_enabled(),
+                "reasoning_output": auth.get_reasoning_output_settings(),
+                "enterprise": auth.get_enterprise_settings(),
                 "polling": bool(polling.get("enabled")),
                 "polling_mode": polling.get("mode"),
                 "max_mode": bool(auth.get_max_mode_settings().get("enabled")),
@@ -13392,6 +13828,8 @@ async def status():
         "web_base": auth.get_settings().get("web_base_url") or WEB_BASE,
         "upstream_mode": _current_upstream_mode(),
         "auto_route": _auto_route_enabled(),
+        "reasoning_output": auth.get_reasoning_output_settings(),
+        "enterprise": auth.get_enterprise_settings(),
         "build_revision": os.environ.get("RELAY_BUILD_REVISION", "local"),
         "traework_native": {
             "enabled": traework_native_bridge.NativeBridgeConfig.from_env().enabled,
@@ -13712,6 +14150,10 @@ async def api_model_test(req: Request):
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
+                "cached_tokens": usage_details(usage).get("cached_tokens", 0),
+                "cache_write_tokens": usage_details(usage).get(
+                    "cache_write_tokens", 0
+                ),
                 "reasoning_tokens": (
                     usage["completion_tokens_details"].get("reasoning_tokens")
                     if isinstance(usage.get("completion_tokens_details"), Mapping)
@@ -15193,7 +15635,14 @@ async def api_settings(request: Request):
         WEB_BASE = web_base_url
         os.environ["TRAE_WEB_BASE_URL"] = web_base_url
     if model_base_url is not None:
-        if upstream_mode in {"work", "work-agent"}:
+        if upstream_mode in {"raw", "direct"}:
+            if model_base_url:
+                os.environ["TRAE_RAW_BASE_URL"] = model_base_url
+                os.environ["TRAE_ENTERPRISE_BASE_URL"] = model_base_url
+            else:
+                os.environ.pop("TRAE_RAW_BASE_URL", None)
+                os.environ.pop("TRAE_ENTERPRISE_BASE_URL", None)
+        elif upstream_mode in {"work", "work-agent"}:
             if model_base_url:
                 os.environ["TRAE_RAW_BASE_URL"] = model_base_url
                 os.environ["TRAE_WORK_BASE_URL"] = model_base_url
@@ -15223,6 +15672,59 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+@app.get("/api/reasoning-output")
+async def api_get_reasoning_output():
+    return JSONResponse(
+        {"success": True, **auth.get_reasoning_output_settings()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/reasoning-output")
+async def api_set_reasoning_output(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return JSONResponse(
+            {"success": False, "error": "enabled must be a boolean"}, status_code=400
+        )
+    settings = auth.set_reasoning_output_settings(body["enabled"])
+    return JSONResponse({"success": True, **settings}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/enterprise")
+async def api_get_enterprise():
+    return JSONResponse(
+        {"success": True, **auth.get_enterprise_settings()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/enterprise")
+async def api_set_enterprise(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return JSONResponse(
+            {"success": False, "error": "enabled must be a boolean"}, status_code=400
+        )
+    if "account_id" in body and not isinstance(body["account_id"], str):
+        return JSONResponse(
+            {"success": False, "error": "account_id must be a string"}, status_code=400
+        )
+    try:
+        settings = auth.set_enterprise_settings(
+            body["enabled"], body.get("account_id")
+        )
+    except ValueError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    return JSONResponse({"success": True, **settings}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/auto-route")
