@@ -1076,8 +1076,10 @@ def build_traecode_chat_body(
             choice = options.get("tool_choice")
             if choice is not None:
                 body["tool_choice"] = copy.deepcopy(choice)
-            if options.get("parallel_tool_calls") is not None:
-                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+            # Trae 原生工具流在并行调用时会交错多个调用的参数片段，调用方
+            # 会收到缺少开头或结尾的 JSON。默认强制串行，只有客户端显式
+            # 要求 true 时才放开。
+            body["parallel_tool_calls"] = bool(options.get("parallel_tool_calls") is True)
     return body
 
 
