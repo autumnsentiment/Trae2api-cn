@@ -13770,7 +13770,16 @@ async def auth_middleware(request: Request, call_next):
     if request.url.path == "/api/model-test":
         # Keep the dashboard probe usable on loopback/RFC1918 management
         # networks without exposing a billable model endpoint to the public.
+        # Reverse proxies forward the real client IP, so also honor an
+        # operator-managed allowlist for the console probe.
         client_host = str(getattr(request.client, "host", "") or "").strip()
+        trusted_probe_hosts = {
+            item.strip()
+            for item in os.environ.get("RELAY_PROBE_TRUSTED_IPS", "").split(",")
+            if item.strip()
+        }
+        if client_host and client_host in trusted_probe_hosts:
+            return await call_next(request)
         try:
             client_ip = ipaddress.ip_address(client_host)
         except ValueError:
