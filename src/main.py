@@ -12191,6 +12191,36 @@ def _apply_auto_route(
         return options
     uses_tools = _tool_protocol_requested(options, messages)
 
+    # Keep caller tools on the Remote Agent transport when the operator opts
+    # in. The Remote transport already injects the caller tool catalog as a
+    # system prompt and returns tool calls, and it is the only transport that
+    # can combine tools with the 1M Max profile.
+    tools_remote = os.environ.get("TRAE_TOOLS_REMOTE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    experiment_tools_remote = os.environ.get(
+        "TRAE_EXPERIMENT_TOOLS_REMOTE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if uses_tools and (tools_remote or experiment_tools_remote) and not explicit:
+        options["_upstream_mode"] = "remote"
+        options["_auto_route"] = "tools-remote"
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                auto_route=True,
+                auto_route_reason="tools-remote",
+                requested_mode="remote",
+            )
+        logger.info(
+            "tools-remote route id=%s model_request=%s",
+            str(options.get("_relay_request_id") or ""),
+            str(options.get("_auto_route") or ""),
+        )
+        return options
+
     # Tool calls are a protocol constraint, rather than an optional balancing
     # hint.  An explicitly selected Web/Remote/Work endpoint cannot preserve
     # caller-owned tools, so correct it to the native IDE endpoint.  Explicit
@@ -12326,6 +12356,15 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     except _ModelAccountUnavailable as exc:
         return _openai_error(503, str(exc), "model_account_unavailable")
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
+    if (
+        options.get("_auto_route") == "tools-remote"
+        and _tool_protocol_requested(options, messages)
+    ):
+        # A later routing pass may try to put caller tools back on the native
+        # IDE transport. The operator explicitly opted these turns into the
+        # Remote Agent so the 1M Max profile stays available.
+        active_mode = "remote"
+        options["_upstream_mode"] = "remote"
     fallback_from = str(options.get("_upstream_fallback_from") or "").strip().lower()
     if isinstance(trace, dict):
         if fallback_from:
