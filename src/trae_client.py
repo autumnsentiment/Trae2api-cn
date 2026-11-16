@@ -2975,6 +2975,14 @@ def _convert_ide_native_messages(
             continue
         if "content" in message:
             item["content"] = _ide_native_content(content)
+        if role == "assistant":
+            has_text = item.get("content") not in (None, "", [])
+            if not has_text and not item.get("tool_calls") and not item.get("function_call"):
+                # Trae rejects an assistant turn with neither text nor a tool
+                # call as ``4001 param invalid``; reasoning-only turns arrive
+                # here as ``content: null`` after the renderer blocks are
+                # stripped, so drop them from the replayed history.
+                continue
         result.append(item)
     return result
 
@@ -3044,6 +3052,92 @@ def _apply_legacy_reasoning_effort(
     return result
 
 
+def _json_size(value: Any) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    )
+
+
+def _compact_ide_tool_schemas(
+    tools: list[dict[str, Any]], max_chars: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Shrink native tool schemas while keeping every tool callable.
+
+    Trae's legacy ``llm_utils_chat`` rejects oversized payloads with a generic
+    ``4001 param invalid``.  Descriptions dominate large MCP tool catalogs, so
+    drop documentation first; only drop whole tools when the schemas still do
+    not fit.
+    """
+
+    before = _json_size(tools)
+    if before <= max_chars:
+        return tools, before
+
+    def strip_docs(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {
+                key: strip_docs(value)
+                for key, value in node.items()
+                if key
+                not in {
+                    "description",
+                    "title",
+                    "examples",
+                    "$schema",
+                    "$comment",
+                    "default",
+                }
+            }
+        if isinstance(node, list):
+            return [strip_docs(item) for item in node]
+        return node
+
+    stripped = []
+    for tool in tools:
+        item = copy.deepcopy(tool)
+        function = item.get("function")
+        if isinstance(function, Mapping):
+            raw_schema = function.get("parameters")
+            schema = raw_schema
+            if isinstance(raw_schema, str):
+                try:
+                    schema = json.loads(raw_schema)
+                except Exception:
+                    schema = {}
+            if isinstance(schema, Mapping):
+                schema = strip_docs(dict(schema))
+                function["parameters"] = json.dumps(
+                    schema, ensure_ascii=False, separators=(",", ":")
+                )
+        stripped.append(strip_docs(item))
+    after = _json_size(stripped)
+    if after <= max_chars:
+        logger.info(
+            "legacy ide tool schemas compacted tools=%d chars=%d->%d",
+            len(tools),
+            before,
+            after,
+        )
+        return stripped, after
+
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for tool in stripped:
+        size = _json_size(tool)
+        if kept and used + size > max_chars:
+            continue
+        kept.append(tool)
+        used += size
+    logger.info(
+        "legacy ide tool schemas truncated tools=%d->%d chars=%d->%d",
+        len(tools),
+        len(kept),
+        before,
+        used,
+    )
+    return kept, used
+
+
 def build_llm_chat_body(
     messages: list[dict],
     model: str,
@@ -3058,7 +3152,38 @@ def build_llm_chat_body(
     model through ``config_name``.  It also keeps the transport streaming;
     non-stream callers aggregate the SSE response in the relay.
     """
-    options = options or {}
+    options = dict(options or {})
+    tools = options["tools"] if "tools" in options else options.get("_inherited_tools")
+    choice = _ide_native_tool_choice(options.get("tool_choice"))
+    native_tools: list[dict[str, Any]] = []
+    tool_chars = 0
+    if isinstance(tools, list) and tools and str(choice or "").lower() != "none":
+        native_tools = raw_client._native_tool_definitions(tools) or []
+        if native_tools:
+            try:
+                tool_budget = int(
+                    options.get("trae_ide_max_tool_schema_chars")
+                    or os.environ.get("TRAE_IDE_MAX_TOOL_SCHEMA_CHARS", "48000")
+                )
+            except (TypeError, ValueError):
+                tool_budget = 48000
+            native_tools, tool_chars = _compact_ide_tool_schemas(
+                native_tools, max(8000, tool_budget)
+            )
+    if tool_chars:
+        # Keep the native tool schemas and the replayed history inside the
+        # upstream prompt budget; oversized payloads return ``4001``.
+        options.setdefault(
+            "trae_raw_max_history_chars", max(40000, 180000 - tool_chars)
+        )
+    messages, omitted_history = raw_client._compact_raw_history(messages, options)
+    if omitted_history:
+        logger.info(
+            "legacy ide history compacted input_messages=%d omitted=%d tools_chars=%d",
+            len(messages) + omitted_history,
+            omitted_history,
+            tool_chars,
+        )
     converted = _convert_ide_native_messages(messages, options)
     session_id = (
         str(options.get("_legacy_usage_turn_id") or "").strip()
@@ -3078,16 +3203,19 @@ def build_llm_chat_body(
     max_tokens = clamp_max_completion_tokens(max_tokens, model)
     if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
         body["max_tokens"] = int(max_tokens)
-    tools = options["tools"] if "tools" in options else options.get("_inherited_tools")
-    choice = _ide_native_tool_choice(options.get("tool_choice"))
-    if isinstance(tools, list) and tools and str(choice or "").lower() != "none":
-        native_tools = raw_client._native_tool_definitions(tools)
-        if native_tools:
-            body["tools"] = native_tools
-            if choice is not None:
-                body["tool_choice"] = choice
-            if options.get("parallel_tool_calls") is not None:
-                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+    if native_tools:
+        body["tools"] = native_tools
+        if choice is not None:
+            body["tool_choice"] = choice
+        if options.get("parallel_tool_calls") is not None:
+            body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+    dump_path = str(os.environ.get("TRAE_IDE_DUMP_BODY", "") or "").strip()
+    if dump_path:
+        try:
+            with open(dump_path, "w", encoding="utf-8") as handle:
+                json.dump(body, handle, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("legacy ide body dump failed: %s", exc)
     return _apply_legacy_reasoning_effort(body, options)
 
 

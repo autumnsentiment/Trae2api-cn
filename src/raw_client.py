@@ -1076,8 +1076,10 @@ def build_traecode_chat_body(
             choice = options.get("tool_choice")
             if choice is not None:
                 body["tool_choice"] = copy.deepcopy(choice)
-            if options.get("parallel_tool_calls") is not None:
-                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+            # Trae 原生工具流在并行调用时会交错多个调用的参数片段，调用方
+            # 会收到缺少开头或结尾的 JSON。默认强制串行，只有客户端显式
+            # 要求 true 时才放开。
+            body["parallel_tool_calls"] = bool(options.get("parallel_tool_calls") is True)
     return body
 
 
@@ -2611,15 +2613,24 @@ def _compact_raw_history(
             used += size
         candidates = list(reversed(kept_reversed))
 
-    # Do not begin a retained continuation with an orphaned tool result when
-    # the matching assistant call is the immediately preceding message.
+    # Do not begin a retained continuation with an orphaned tool result.
+    # Parallel calls can put several tool messages after one assistant turn,
+    # so walk back to the assistant message that owns the whole group instead
+    # of only checking the immediately preceding message.
     if candidates and _message_has_tool_results(valid[candidates[0]]):
         first_position = non_system_indexes.index(candidates[0])
-        if first_position:
-            previous = non_system_indexes[first_position - 1]
-            previous_message = valid[previous]
-            if _message_has_assistant_tool_calls(previous_message):
-                candidates.insert(0, previous)
+        anchor_pos = first_position
+        while anchor_pos > 0:
+            previous = valid[non_system_indexes[anchor_pos - 1]]
+            if _message_has_assistant_tool_calls(previous):
+                anchor_pos -= 1
+                break
+            if _message_has_tool_results(previous):
+                anchor_pos -= 1
+                continue
+            break
+        if anchor_pos != first_position:
+            candidates = non_system_indexes[anchor_pos:first_position] + candidates
 
     keep = set(system_indexes) | set(candidates)
     compacted = [message for index, message in enumerate(valid) if index in keep]
@@ -2836,6 +2847,36 @@ def _serialize_tool_call_context(tool_calls: Any) -> str:
     return "\n".join(lines) if count else ""
 
 
+def _normalize_parameter_schema(parameters: Any) -> dict[str, Any]:
+    """Return a JSON Schema object for a tool's ``parameters`` field.
+
+    Many MCP/plugin catalogs publish a bare property map such as
+    ``{"target": {"type": "string"}}`` instead of a full JSON Schema.  Trae
+    rejects those with ``parameters must be a JSON Schema of type object``
+    (4027) or a generic 4001, so wrap them before sending.
+    """
+
+    schema = parameters
+    if isinstance(schema, str):
+        try:
+            schema = json.loads(schema)
+        except Exception:
+            schema = {}
+    if not isinstance(schema, Mapping):
+        schema = {}
+    schema = dict(schema)
+    if schema.get("type") != "object":
+        if "type" not in schema and "properties" not in schema:
+            schema = {"type": "object", "properties": schema}
+        else:
+            schema["type"] = "object"
+            if not isinstance(schema.get("properties"), Mapping):
+                schema["properties"] = {}
+    elif not isinstance(schema.get("properties"), Mapping):
+        schema["properties"] = {}
+    return schema
+
+
 def _native_tool_definition(tool: Any) -> Optional[dict[str, Any]]:
     """Convert an OpenAI tool definition to Trae's raw native shape.
 
@@ -2864,14 +2905,13 @@ def _native_tool_definition(tool: Any) -> Optional[dict[str, Any]]:
     parameters = function.get("parameters")
     if parameters is None:
         parameters = function.get("input_schema") or function.get("inputSchema") or {}
-    if not isinstance(parameters, str):
-        parameters = json.dumps(
-            parameters,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
-    function["parameters"] = parameters
+    parameters = _normalize_parameter_schema(parameters)
+    function["parameters"] = json.dumps(
+        parameters,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
     function.pop("input_schema", None)
     function.pop("inputSchema", None)
     result["type"] = str(result.get("type") or "function")

@@ -13,7 +13,7 @@ set "PORT=8765"
 set "HELPER=%~dp0web_login.py"
 set "TMP_HELPER=%HELPER%.download-%RANDOM%"
 
-if exist "%HELPER%\" (
+if exist "%HELPER%\*" (
   echo web_login.py 目标不能是文件夹，请更换授权助手目录后重试。
   pause
   exit /b 1

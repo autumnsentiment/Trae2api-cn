@@ -8460,7 +8460,7 @@ async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = 
 
 async def _await_session_cleanup(task: asyncio.Task) -> None:
     """Finish owned cleanup before propagating repeated client cancellation."""
-    pending_exception = sys.exception()
+    pending_exception = sys.exc_info()[1]
     cancellation = (
         pending_exception if isinstance(pending_exception, asyncio.CancelledError) else None
     )
@@ -12191,6 +12191,36 @@ def _apply_auto_route(
         return options
     uses_tools = _tool_protocol_requested(options, messages)
 
+    # Keep caller tools on the Remote Agent transport when the operator opts
+    # in. The Remote transport already injects the caller tool catalog as a
+    # system prompt and returns tool calls, and it is the only transport that
+    # can combine tools with the 1M Max profile.
+    tools_remote = os.environ.get("TRAE_TOOLS_REMOTE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    experiment_tools_remote = os.environ.get(
+        "TRAE_EXPERIMENT_TOOLS_REMOTE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if uses_tools and (tools_remote or experiment_tools_remote) and not explicit:
+        options["_upstream_mode"] = "remote"
+        options["_auto_route"] = "tools-remote"
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                auto_route=True,
+                auto_route_reason="tools-remote",
+                requested_mode="remote",
+            )
+        logger.info(
+            "tools-remote route id=%s model_request=%s",
+            str(options.get("_relay_request_id") or ""),
+            str(options.get("_auto_route") or ""),
+        )
+        return options
+
     # Tool calls are a protocol constraint, rather than an optional balancing
     # hint.  An explicitly selected Web/Remote/Work endpoint cannot preserve
     # caller-owned tools, so correct it to the native IDE endpoint.  Explicit
@@ -12326,6 +12356,15 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     except _ModelAccountUnavailable as exc:
         return _openai_error(503, str(exc), "model_account_unavailable")
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
+    if (
+        options.get("_auto_route") == "tools-remote"
+        and _tool_protocol_requested(options, messages)
+    ):
+        # A later routing pass may try to put caller tools back on the native
+        # IDE transport. The operator explicitly opted these turns into the
+        # Remote Agent so the 1M Max profile stays available.
+        active_mode = "remote"
+        options["_upstream_mode"] = "remote"
     fallback_from = str(options.get("_upstream_fallback_from") or "").strip().lower()
     if isinstance(trace, dict):
         if fallback_from:
@@ -13770,7 +13809,16 @@ async def auth_middleware(request: Request, call_next):
     if request.url.path == "/api/model-test":
         # Keep the dashboard probe usable on loopback/RFC1918 management
         # networks without exposing a billable model endpoint to the public.
+        # Reverse proxies forward the real client IP, so also honor an
+        # operator-managed allowlist for the console probe.
         client_host = str(getattr(request.client, "host", "") or "").strip()
+        trusted_probe_hosts = {
+            item.strip()
+            for item in os.environ.get("RELAY_PROBE_TRUSTED_IPS", "").split(",")
+            if item.strip()
+        }
+        if client_host and client_host in trusted_probe_hosts:
+            return await call_next(request)
         try:
             client_ip = ipaddress.ip_address(client_host)
         except ValueError:
@@ -15833,6 +15881,28 @@ async def api_max_mode_models():
         for name, cfg in configs.items()
         if isinstance(cfg, Mapping) and descriptor_supports_max_mode(cfg)
     ]
+    try:
+        overrides = json.loads(os.environ.get("TRAE_MAX_MODE_OVERRIDE", "") or "{}")
+    except Exception:
+        overrides = {}
+    if isinstance(overrides, Mapping):
+        known = {item["name"] for item in models}
+        for name, cfg in overrides.items():
+            if not isinstance(cfg, Mapping) or name in known:
+                continue
+            try:
+                max_context = int(cfg.get("context_window_size") or 0)
+            except (TypeError, ValueError):
+                max_context = 0
+            if max_context <= 0:
+                continue
+            models.append(
+                {
+                    "name": str(name),
+                    "display_name": str(cfg.get("display_name") or name),
+                    "max_context": max_context,
+                }
+            )
     if not configs:
         return JSONResponse(
             {"success": False, "error": "上游模型列表获取失败"}, status_code=502
