@@ -1428,13 +1428,152 @@ class ToolCallAccumulator:
             self._indexes[key] = idx
 
 
-def _repair_json_arguments(arguments: str) -> str:
-    """Best-effort repair of a truncated native tool arguments string.
+_CONTROL_ESCAPES = {
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_STRING_TERMINATORS = set(",}]:")
+_SIMPLE_ESCAPES = set('"\\/bfnrt')
 
-    Trae's native stream occasionally drops the final fragment(s) of a tool
-    call, leaving arguments like ``{"command": "git status"`` without the
-    closing ``}`` (or with a dangling quote). Never raise on malformed input;
-    return the original string when we cannot repair confidently.
+
+def _sanitize_json_strings(text: str) -> str:
+    """Make string bodies parseable in one pass.
+
+    Models write PowerShell commands verbatim, so the native argument text can
+    contain raw control characters, single-backslash Windows paths (invalid
+    JSON escapes), and unescaped inner quotes. Escapes that json.loads would
+    silently reinterpret (``\\n`` in ``C:\\new``) are left alone.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if (
+                nxt == "u"
+                and i + 6 <= n
+                and all(c in _HEX_DIGITS for c in text[i + 2 : i + 6])
+            ):
+                out.append(text[i : i + 6])
+                i += 6
+                continue
+            if nxt and nxt in _SIMPLE_ESCAPES:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in _STRING_TERMINATORS:
+                in_str = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        if ch < " ":
+            out.append(_CONTROL_ESCAPES.get(ch) or "\\u%04x" % ord(ch))
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_json_span(text: str) -> str:
+    """Trim prose/fences around the outermost JSON value, if any."""
+    starts = [pos for pos in (text.find("{"), text.find("[")) if pos >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    if end <= start:
+        return text[start:]
+    return text[start : end + 1]
+
+
+def _drop_trailing_commas(text: str) -> str:
+    """Remove commas that directly precede a closing brace/bracket."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _log_unrepairable_arguments(name: str, arguments: str) -> None:
+    """Append the raw offending arguments to data/ when opt-in diagnosis is on."""
+    if os.environ.get("TRAE_DUMP_UNREPAIRABLE_TOOL_ARGS", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data",
+            "tool-args-drops.log",
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "%s\t%s\t%r\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), name, arguments[:4000])
+            )
+    except Exception:  # pragma: no cover - diagnostics must never fail a call
+        pass
+
+
+def _repair_json_arguments(arguments: str) -> str:
+    """Best-effort repair of a malformed native tool arguments string.
+
+    Trae's native stream drops fragments, doubles fragments, and passes tool
+    arguments through verbatim (so PowerShell quotes, paths, and newlines are
+    not JSON-escaped). Never raise on malformed input; return the original
+    string when we cannot repair confidently.
     """
     if not arguments:
         return arguments
@@ -1443,7 +1582,13 @@ def _repair_json_arguments(arguments: str) -> str:
         return arguments
     except Exception:
         pass
-    repaired = arguments.rstrip()
+    repaired = _extract_json_span(arguments.strip())
+    repaired = _drop_trailing_commas(_sanitize_json_strings(repaired))
+    try:
+        json.loads(repaired)
+        return repaired
+    except Exception:
+        pass
     stack = []
     in_str = False
     esc = False
@@ -1476,8 +1621,12 @@ def _repair_json_arguments(arguments: str) -> str:
 
 
 def _split_json_stream(text: str):
-    """从 {..}{..} 拼接串里切出一个个合法 JSON 对象（raw_decode）。"""
+    """从 {..}{..} 拼接串里切出一个个合法 JSON 对象（raw_decode）。
+
+    末尾残片（重复推流或截断）先按单对象修复再尝试拼接；修不好才丢弃。
+    """
     out = []
+    decoder = json.JSONDecoder()
     i = 0
     n = len(text)
     while i < n:
@@ -1486,11 +1635,19 @@ def _split_json_stream(text: str):
         if i >= n:
             break
         if text[i] not in "{[":
-            return None
+            return out or None
         try:
-            obj, end = json.JSONDecoder().raw_decode(text, i)
+            obj, end = decoder.raw_decode(text, i)
         except Exception:
-            return None
+            tail = text[i:]
+            repaired = _repair_json_arguments(tail)
+            if repaired == tail:
+                return out or None
+            try:
+                out.append(json.loads(repaired))
+            except Exception:
+                return out or None
+            return out
         out.append(obj)
         i = end
     return out
@@ -1515,6 +1672,19 @@ def _ensure_native_tool_arguments(
             continue
         except (TypeError, ValueError):
             pass
+        try:
+            parsed = json.loads(arguments, strict=False)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            function["arguments"] = json.dumps(parsed, ensure_ascii=False)
+            repaired_any = True
+            logger.warning(
+                "[repair] call=%s re-encoded raw control character(s)",
+                function.get("name") or "?",
+            )
+            kept.append(call)
+            continue
         parts = _split_json_stream(arguments)
         if parts is not None:
             if len(parts) > 1:
@@ -1569,11 +1739,14 @@ def _ensure_native_tool_arguments(
             function.get("name") or "?",
             str(arguments)[:200],
         )
+        _log_unrepairable_arguments(
+            function.get("name") or "?", str(arguments)
+        )
         repaired_any = True
         if strict:
             raise InvalidNativeToolArguments(
                 "Trae upstream returned invalid JSON arguments for tool "
-                f"{function.get('name') or '?'}",
+                f"{function.get('name') or '?'} args={str(arguments)[:300]!r}",
                 retryable=False,
                 usage=usage,
                 observed_model_event=True,
