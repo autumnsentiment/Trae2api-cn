@@ -8460,7 +8460,7 @@ async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = 
 
 async def _await_session_cleanup(task: asyncio.Task) -> None:
     """Finish owned cleanup before propagating repeated client cancellation."""
-    pending_exception = sys.exception()
+    pending_exception = sys.exc_info()[1]
     cancellation = (
         pending_exception if isinstance(pending_exception, asyncio.CancelledError) else None
     )
