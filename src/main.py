@@ -15833,6 +15833,28 @@ async def api_max_mode_models():
         for name, cfg in configs.items()
         if isinstance(cfg, Mapping) and descriptor_supports_max_mode(cfg)
     ]
+    try:
+        overrides = json.loads(os.environ.get("TRAE_MAX_MODE_OVERRIDE", "") or "{}")
+    except Exception:
+        overrides = {}
+    if isinstance(overrides, Mapping):
+        known = {item["name"] for item in models}
+        for name, cfg in overrides.items():
+            if not isinstance(cfg, Mapping) or name in known:
+                continue
+            try:
+                max_context = int(cfg.get("context_window_size") or 0)
+            except (TypeError, ValueError):
+                max_context = 0
+            if max_context <= 0:
+                continue
+            models.append(
+                {
+                    "name": str(name),
+                    "display_name": str(cfg.get("display_name") or name),
+                    "max_context": max_context,
+                }
+            )
     if not configs:
         return JSONResponse(
             {"success": False, "error": "上游模型列表获取失败"}, status_code=502
