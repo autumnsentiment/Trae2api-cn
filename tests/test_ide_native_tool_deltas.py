@@ -632,6 +632,34 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
             json.loads(repaired[0]["function"]["arguments"]), {"path": "a.txt"}
         )
 
+    async def test_head_fragment_without_name_is_reattached_to_the_named_call(self):
+        frames = [
+            [_call('{"path":"src/l')],
+            [_call('vjiang/x.py"}', name="read_file", call_id="call_native")],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"path": "src/lvjiang/x.py"},
+                )
+
+    async def test_named_head_with_lost_tail_is_completed_from_the_fragment(self):
+        frames = [
+            [_call('{"path":"src/l', name="read_file", call_id="call_native")],
+            [_call('vjiang/x.py"}')],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"path": "src/lvjiang/x.py"},
+                )
+
     async def test_verbatim_command_arguments_are_repaired_on_both_wires(self):
         tools = [
             *TOOLS,

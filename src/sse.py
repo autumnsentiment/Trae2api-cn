@@ -933,6 +933,7 @@ class ToolCallAccumulator:
         self._source_indexes: dict[str, int] = {}
         self._indexes: dict[str, int] = {}
         self._max_calls = max_calls
+        self._orphans: list[dict] = []
 
     @property
     def has_calls(self) -> bool:
@@ -1147,6 +1148,8 @@ class ToolCallAccumulator:
                 and call.get("_explicit_id") is True
                 and not function.get("name")
                 and str(function.get("arguments") or "").strip()
+                and str(function.get("arguments") or "").lstrip()[:1]
+                not in ("{", "[")
             ):
                 raise InvalidNativeToolArguments(
                     "Trae upstream returned tool arguments for an unknown call "
@@ -1200,11 +1203,20 @@ class ToolCallAccumulator:
                 call["id"] = call_id
             if not function.get("name"):
                 existing_function = existing.get("function") if existing else None
-                if not isinstance(existing_function, dict) or not existing_function.get(
-                    "name"
-                ):
+                existing_name = (
+                    existing_function.get("name")
+                    if isinstance(existing_function, dict)
+                    else ""
+                )
+                if existing_name:
+                    function["name"] = existing_name
+                else:
+                    # Upstream occasionally streams the head of a native
+                    # argument object before (or without) the frame that
+                    # names the call. Hold it so finalize can reattach it
+                    # instead of leaving the call with a tail-only string.
+                    self._remember_orphan(call)
                     continue
-                function["name"] = existing_function["name"]
             if existing is not None:
                 closed_state = self._closed_state(existing, call)
                 if closed_state == "replay":
@@ -1405,6 +1417,7 @@ class ToolCallAccumulator:
         """Replace the aggregated calls (used after repair/split)."""
         self._calls = {}
         self._order = []
+        self._orphans = []
         self._correlation_keys = {}
         self._public_keys = {}
         self._source_indexes = {}
@@ -1426,6 +1439,75 @@ class ToolCallAccumulator:
                 source_index = idx
             self._source_indexes[key] = source_index
             self._indexes[key] = idx
+
+    def _remember_orphan(self, call: dict) -> None:
+        function = call.get("function") or {}
+        arguments = str(function.get("arguments") or "")
+        if not arguments.strip():
+            return
+        if len(self._orphans) >= 8:
+            self._orphans.pop(0)
+        self._orphans.append(
+            {
+                "arguments": arguments,
+                "index": call.get("_source_index", call.get("index")),
+                "_event_session_id": call.get("_event_session_id", ""),
+                "_plan_item_id": call.get("_plan_item_id", ""),
+                "_correlation_key": call.get("_correlation_key", ""),
+                "_upstream_tool_call_id": call.get("_upstream_tool_call_id", ""),
+            }
+        )
+        logger.warning("[orphan] held nameless native fragment args=%r", arguments[:120])
+
+    @staticmethod
+    def _orphan_matches(call: dict, source_index: Any, orphan: dict) -> bool:
+        for field in ("_event_session_id", "_plan_item_id", "_correlation_key"):
+            left = str(call.get(field) or "")
+            right = str(orphan.get(field) or "")
+            if left and right and left != right:
+                return False
+        orphan_index = orphan.get("index")
+        if isinstance(source_index, int) and isinstance(orphan_index, int):
+            return source_index == orphan_index
+        return True
+
+    def recover_orphan_arguments(self) -> None:
+        """Reattach fragments whose sibling frame never carried the call name."""
+        if not self._orphans:
+            return
+        for key in list(self._order):
+            call = self._calls[key]
+            function = call.get("function") or {}
+            if not function.get("name"):
+                continue
+            arguments = str(function.get("arguments") or "")
+            if not arguments:
+                continue
+            try:
+                json.loads(arguments)
+                continue
+            except Exception:
+                pass
+            source_index = self._source_indexes.get(key)
+            for orphan in list(self._orphans):
+                if not self._orphan_matches(call, source_index, orphan):
+                    continue
+                orphan_args = str(orphan.get("arguments") or "")
+                for candidate in (orphan_args + arguments, arguments + orphan_args):
+                    try:
+                        json.loads(candidate)
+                    except Exception:
+                        continue
+                    function["arguments"] = candidate
+                    self._orphans.remove(orphan)
+                    logger.warning(
+                        "[orphan-merge] call=%s recovered lost fragment",
+                        function.get("name") or "?",
+                    )
+                    break
+                else:
+                    continue
+                break
 
 
 _CONTROL_ESCAPES = {
@@ -1932,8 +2014,12 @@ def _filter_tool_calls(
             continue
         name = _call_function_name(call)
         if names is not None and name not in names:
-            continue
-        if selected and name != selected:
+            # Native argument fragments can reach the filter before the frame
+            # that names the call; the accumulator holds and reattaches them.
+            fragment = str((call.get("function") or {}).get("arguments") or "")
+            if name or fragment.lstrip()[:1] not in ("{", "["):
+                continue
+        if selected and name and name != selected:
             continue
         call_id = str(call.get("id") or "")
         identity = str(call.get("_correlation_key") or call_id)
@@ -2520,6 +2606,7 @@ async def translate_ide_stream(
             usage=final_usage,
             observed_model_event=observed_model_event,
         )
+    tool_calls.recover_orphan_arguments()
     tool_calls.set_calls(
         _ensure_native_tool_arguments(
             tool_calls.calls(), final_usage, strict=True
@@ -3840,6 +3927,7 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
+    tool_calls.recover_orphan_arguments()
     tool_calls.set_calls(
         _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
     )
