@@ -959,6 +959,7 @@ class ToolCallAccumulator:
         self._source_indexes: dict[str, int] = {}
         self._indexes: dict[str, int] = {}
         self._max_calls = max_calls
+        self._orphans: list[dict] = []
 
     @property
     def has_calls(self) -> bool:
@@ -1173,6 +1174,8 @@ class ToolCallAccumulator:
                 and call.get("_explicit_id") is True
                 and not function.get("name")
                 and str(function.get("arguments") or "").strip()
+                and str(function.get("arguments") or "").lstrip()[:1]
+                not in ("{", "[")
             ):
                 raise InvalidNativeToolArguments(
                     "Trae upstream returned tool arguments for an unknown call "
@@ -1226,11 +1229,20 @@ class ToolCallAccumulator:
                 call["id"] = call_id
             if not function.get("name"):
                 existing_function = existing.get("function") if existing else None
-                if not isinstance(existing_function, dict) or not existing_function.get(
-                    "name"
-                ):
+                existing_name = (
+                    existing_function.get("name")
+                    if isinstance(existing_function, dict)
+                    else ""
+                )
+                if existing_name:
+                    function["name"] = existing_name
+                else:
+                    # Upstream occasionally streams the head of a native
+                    # argument object before (or without) the frame that
+                    # names the call. Hold it so finalize can reattach it
+                    # instead of leaving the call with a tail-only string.
+                    self._remember_orphan(call)
                     continue
-                function["name"] = existing_function["name"]
             if existing is not None:
                 closed_state = self._closed_state(existing, call)
                 if closed_state == "replay":
@@ -1490,6 +1502,7 @@ class ToolCallAccumulator:
         """Replace the aggregated calls (used after repair/split)."""
         self._calls = {}
         self._order = []
+        self._orphans = []
         self._correlation_keys = {}
         self._public_keys = {}
         self._source_indexes = {}
@@ -1512,14 +1525,222 @@ class ToolCallAccumulator:
             self._source_indexes[key] = source_index
             self._indexes[key] = idx
 
+    def _remember_orphan(self, call: dict) -> None:
+        function = call.get("function") or {}
+        arguments = str(function.get("arguments") or "")
+        if not arguments.strip():
+            return
+        if len(self._orphans) >= 8:
+            self._orphans.pop(0)
+        self._orphans.append(
+            {
+                "arguments": arguments,
+                "index": call.get("_source_index", call.get("index")),
+                "_event_session_id": call.get("_event_session_id", ""),
+                "_plan_item_id": call.get("_plan_item_id", ""),
+                "_correlation_key": call.get("_correlation_key", ""),
+                "_upstream_tool_call_id": call.get("_upstream_tool_call_id", ""),
+            }
+        )
+        logger.warning("[orphan] held nameless native fragment args=%r", arguments[:120])
+
+    @staticmethod
+    def _orphan_matches(call: dict, source_index: Any, orphan: dict) -> bool:
+        for field in ("_event_session_id", "_plan_item_id", "_correlation_key"):
+            left = str(call.get(field) or "")
+            right = str(orphan.get(field) or "")
+            if left and right and left != right:
+                return False
+        orphan_index = orphan.get("index")
+        if isinstance(source_index, int) and isinstance(orphan_index, int):
+            return source_index == orphan_index
+        return True
+
+    def recover_orphan_arguments(self) -> None:
+        """Reattach fragments whose sibling frame never carried the call name."""
+        if not self._orphans:
+            return
+        for key in list(self._order):
+            call = self._calls[key]
+            function = call.get("function") or {}
+            if not function.get("name"):
+                continue
+            arguments = str(function.get("arguments") or "")
+            if not arguments:
+                continue
+            try:
+                json.loads(arguments)
+                continue
+            except Exception:
+                pass
+            source_index = self._source_indexes.get(key)
+            for orphan in list(self._orphans):
+                if not self._orphan_matches(call, source_index, orphan):
+                    continue
+                orphan_args = str(orphan.get("arguments") or "")
+                for candidate in (orphan_args + arguments, arguments + orphan_args):
+                    try:
+                        json.loads(candidate)
+                    except Exception:
+                        continue
+                    function["arguments"] = candidate
+                    self._orphans.remove(orphan)
+                    logger.warning(
+                        "[orphan-merge] call=%s recovered lost fragment",
+                        function.get("name") or "?",
+                    )
+                    break
+                else:
+                    continue
+                break
+
+
+_CONTROL_ESCAPES = {
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_STRING_TERMINATORS = set(",}]:")
+_SIMPLE_ESCAPES = set('"\\/bfnrt')
+
+
+def _sanitize_json_strings(text: str) -> str:
+    """Make string bodies parseable in one pass.
+
+    Models write PowerShell commands verbatim, so the native argument text can
+    contain raw control characters, single-backslash Windows paths (invalid
+    JSON escapes), and unescaped inner quotes. Escapes that json.loads would
+    silently reinterpret (``\\n`` in ``C:\\new``) are left alone.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if (
+                nxt == "u"
+                and i + 6 <= n
+                and all(c in _HEX_DIGITS for c in text[i + 2 : i + 6])
+            ):
+                out.append(text[i : i + 6])
+                i += 6
+                continue
+            if nxt and nxt in _SIMPLE_ESCAPES:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in _STRING_TERMINATORS:
+                in_str = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        if ch < " ":
+            out.append(_CONTROL_ESCAPES.get(ch) or "\\u%04x" % ord(ch))
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_json_span(text: str) -> str:
+    """Trim prose/fences around the outermost JSON value, if any."""
+    starts = [pos for pos in (text.find("{"), text.find("[")) if pos >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    if end <= start:
+        return text[start:]
+    return text[start : end + 1]
+
+
+def _drop_trailing_commas(text: str) -> str:
+    """Remove commas that directly precede a closing brace/bracket."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _log_unrepairable_arguments(name: str, arguments: str) -> None:
+    """Append the raw offending arguments to data/ when opt-in diagnosis is on."""
+    if os.environ.get("TRAE_DUMP_UNREPAIRABLE_TOOL_ARGS", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data",
+            "tool-args-drops.log",
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "%s\t%s\t%r\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), name, arguments[:4000])
+            )
+    except Exception:  # pragma: no cover - diagnostics must never fail a call
+        pass
+
 
 def _repair_json_arguments(arguments: str) -> str:
-    """Best-effort repair of a truncated native tool arguments string.
+    """Best-effort repair of a malformed native tool arguments string.
 
-    Trae's native stream occasionally drops the final fragment(s) of a tool
-    call, leaving arguments like ``{"command": "git status"`` without the
-    closing ``}`` (or with a dangling quote). Never raise on malformed input;
-    return the original string when we cannot repair confidently.
+    Trae's native stream drops fragments, doubles fragments, and passes tool
+    arguments through verbatim (so PowerShell quotes, paths, and newlines are
+    not JSON-escaped). Never raise on malformed input; return the original
+    string when we cannot repair confidently.
     """
     if not arguments:
         return arguments
@@ -1528,7 +1749,13 @@ def _repair_json_arguments(arguments: str) -> str:
         return arguments
     except Exception:
         pass
-    repaired = arguments.rstrip()
+    repaired = _extract_json_span(arguments.strip())
+    repaired = _drop_trailing_commas(_sanitize_json_strings(repaired))
+    try:
+        json.loads(repaired)
+        return repaired
+    except Exception:
+        pass
     stack = []
     in_str = False
     esc = False
@@ -1561,8 +1788,12 @@ def _repair_json_arguments(arguments: str) -> str:
 
 
 def _split_json_stream(text: str):
-    """从 {..}{..} 拼接串里切出一个个合法 JSON 对象（raw_decode）。"""
+    """从 {..}{..} 拼接串里切出一个个合法 JSON 对象（raw_decode）。
+
+    末尾残片（重复推流或截断）先按单对象修复再尝试拼接；修不好才丢弃。
+    """
     out = []
+    decoder = json.JSONDecoder()
     i = 0
     n = len(text)
     while i < n:
@@ -1571,11 +1802,19 @@ def _split_json_stream(text: str):
         if i >= n:
             break
         if text[i] not in "{[":
-            return None
+            return out or None
         try:
-            obj, end = json.JSONDecoder().raw_decode(text, i)
+            obj, end = decoder.raw_decode(text, i)
         except Exception:
-            return None
+            tail = text[i:]
+            repaired = _repair_json_arguments(tail)
+            if repaired == tail:
+                return out or None
+            try:
+                out.append(json.loads(repaired))
+            except Exception:
+                return out or None
+            return out
         out.append(obj)
         i = end
     return out
@@ -1600,6 +1839,19 @@ def _ensure_native_tool_arguments(
             continue
         except (TypeError, ValueError):
             pass
+        try:
+            parsed = json.loads(arguments, strict=False)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            function["arguments"] = json.dumps(parsed, ensure_ascii=False)
+            repaired_any = True
+            logger.warning(
+                "[repair] call=%s re-encoded raw control character(s)",
+                function.get("name") or "?",
+            )
+            kept.append(call)
+            continue
         parts = _split_json_stream(arguments)
         if parts is not None:
             if len(parts) > 1:
@@ -1654,11 +1906,14 @@ def _ensure_native_tool_arguments(
             function.get("name") or "?",
             str(arguments)[:200],
         )
+        _log_unrepairable_arguments(
+            function.get("name") or "?", str(arguments)
+        )
         repaired_any = True
         if strict:
             raise InvalidNativeToolArguments(
                 "Trae upstream returned invalid JSON arguments for tool "
-                f"{function.get('name') or '?'}",
+                f"{function.get('name') or '?'} args={str(arguments)[:300]!r}",
                 retryable=False,
                 usage=usage,
                 observed_model_event=True,
@@ -1844,8 +2099,12 @@ def _filter_tool_calls(
             continue
         name = _call_function_name(call)
         if names is not None and name not in names:
-            continue
-        if selected and name != selected:
+            # Native argument fragments can reach the filter before the frame
+            # that names the call; the accumulator holds and reattaches them.
+            fragment = str((call.get("function") or {}).get("arguments") or "")
+            if name or fragment.lstrip()[:1] not in ("{", "["):
+                continue
+        if selected and name and name != selected:
             continue
         call_id = str(call.get("id") or "")
         identity = str(call.get("_correlation_key") or call_id)
@@ -2434,6 +2693,7 @@ async def translate_ide_stream(
             usage=final_usage,
             observed_model_event=observed_model_event,
         )
+    tool_calls.recover_orphan_arguments()
     tool_calls.set_calls(
         _ensure_native_tool_arguments(
             tool_calls.calls(), final_usage, strict=True
@@ -3754,6 +4014,7 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
+    tool_calls.recover_orphan_arguments()
     tool_calls.set_calls(
         _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
     )

@@ -61,10 +61,13 @@ def _response(frames: list[list[dict]], *, terminal: bool = True) -> LineRespons
 
 
 class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
-    async def _calls(self, frames: list[list[dict]], stream: bool) -> list[dict]:
+    async def _calls(
+        self, frames: list[list[dict]], stream: bool, allowed_tools: list[dict] | None = None
+    ) -> list[dict]:
+        allowed_tools = allowed_tools or TOOLS
         if not stream:
             result = await sse.collect_nonstream_ide(
-                _response(frames), "m", allowed_tools=TOOLS, fail_on_empty=True
+                _response(frames), "m", allowed_tools=allowed_tools, fail_on_empty=True
             )
             self.assertEqual(result["choices"][0]["finish_reason"], "tool_calls")
             return result["choices"][0]["message"]["tool_calls"]
@@ -72,7 +75,7 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
         finishes: list[str] = []
         done_count = 0
         async for chunk in sse.translate_ide_stream(
-            _response(frames), "m", allowed_tools=TOOLS, fail_on_empty=True
+            _response(frames), "m", allowed_tools=allowed_tools, fail_on_empty=True
         ):
             if chunk == "data: [DONE]\n\n":
                 done_count += 1
@@ -543,6 +546,153 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
     def test_orphan_native_closing_fragment_is_dropped(self):
         call = cli_client.normalize_tool_call(_call("}", name="read_file"))
         self.assertEqual(sse._ensure_native_tool_arguments([call]), [])
+
+    def test_raw_control_characters_in_native_arguments_are_reencoded(self):
+        call = cli_client.normalize_tool_call(
+            _call(
+                '{"command":"Get-ChildItem\nsrc","description":"x"}',
+                name="pwsh",
+                call_id="call_control",
+            )
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            json.loads(repaired[0]["function"]["arguments"]),
+            {"command": "Get-ChildItem\nsrc", "description": "x"},
+        )
+
+    def test_windows_path_single_backslash_stays_literal(self):
+        call = cli_client.normalize_tool_call(
+            _call(
+                r'{"command":"Get-ChildItem src\lvjiang\core","description":"x"}',
+                name="pwsh",
+                call_id="call_path",
+            )
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            json.loads(repaired[0]["function"]["arguments"])["command"],
+            r"Get-ChildItem src\lvjiang\core",
+        )
+
+    def test_unescaped_inner_quotes_in_native_arguments_are_escaped(self):
+        call = cli_client.normalize_tool_call(
+            _call(
+                '{"command":"Select-String -Pattern "batch" src","description":"x"}',
+                name="pwsh",
+                call_id="call_quotes",
+            )
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            json.loads(repaired[0]["function"]["arguments"])["command"],
+            'Select-String -Pattern "batch" src',
+        )
+
+    def test_truncated_duplicate_object_is_salvaged_and_deduplicated(self):
+        call = cli_client.normalize_tool_call(
+            _call('{"path":"a.txt"}{"path":"a.txt"', name="read_file")
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            [json.loads(item["function"]["arguments"]) for item in repaired],
+            [{"path": "a.txt"}],
+        )
+
+    def test_distinct_truncated_second_object_is_salvaged(self):
+        call = cli_client.normalize_tool_call(
+            _call('{"path":"a.txt"}{"path":"b.txt"', name="read_file")
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            [json.loads(item["function"]["arguments"]) for item in repaired],
+            [{"path": "a.txt"}, {"path": "b.txt"}],
+        )
+
+    def test_trailing_comma_in_native_arguments_is_dropped(self):
+        call = cli_client.normalize_tool_call(
+            _call('{"command":"a","description":"x",}', name="pwsh", call_id="call_comma")
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            json.loads(repaired[0]["function"]["arguments"]),
+            {"command": "a", "description": "x"},
+        )
+
+    def test_prose_and_code_fence_around_native_arguments_are_stripped(self):
+        call = cli_client.normalize_tool_call(
+            _call(
+                'Here is the call:\n```json\n{"path":"a.txt"}\n```',
+                name="read_file",
+                call_id="call_prose",
+            )
+        )
+        repaired = sse._ensure_native_tool_arguments([call], strict=True)
+        self.assertEqual(
+            json.loads(repaired[0]["function"]["arguments"]), {"path": "a.txt"}
+        )
+
+    async def test_head_fragment_without_name_is_reattached_to_the_named_call(self):
+        frames = [
+            [_call('{"path":"src/l')],
+            [_call('vjiang/x.py"}', name="read_file", call_id="call_native")],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"path": "src/lvjiang/x.py"},
+                )
+
+    async def test_named_head_with_lost_tail_is_completed_from_the_fragment(self):
+        frames = [
+            [_call('{"path":"src/l', name="read_file", call_id="call_native")],
+            [_call('vjiang/x.py"}')],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"path": "src/lvjiang/x.py"},
+                )
+
+    async def test_verbatim_command_arguments_are_repaired_on_both_wires(self):
+        tools = [
+            *TOOLS,
+            {
+                "type": "function",
+                "function": {
+                    "name": "pwsh",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ]
+        arguments = (
+            '{"command":"Get-ChildItem src\\lvjiang\n'
+            'Select-String -Pattern "batch" src","description":"x"}'
+        )
+        frames = [[_call(arguments, name="pwsh", call_id="call_pwsh")]]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream, tools)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {
+                        "command": 'Get-ChildItem src\\lvjiang\nSelect-String -Pattern "batch" src',
+                        "description": "x",
+                    },
+                )
 
     async def test_zero_argument_native_call_still_returns_a_json_object(self):
         frames = [[_call("{}", name="read_file", call_id="call_native")]]
