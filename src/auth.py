@@ -84,7 +84,7 @@ class AuthState:
 
     def log_summary(self) -> None:
         if self.token:
-            logger.info("auth: token=%s...", self.token[:36])
+            logger.info("auth: token_present=%s token_length=%d", bool(self.token), len(self.token))
         if self.user_id:
             logger.info("auth: user_id=%s", self.user_id)
         if self.expired_at:

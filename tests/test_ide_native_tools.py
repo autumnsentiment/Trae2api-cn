@@ -294,7 +294,7 @@ class IdeNativeToolTests(unittest.TestCase):
         self.assertNotIn("opencode_tool_call", prompt)
         self.assertNotIn("input schemas (JSON)", prompt)
         self.assertEqual(body["tool_choice"], "required")
-        self.assertFalse(body["parallel_tool_calls"])
+        self.assertNotIn("parallel_tool_calls", body)
         self.assertEqual(
             json.loads(body["tools"][0]["function"]["parameters"]),
             TOOLS[0]["function"]["parameters"],
@@ -359,7 +359,7 @@ class IdeNativeToolTests(unittest.TestCase):
                     parallel_tool_calls=True,
                 )
                 self.assertEqual(body["tool_choice"], expected)
-                self.assertTrue(body["parallel_tool_calls"])
+                self.assertNotIn("parallel_tool_calls", body)
 
     def test_explicit_empty_catalog_does_not_restore_inherited_tools(self):
         explicit = _body(

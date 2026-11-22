@@ -37,6 +37,15 @@ class NativeRateLimitClassificationTests(unittest.TestCase):
                 error = UpstreamEventError("busy", code=code)
                 self.assertTrue(main_module._is_native_rate_limit_error(error))
 
+    def test_structured_4008_and_quota_message_are_recognized(self):
+        for error in (
+            UpstreamEventError("Your requests have exceeded the quota", code=4008),
+            UpstreamEventError("busy", account_quota_exhausted=True),
+            RuntimeError("Your requests have exceeded the quota"),
+        ):
+            with self.subTest(error=str(error)):
+                self.assertTrue(main_module._is_native_rate_limit_error(error))
+
     def test_unrelated_3004_text_is_not_a_rate_limit(self):
         self.assertFalse(
             main_module._is_native_rate_limit_error(
@@ -53,8 +62,37 @@ class NativeRateLimitClassificationTests(unittest.TestCase):
             with self.subTest(guard=guard):
                 self.assertFalse(
                     main_module._is_native_rate_limit_error(
-                        UpstreamEventError("rate limit", code=3004, **guard)
+                        UpstreamEventError("quota exhausted", code=4008, **guard)
                     )
+                )
+
+    def test_4023_is_not_a_rate_limit(self):
+        for error in (
+            UpstreamEventError(
+                "We're sorry, the model is unknown.", code=4023
+            ),
+            RuntimeError(
+                "Trae upstream error 4023: We're sorry, the model is unknown."
+            ),
+            RuntimeError("the model is unknown"),
+        ):
+            with self.subTest(error=str(error)):
+                self.assertTrue(
+                    main_module._is_native_model_unknown_error(error)
+                )
+                self.assertFalse(
+                    main_module._is_native_rate_limit_error(error)
+                )
+
+    def test_unrelated_numbers_are_not_model_unknown_errors(self):
+        for error in (
+            RuntimeError("input exceeds context 14023 tokens"),
+            RuntimeError("request id 40230"),
+            RuntimeError("model is available"),
+        ):
+            with self.subTest(error=str(error)):
+                self.assertFalse(
+                    main_module._is_native_model_unknown_error(error)
                 )
 
 
@@ -118,6 +156,104 @@ class NativeRateLimitChainTests(unittest.IsolatedAsyncioTestCase):
             return "".join([chunk async for chunk in response.body_iterator])
         return response.body.decode("utf-8")
 
+    async def _custom_request(self, stream, **extra_options):
+        response = await main_module._dispatch_chat(
+            [{"role": "user", "content": "Reply pong"}],
+            "glm-5.2",
+            stream,
+            {
+                **self._options(),
+                "_traework_custom_model": True,
+                "_tool_protocol_requested": True,
+                **extra_options,
+            },
+        )
+        if stream:
+            return "".join([chunk async for chunk in response.body_iterator])
+        return response.body.decode("utf-8")
+
+    async def test_custom_raw_v2_4011_rotates_before_output(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                limited = _wrapper(
+                    ("model_config", {"model_name": "glm-5.2__dev"}),
+                    ("error", {"code": 4011, "message": "rate limit"}),
+                )
+                completed = _wrapper(
+                    ("text_delta", {"delta": "pong"}),
+                    ("done", {"finish_reason": "stop"}),
+                )
+                raw = AsyncMock(side_effect=[limited, completed])
+                legacy = AsyncMock()
+                with self._patch_chain(raw, legacy):
+                    result = await self._custom_request(stream)
+
+                self.assertIn("pong", result)
+                self.assertEqual(raw.await_count, 2)
+                self.assertEqual(
+                    [call.kwargs["options"]["_account_id"] for call in raw.await_args_list],
+                    ["account-a", "account-b"],
+                )
+                for call in raw.await_args_list:
+                    self.assertEqual(call.args[1], "glm-5.2")
+                    self.assertEqual(
+                        call.kwargs["options"]["_traecode_raw_chat_function"],
+                        "chat_v3",
+                    )
+                    self.assertEqual(
+                        call.kwargs["options"]["tools"], self._options()["tools"]
+                    )
+                    self.assertTrue(call.kwargs["options"]["_traecode_native_tools"])
+                legacy.assert_not_awaited()
+                limited.close.assert_called_once()
+                completed.close.assert_called_once()
+
+    async def test_custom_raw_v2_4011_after_output_or_usage_never_replays(self):
+        for stream in (False, True):
+            for event in (
+                ("text_delta", {"delta": "partial"}),
+                ("reasoning_delta", {"delta": "reasoning"}),
+                ("token_usage", {"input_token": 3, "output_token": 1}),
+            ):
+                with self.subTest(stream=stream, event=event[0]):
+                    limited = _wrapper(
+                        event, ("error", {"code": 4011, "message": "rate limit"})
+                    )
+                    raw = AsyncMock(return_value=limited)
+                    legacy = AsyncMock()
+                    with (
+                        self._patch_chain(raw, legacy),
+                        self.assertRaises(UpstreamEventError) as caught,
+                    ):
+                        await self._custom_request(stream)
+
+                    self.assertEqual(caught.exception.code, 4011)
+                    self.assertFalse(caught.exception.retryable)
+                    raw.assert_awaited_once()
+                    legacy.assert_not_awaited()
+                    limited.close.assert_called_once()
+
+    async def test_custom_raw_v2_4011_respects_disabled_fallback(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                limited = _wrapper(
+                    ("error", {"code": 4011, "message": "rate limit"})
+                )
+                raw = AsyncMock(return_value=limited)
+                legacy = AsyncMock()
+                with (
+                    self._patch_chain(raw, legacy),
+                    self.assertRaises(UpstreamEventError) as caught,
+                ):
+                    await self._custom_request(
+                        stream, _disable_upstream_fallback=True
+                    )
+
+                self.assertEqual(caught.exception.code, 4011)
+                raw.assert_awaited_once()
+                legacy.assert_not_awaited()
+                limited.close.assert_called_once()
+
     async def test_3004_after_model_metadata_rotates_without_legacy_replay(self):
         for stream in (False, True):
             for error_payload in (
@@ -155,6 +291,61 @@ class NativeRateLimitChainTests(unittest.IsolatedAsyncioTestCase):
                     limited.close.assert_called_once()
                     completed.close.assert_called_once()
 
+    async def test_4008_after_model_metadata_rotates_without_legacy_replay(self):
+        for stream in (False, True):
+            for error_payload in (
+                {"code": 4008, "message": "Your requests have exceeded the quota."},
+                {"error": {"errorCode": "4008", "message": "quota exceeded"}},
+            ):
+                with self.subTest(stream=stream, error_payload=error_payload):
+                    limited = _wrapper(
+                        (
+                            "model_config",
+                            {
+                                "model_name": "glm-5.2__dev",
+                                "reply_to_message_id": "setup-turn",
+                            },
+                        ),
+                        ("error", error_payload),
+                    )
+                    completed = _wrapper(
+                        ("text_delta", {"delta": "pong"}),
+                        ("done", {"finish_reason": "stop"}),
+                    )
+                    raw = AsyncMock(side_effect=[limited, completed])
+                    legacy = AsyncMock()
+                    with self._patch_chain(raw, legacy):
+                        result = await self._request(stream)
+
+                    self.assertIn("pong", result)
+                    self.assertEqual(raw.await_count, 2)
+                    self.assertEqual(
+                        [call.kwargs["options"]["_account_id"] for call in raw.await_args_list],
+                        ["account-a", "account-b"],
+                    )
+                    legacy.assert_not_awaited()
+                    limited.close.assert_called_once()
+                    completed.close.assert_called_once()
+
+    async def test_4008_without_polling_preserves_error_without_legacy_replay(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                limited = _wrapper(
+                    ("error", {"code": 4008, "message": "quota exceeded"})
+                )
+                raw = AsyncMock(return_value=limited)
+                legacy = AsyncMock()
+                with self._patch_chain(raw, legacy, polling=False):
+                    with self.assertRaises(UpstreamEventError) as error:
+                        await self._request(stream)
+
+                self.assertEqual(error.exception.code, 4008)
+                self.assertTrue(error.exception.retryable)
+                self.assertTrue(error.exception.account_quota_exhausted)
+                raw.assert_awaited_once()
+                legacy.assert_not_awaited()
+                limited.close.assert_called_once()
+
     async def test_3004_without_polling_preserves_error_without_legacy_replay(self):
         for stream in (False, True):
             with self.subTest(stream=stream):
@@ -171,6 +362,21 @@ class NativeRateLimitChainTests(unittest.IsolatedAsyncioTestCase):
                 raw.assert_awaited_once()
                 legacy.assert_not_awaited()
                 limited.close.assert_called_once()
+
+    async def test_4023_does_not_rotate_or_replay(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                error = RuntimeError(
+                    "Trae upstream error 4023: We're sorry, the model is unknown."
+                )
+                raw = AsyncMock(side_effect=error)
+                legacy = AsyncMock()
+                with self._patch_chain(raw, legacy):
+                    with self.assertRaises(RuntimeError) as caught:
+                        await self._request(stream)
+                self.assertIs(caught.exception, error)
+                raw.assert_awaited_once()
+                legacy.assert_not_awaited()
 
     async def test_3004_after_model_output_or_usage_never_replays(self):
         for stream in (False, True):
@@ -223,7 +429,14 @@ class NativeRateLimitChainTests(unittest.IsolatedAsyncioTestCase):
                     response = _wrapper(*events)
                     raw = AsyncMock(return_value=response)
                     legacy = AsyncMock()
-                    with self._patch_chain(raw, legacy):
+                    with (
+                        self._patch_chain(raw, legacy),
+                        patch.object(
+                            main_module.responses_api,
+                            "reasoning_output_requested",
+                            return_value=False,
+                        ),
+                    ):
                         with self.assertRaises(EmptyUpstreamResponse) as caught:
                             await self._request(stream)
                     self.assertFalse(caught.exception.retryable)

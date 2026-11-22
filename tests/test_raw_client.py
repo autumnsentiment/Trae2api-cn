@@ -315,6 +315,12 @@ class RawClientBuildTests(unittest.TestCase):
                 "DeepSeek-V4-Flash \u6b63\u5f0f\u7248",
             ),
             "kimi-k2.6": ("kimi-k2.6", "kimi-k2.6__v2", "Kimi-K2.6"),
+            "kimi-k3": ("kimi-k3", "kimi-k3__dev", "Kimi-K3"),
+            "kimi-k3.1-pro": (
+                "kimi-k3.1-pro",
+                "kimi-k3.1-pro__dev",
+                "Kimi-K3.1-Pro",
+            ),
             "minimax-m3": ("minimax-m3", "minimax-m3", "MiniMax M3"),
             "qwen-3.7-plus": ("qwen-3.7-plus", "qwen-3.7-plus", "Qwen 3.7 Plus"),
         }

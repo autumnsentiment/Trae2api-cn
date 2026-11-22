@@ -31,6 +31,7 @@ from .cli_client import (
     tool_result_is_failed,
 )
 from . import images
+from .model_limits import descriptor_denies_pay_identity, descriptor_max_profile
 from .reasoning_effort import apply_reasoning_effort, requested_level
 logger = logging.getLogger(__name__)
 
@@ -200,15 +201,81 @@ class RawModel:
     descriptor: Optional[Mapping[str, Any]] = field(default=None, compare=False, repr=False)
 
 
-class TraeCodeRateLimitError(RuntimeError):
+class TraeCodeRequestError(RuntimeError):
+    """A bounded HTTP rejection with structured upstream failure metadata."""
+
+    def __init__(
+        self,
+        status_code: int,
+        code: Any = None,
+        detail: str = "",
+        *,
+        usage: Optional[Mapping[str, Any]] = None,
+        observed_model_event: bool = False,
+    ):
+        self.status_code = status_code
+        self.code = code[:128] if isinstance(code, str) else code
+        self.detail = str(detail or "")[:800]
+        self.usage = dict(usage) if isinstance(usage, Mapping) else None
+        self.observed_model_event = bool(observed_model_event)
+        self.retryable = not self.observed_model_event and self.usage is None
+        code_note = f", code={self.code}" if self.code is not None else ""
+        super().__init__(
+            f"TraeCode raw chat request failed (HTTP {status_code}{code_note})"
+            + (f": {self.detail}" if self.detail else "")
+        )
+
+
+class TraeCodeRateLimitError(TraeCodeRequestError):
     """An HTTP limit that requires account rotation instead of gateway fallback."""
 
     def __init__(self, status_code: int, code: Any, detail: str):
-        self.status_code = status_code
-        self.code = code
+        super().__init__(status_code, code, detail)
+        RuntimeError.__init__(
+            self,
+            f"TraeCode raw chat rate limit {self.code} (HTTP {status_code})"
+            + (f": {self.detail}" if self.detail else ""),
+        )
+
+
+class TraeCodeModelUnavailable(RuntimeError):
+    """The bound account does not expose this model in the requested scope."""
+
+    def __init__(
+        self,
+        model: str,
+        raw_chat_function: str,
+        *,
+        reason: str = "",
+    ):
+        self.model = str(model or "").strip()
+        self.raw_chat_function = str(raw_chat_function or "").strip()
+        self.reason = str(reason or "").strip()
+        suffix = (
+            f"; reason={self.reason}" if self.reason else ""
+        )
         super().__init__(
-            f"TraeCode raw chat rate limit {code} (HTTP {status_code})"
-            + (f": {detail}" if detail else "")
+            "Trae model is not available in the requested native scope: "
+            f"{self.model or '<unknown>'} "
+            f"(raw_chat_function={self.raw_chat_function or '<unknown>'}"
+            f"{suffix})"
+        )
+
+
+class TraeCodeModelNotEntitled(RuntimeError):
+    """The model exists in the catalog but the bound account cannot use it."""
+
+    code = "model_not_entitled"
+
+    def __init__(self, model: str, raw_chat_function: str, pay_identity: Any):
+        self.model = str(model or "").strip()
+        self.raw_chat_function = str(raw_chat_function or "").strip()
+        self.pay_identity = pay_identity
+        super().__init__(
+            "Trae model_not_entitled: "
+            f"{self.model or '<unknown>'} exists in the requested native "
+            f"scope but is not available for pay identity {pay_identity} "
+            f"(raw_chat_function={self.raw_chat_function or '<unknown>'})"
         )
 
 
@@ -628,12 +695,81 @@ def resolve_traecode_model(
     return resolved
 
 
+_CUSTOM_PROVIDER_ID = "custom_openai_compatible"
+
+
+def _traecode_selected_provider_detail(
+    descriptor: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Return provider metadata for the exact model selected by the resolver."""
+
+    selected_model = str(
+        descriptor.get("raw_model_name") or descriptor.get("model_name") or ""
+    ).strip().casefold()
+    if not selected_model:
+        return None
+    details = descriptor.get("_traecode_model_detail_list")
+    if not isinstance(details, list):
+        details = descriptor.get("model_detail_list")
+    if not isinstance(details, list):
+        return None
+    for detail in details or []:
+        if not isinstance(detail, Mapping):
+            continue
+        if (
+            str(detail.get("model_name") or "").strip().casefold()
+            == selected_model
+        ):
+            return {**descriptor, **detail}
+    return None
+
+
+def _custom_provider_binding_missing(descriptor: Mapping[str, Any]) -> bool:
+    """Return whether a custom provider is client-direct or lacks credentials."""
+
+    provider = str(descriptor.get("provider") or "").strip().casefold()
+    if provider != _CUSTOM_PROVIDER_ID:
+        return False
+    custom_config = descriptor.get("custom_config")
+    custom_config = custom_config if isinstance(custom_config, Mapping) else {}
+    client_connect = (
+        descriptor.get("client_connect")
+        if descriptor.get("client_connect") is not None
+        else custom_config.get("client_connect")
+    )
+    if client_connect is True or str(client_connect or "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    base_url = str(
+        descriptor.get("base_url")
+        or custom_config.get("base_url")
+        or ""
+    ).strip()
+    api_key = str(
+        descriptor.get("api_key")
+        or descriptor.get("ak")
+        or descriptor.get("access_key")
+        or custom_config.get("api_key")
+        or custom_config.get("ak")
+        or custom_config.get("access_key")
+        or ""
+    ).strip()
+    return not base_url or not api_key
+
+
 async def resolve_traecode_model_for_request(
     model: str, options: Optional[Mapping[str, Any]] = None
 ) -> RawModel:
     """Resolve TraeCode model fields, consulting the live config when needed."""
 
     options = options or {}
+    from . import trae_client as _trae_client
+
+    base_model, max_variant = _trae_client.split_max_model_name(model)
     explicit = any(
         _traecode_option(options, key, default=None) is not None
         for key in (
@@ -649,7 +785,7 @@ async def resolve_traecode_model_for_request(
             "model_name",
         )
     )
-    resolved = resolve_traecode_model(model, options)
+    resolved = resolve_traecode_model(base_model, options)
     if explicit:
         return resolved
     # TraeCode IDE/Solo uses a different provider-id namespace from the
@@ -687,9 +823,9 @@ async def resolve_traecode_model_for_request(
                     "max",
                     default=False,
                 )
-            )
+            ) or max_variant
             live = await trae_client.resolve_traecode_model_config(
-                model,
+                base_model,
                 token_override=token,
                 user_id_override=bound_user_id,
                 provider_specific=(
@@ -701,17 +837,54 @@ async def resolve_traecode_model_for_request(
                 raw_chat_function=str(native_function),
             )
             if isinstance(live, Mapping):
+                live_config_name = str(
+                    live.get("config_name")
+                    or live.get("name")
+                    or ""
+                ).strip()
+                live_raw_model_name = str(
+                    live.get("raw_model_name")
+                    or live.get("model_name")
+                    or ""
+                ).strip()
+                if (
+                    str(base_model or "").strip().casefold().startswith("kimi-")
+                    and (
+                        not live_config_name
+                        or not live_raw_model_name
+                        or live_raw_model_name.casefold()
+                        in {
+                            live_config_name.casefold(),
+                            str(base_model or "").strip().casefold(),
+                        }
+                    )
+                ):
+                    # Kimi's native gateway requires a catalog provider id
+                    # distinct from the public picker/config name.  A catalog
+                    # hit without ``model_detail_list`` is not enough evidence
+                    # to bind the model; falling back to the picker name turns
+                    # a scope miss into gateway 4023.
+                    raise TraeCodeModelUnavailable(model, str(native_function))
+                descriptor = live if isinstance(live, Mapping) else {}
+                selected_detail = _traecode_selected_provider_detail(descriptor)
+                if _custom_provider_binding_missing(
+                    selected_detail or descriptor
+                ):
+                    raise TraeCodeModelUnavailable(
+                        model,
+                        str(native_function),
+                        reason="custom_provider_requires_client_direct",
+                    )
+                pay_identity = _traecode_bound_pay_identity(options)
+                if descriptor_denies_pay_identity(descriptor, pay_identity):
+                    raise TraeCodeModelNotEntitled(
+                        model,
+                        str(native_function),
+                        pay_identity,
+                    )
                 return RawModel(
-                    config_name=str(
-                        live.get("config_name")
-                        or live.get("name")
-                        or resolved.config_name
-                    ),
-                    raw_model_name=str(
-                        live.get("raw_model_name")
-                        or live.get("model_name")
-                        or resolved.raw_model_name
-                    ),
+                    config_name=live_config_name or resolved.config_name,
+                    raw_model_name=live_raw_model_name or resolved.raw_model_name,
                     display_name=str(
                         live.get("display_name")
                         or live.get("display_model_name")
@@ -723,7 +896,32 @@ async def resolve_traecode_model_for_request(
                     provider=str(live.get("provider") or resolved.provider or ""),
                     descriptor=copy.deepcopy(dict(live)),
                 )
+            live_catalog = await trae_client._cached_model_catalog(
+                "solo",
+                token,
+                provider_specific=(
+                    dict(provider_specific)
+                    if isinstance(provider_specific, Mapping)
+                    else None
+                ),
+                user_id_override=bound_user_id,
+                raw_chat_function=str(native_function),
+            )
+            if isinstance(live_catalog, Mapping) and (
+                live_catalog or getattr(live_catalog, "fetch_succeeded", False)
+            ):
+                # The catalog was fetched successfully for this account and
+                # function but does not contain the requested model.  Do not
+                # synthesize a ``__dev``/``__v2`` id from an unrelated legacy
+                # alias; the gateway would reject that unknown binding after
+                # parsing (and sometimes billing) the request.
+                raise TraeCodeModelUnavailable(model, str(native_function))
         except Exception as exc:
+            if isinstance(
+                exc,
+                (TraeCodeModelUnavailable, TraeCodeModelNotEntitled),
+            ):
+                raise
             logger.warning(
                 "traecode live model config lookup failed for %s: %s",
                 model,
@@ -733,7 +931,7 @@ async def resolve_traecode_model_for_request(
     # Reuse it for unknown/new models, then normalize the legacy ``__v2``
     # suffix away because TraeCode's CustomModel uses provider model ids.
     try:
-        upstream = await resolve_raw_model_for_request(model, options)
+        upstream = await resolve_raw_model_for_request(base_model, options)
     except Exception as exc:
         logger.warning("traecode model config lookup failed for %s: %s", model, exc)
         return resolved
@@ -757,6 +955,67 @@ async def resolve_traecode_model_for_request(
             else resolved.descriptor
         ),
     )
+
+
+def _traecode_bound_pay_identity(options: Optional[Mapping[str, Any]]) -> Any:
+    """Read the model entitlement identity for the bound account.
+
+    This mirrors the Remote resolver's precedence: a dispatcher-bound account
+    record wins over caller-provided metadata.  Inline identity is retained as
+    a fallback for single-token deployments that have no account record.
+    """
+
+    options = options or {}
+    bound_account = str(
+        options.get("_auth_user_id")
+        or options.get("_billing_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if bound_account:
+        canonical_account = (
+            auth.resolve_model_account_id(bound_account) or bound_account
+        )
+        record = auth.get_account_record(canonical_account)
+        for value in (
+            record.get("user_pay_identity"),
+            record.get("pay_identity"),
+            record.get("user_identity"),
+            record.get("userIdentity"),
+        ):
+            if value is not None and value != "":
+                return value
+        record_provider = record.get("provider_specific")
+        if isinstance(record_provider, Mapping):
+            for value in (
+                record_provider.get("userPayIdentity"),
+                record_provider.get("payIdentity"),
+                record_provider.get("userIdentity"),
+                record_provider.get("user_identity"),
+            ):
+                if value is not None and value != "":
+                    return value
+    for value in (
+        options.get("_auth_pay_identity"),
+        options.get("_pay_identity"),
+        options.get("user_pay_identity"),
+        options.get("userPayIdentity"),
+    ):
+        if value is not None and value != "":
+            return value
+    provider = options.get("provider_specific")
+    if provider is None:
+        provider = options.get("providerSpecificData")
+    if isinstance(provider, Mapping):
+        for value in (
+            provider.get("userPayIdentity"),
+            provider.get("payIdentity"),
+            provider.get("userIdentity"),
+            provider.get("user_identity"),
+        ):
+            if value is not None and value != "":
+                return value
+    return None
 
 
 def traecode_session_id(
@@ -902,7 +1161,14 @@ def _traecode_tool_calls(message: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _traecode_tool_definitions(tools: Any) -> list[dict[str, Any]]:
-    """Keep OpenAI function schemas object-shaped for TraeCode."""
+    """Convert OpenAI tools to TraeCode raw-v2's native wire shape.
+
+    ``FunctionDefinition.parameters`` is a serialized JSON schema string in
+    the IDE raw-v2 DTO.  Sending the OpenAI object shape is rejected by the
+    gateway with HTTP 400 before model dispatch.  The bundle passes
+    ``tools`` through unchanged, which means its caller must already supply
+    the native shape; the relay must perform that normalization itself.
+    """
 
     if not isinstance(tools, list):
         return []
@@ -920,18 +1186,22 @@ def _traecode_tool_definitions(tools: Any) -> list[dict[str, Any]]:
         parameters = function.get("parameters")
         if parameters is None:
             parameters = function.get("input_schema") or function.get("inputSchema") or {}
-        if isinstance(parameters, str):
-            try:
-                parameters = json.loads(parameters)
-            except (TypeError, ValueError):
-                parameters = {"type": "object"}
+        parameters = _decode_tool_parameters(parameters)
         fn: dict[str, Any] = {
             "name": name,
             "description": str(function.get("description") or ""),
-            "parameters": copy.deepcopy(parameters),
+            "parameters": json.dumps(
+                parameters,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ),
         }
-        if "strict" in function:
-            fn["strict"] = bool(function.get("strict"))
+        # Trae's FunctionDefinition does not declare the OpenAI transport
+        # flag.  Keep strictness inside the JSON Schema instead; forwarding a
+        # top-level strict field can make the gateway reject the whole tools
+        # array with 4001 before model dispatch.
+        fn.pop("strict", None)
         result.append({"type": "function", "function": fn})
     return result
 
@@ -1027,7 +1297,6 @@ def build_traecode_chat_body(
         # TraeCode's client always opens the SSE path; non-stream API callers
         # are aggregated by the relay after the upstream stream closes.
         "stream": bool(_traecode_option(options, "_traecode_wire_stream", default=True)),
-        "raw_chat_function": function,
         "config_source": int(resolved.config_source or 1),
         "messages": body_messages,
     }
@@ -1073,11 +1342,9 @@ def build_traecode_chat_body(
         converted_tools = _traecode_tool_definitions(tools)
         if converted_tools:
             body["tools"] = converted_tools
-            choice = options.get("tool_choice")
+            choice = normalize_traecode_tool_choice(options.get("tool_choice"))
             if choice is not None:
-                body["tool_choice"] = copy.deepcopy(choice)
-            if options.get("parallel_tool_calls") is not None:
-                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+                body["tool_choice"] = choice
     return body
 
 
@@ -1430,9 +1697,26 @@ async def send_traecode_chat_request(
     base_urls = resolve_traecode_base_urls(options)
     if not base_urls:
         raise RuntimeError("No TraeCode model gateway configured")
+    disable_fallback = bool(options.get("_disable_upstream_fallback"))
+    if disable_fallback:
+        base_urls = base_urls[:1]
     solo = bool(_traecode_option(options, "_traecode_solo", "traecode_solo", "solo", default=False))
     raw_chat_function = traecode_raw_chat_function(options, solo=solo)
     raw_model = await resolve_traecode_model_for_request(model, options)
+    max_profile = descriptor_max_profile(raw_model.descriptor)
+    trace = options.get("_upstream_trace")
+    if isinstance(trace, dict) and max_profile and (
+        _traecode_option(
+            options,
+            "trae_max_mode",
+            "max_mode",
+            "max",
+            default=False,
+        )
+        or str(model or "").strip().casefold().endswith("-max")
+    ):
+        trace["max_mode_applied"] = True
+        trace["max_context_tokens"] = max_profile.get("context")
     session_id = traecode_session_id(raw_model, options, raw_chat_function)
     body_options = dict(options)
     body_options.setdefault("_traecode_solo", solo)
@@ -1489,7 +1773,9 @@ async def send_traecode_chat_request(
     )
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     endpoints = [TRAECODE_RAW_CHAT_ENDPOINT]
-    if bool(_traecode_option(options, "_traecode_allow_v1_fallback", default=True)):
+    if not disable_fallback and bool(
+        _traecode_option(options, "_traecode_allow_v1_fallback", default=True)
+    ):
         endpoints.append(TRAECODE_RAW_CHAT_FALLBACK_ENDPOINT)
 
     def open_stream() -> RawChatResponse:
@@ -1504,6 +1790,7 @@ async def send_traecode_chat_request(
         client: Optional[httpx.Client] = None
         response: Optional[httpx.Response] = None
         detail = ""
+        last_http_error: Optional[TraeCodeRequestError] = None
         try:
             client = httpx.Client(timeout=timeout, http2=False)
             for base_url in base_urls:
@@ -1530,6 +1817,7 @@ async def send_traecode_chat_request(
                         )
                         response = client.send(request, stream=True)
                     except httpx.RequestError as exc:
+                        last_http_error = None
                         detail = str(exc)[:800]
                         logger.warning(
                             "traecode raw transport failed id=%s base=%s endpoint=%s error=%s",
@@ -1548,7 +1836,9 @@ async def send_traecode_chat_request(
                         )
                     status_code = response.status_code
                     detail = ""
-                    rate_limit_code = 429 if status_code == 429 else None
+                    business_code = 429 if status_code == 429 else None
+                    error_usage = None
+                    observed_model_event = False
                     try:
                         # Read the body before closing it so the connection can
                         # be reused for the next host/path candidate.
@@ -1557,25 +1847,69 @@ async def send_traecode_chat_request(
                             detail = response.text[:800]
                         except httpx.RequestError as exc:
                             detail = str(exc)[:800]
-                        if rate_limit_code is None:
-                            try:
-                                payload = response.json()
-                            except (httpx.ResponseNotRead, ValueError):
-                                payload = None
-                            if isinstance(payload, Mapping):
-                                nested = payload.get("error")
-                                sources = [payload]
-                                if isinstance(nested, Mapping):
-                                    sources.append(nested)
-                                rate_limit_code = next(
+                        try:
+                            payload = response.json()
+                        except (httpx.ResponseNotRead, ValueError):
+                            payload = None
+                        if isinstance(payload, Mapping):
+                            nested = payload.get("error")
+                            sources = [payload]
+                            if isinstance(nested, Mapping):
+                                sources.append(nested)
+                            error_usage = next(
+                                (
+                                    source[key]
+                                    for source in sources
+                                    for key in ("usage", "token_usage", "tokenUsage")
+                                    if isinstance(source.get(key), Mapping)
+                                ),
+                                None,
+                            )
+                            observed_model_event = any(
+                                source.get("observed_model_event") is True
+                                for source in sources
+                            )
+                            if business_code is None:
+                                codes = [
+                                    source[key]
+                                    for source in sources
+                                    for key in ("code", "error_code", "errorCode")
+                                    if isinstance(source.get(key), (int, str))
+                                    and not isinstance(source.get(key), bool)
+                                    and str(source[key]).strip()
+                                ]
+                                if any(
+                                    str(source.get("type") or "").strip().casefold()
+                                    == "model_not_entitled"
+                                    for source in sources
+                                ) or nested == "model_not_entitled":
+                                    codes.insert(0, "model_not_entitled")
+                                fatal_code = next(
                                     (
-                                        source[key]
-                                        for source in sources
-                                        for key in ("code", "error_code", "errorCode")
-                                        if str(source.get(key, "")).strip()
-                                        == "3004"
+                                        code
+                                        for code in codes
+                                        if str(code).strip().casefold()
+                                        in {
+                                            "3004",
+                                            "4011",
+                                            "429",
+                                            "4023",
+                                            "model_not_entitled",
+                                        }
                                     ),
                                     None,
+                                )
+                                business_code = (
+                                    fatal_code
+                                    if fatal_code is not None
+                                    else next(
+                                        (
+                                            code
+                                            for code in codes
+                                            if str(code).strip() in {"4001", "1005"}
+                                        ),
+                                        codes[0] if codes else None,
+                                    )
                                 )
                     finally:
                         response.close()
@@ -1588,12 +1922,26 @@ async def send_traecode_chat_request(
                         status_code,
                         detail,
                     )
-                    if rate_limit_code is not None:
+                    last_http_error = TraeCodeRequestError(
+                        status_code,
+                        business_code,
+                        detail,
+                        usage=error_usage,
+                        observed_model_event=observed_model_event,
+                    )
+                    if not last_http_error.retryable:
+                        raise last_http_error
+                    normalized_code = str(business_code or "").strip().casefold()
+                    if normalized_code in {"3004", "4011", "429"}:
                         # Every candidate uses the same credential, so probing
                         # another host/path only repeats an account-level limit.
                         raise TraeCodeRateLimitError(
-                            status_code, rate_limit_code, detail
+                            status_code, business_code, detail
                         )
+                    if normalized_code in {"4023", "model_not_entitled"}:
+                        raise last_http_error
+            if last_http_error is not None:
+                raise last_http_error
             raise RuntimeError(
                 "TraeCode raw chat request failed on "
                 + ", ".join(
@@ -1658,6 +2006,23 @@ _KNOWN_MODELS = {
     "kimi-k2.6": RawModel("kimi-k2.6", "kimi-k2.6__v2", "Kimi-K2.6"),
     "kimi-k2.7-code": RawModel(
         "kimi-k2.7-code", "kimi-k2.7-code", "Kimi-K2.7-Code"
+    ),
+    # K3 is a distinct catalog model from K3.1 Pro. Its account catalog
+    # resolves the provider suffix when available; this fallback keeps the
+    # public selector from being sent to a gateway that expects a config id.
+    "kimi-k3": RawModel("kimi-k3", "kimi-k3__dev", "Kimi-K3"),
+    # Native Solo publishes K3.1 Pro under an ``-auto`` config while the remote
+    # tier uses the plain config.  Pin the raw id here so a fresh caller does
+    # not inherit a stale/display alias before the live detail is resolved.
+    "kimi-k3.1-pro": RawModel(
+        "kimi-k3.1-pro",
+        "kimi-k3.1-pro__dev",
+        "Kimi-K3.1-Pro",
+    ),
+    "kimi-k3.1-pro-auto": RawModel(
+        "kimi-k3.1-pro-auto",
+        "kimi-k3.1-pro__dev",
+        "Kimi-K3.1-Pro",
     ),
     "deepseek-v4-pro": RawModel(
         "DeepSeek-V4-Pro", "DeepSeek-V4-Pro__v2", "DeepSeek-V4-Pro"
@@ -2852,7 +3217,7 @@ def _native_tool_definition(tool: Any) -> Optional[dict[str, Any]]:
         # Accept the compact function shape used by a few terminal adapters.
         function = {
             key: copy.deepcopy(result.get(key))
-            for key in ("name", "description", "parameters", "strict")
+            for key in ("name", "description", "parameters")
             if key in result
         }
         result = {"type": "function", "function": function}
@@ -2864,16 +3229,16 @@ def _native_tool_definition(tool: Any) -> Optional[dict[str, Any]]:
     parameters = function.get("parameters")
     if parameters is None:
         parameters = function.get("input_schema") or function.get("inputSchema") or {}
-    if not isinstance(parameters, str):
-        parameters = json.dumps(
-            parameters,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
+    parameters = json.dumps(
+        _decode_tool_parameters(parameters),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
     function["parameters"] = parameters
     function.pop("input_schema", None)
     function.pop("inputSchema", None)
+    function.pop("strict", None)
     result["type"] = str(result.get("type") or "function")
     return result
 
@@ -2896,6 +3261,45 @@ def _named_tool_choice(tool_choice: Any) -> str:
     selected = function if isinstance(function, Mapping) else tool_choice
     name = selected.get("name") if isinstance(selected, Mapping) else None
     return str(name or "").strip()
+
+
+def normalize_traecode_tool_choice(tool_choice: Any) -> Optional[str]:
+    """Return the string-only ``tool_choice`` accepted by raw-v2."""
+
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, bool):
+        return "auto" if tool_choice else "none"
+    if isinstance(tool_choice, str):
+        choice = tool_choice.strip()
+        if not choice:
+            return None
+        lowered = choice.casefold()
+        return lowered if lowered in {"none", "auto", "required"} else choice
+    if not isinstance(tool_choice, Mapping):
+        return None
+    choice_type = str(tool_choice.get("type") or "").strip().casefold()
+    if choice_type in {"none", "auto", "required"}:
+        return choice_type
+    name = _named_tool_choice(tool_choice)
+    if name:
+        return name
+    if choice_type in {"function", "tool"}:
+        return "auto"
+    return None
+
+
+def _decode_tool_parameters(parameters: Any) -> Any:
+    """Decode one schema string and validate its top-level JSON type."""
+
+    if isinstance(parameters, str):
+        try:
+            parameters = json.loads(parameters)
+        except (TypeError, ValueError):
+            raise ValueError("tool parameters must contain valid JSON")
+    if not isinstance(parameters, Mapping):
+        raise ValueError("tool parameters must be an object")
+    return parameters
 
 
 def _native_function_call(call: Any) -> Optional[dict[str, Any]]:

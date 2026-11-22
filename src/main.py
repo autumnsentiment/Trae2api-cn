@@ -91,6 +91,7 @@ from .sse import (
     EmptyUpstreamResponse,
     ModelProviderMismatch,
     RepeatedCompletedToolResponse,
+    UpstreamEventError,
     collect_nonstream_cli,
     collect_nonstream_ide,
     collect_nonstream_web,
@@ -374,6 +375,7 @@ CHAT_OPTION_FIELDS = (
     # Per-request 1M max opt-in; the console switch is the global default.
     "trae_max_mode",
     "max_mode",
+    "disable_fallback",
     "stream_options",
     "response_format",
     "service_tier",
@@ -4513,6 +4515,41 @@ def _stream_error_event(response) -> str:
     return "data: " + json.dumps({"error": error}, ensure_ascii=False) + "\n\n"
 
 
+def _exception_stream_error_event(
+    error: BaseException,
+    *,
+    request_id: str = "",
+    model: str = "",
+    message: Optional[str] = None,
+    error_type: Optional[str] = None,
+) -> str:
+    """Preserve a pre-output stream failure's safe diagnostic fields."""
+
+    payload: dict[str, Any] = {
+        "message": str(message or error or "Upstream stream failed"),
+        "type": str(error_type or "api_error"),
+    }
+    code = getattr(error, "code", None)
+    status_code = getattr(error, "status_code", None)
+    upstream_error_type = str(getattr(error, "error_type", "") or "").strip()
+    if code not in (None, ""):
+        payload["code"] = code
+        payload["upstream_code"] = code
+    if status_code not in (None, ""):
+        payload["status"] = status_code
+    if upstream_error_type and not error_type:
+        payload["type"] = upstream_error_type
+    if hasattr(error, "retryable"):
+        payload["retryable"] = bool(getattr(error, "retryable"))
+    if request_id:
+        payload["request_id"] = request_id
+    if model:
+        payload["model"] = model
+    return "data: " + json.dumps(
+        {"error": payload}, ensure_ascii=False
+    ) + "\n\n"
+
+
 def _stream_start_event(model: str) -> str:
     """Send a parseable SSE frame while the first Trae frame is pending.
 
@@ -4568,6 +4605,15 @@ async def _deferred_dispatch_stream(
     ).strip().lower()
     fallback_allowed = (
         not bool(options.get("_disable_upstream_fallback"))
+        and not bool(options.get("_disable_cross_transport_fallback"))
+        and not (
+            bool(options.get("_traework_custom_model"))
+            and str(
+                options.get("_traework_upstream_mode")
+                or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
+            ).strip().lower()
+            in {"raw", "direct", "auto"}
+        )
         and requested_mode
         in {
             "raw",
@@ -4802,12 +4848,17 @@ async def _deferred_dispatch_stream(
 
         if getattr(response, "status_code", 200) >= 400:
             input_too_large = getattr(response, "status_code", 200) == 413
+            error_payload = _response_json_payload(response).get("error")
+            scope_rejected = isinstance(error_payload, Mapping) and (
+                error_payload.get("type")
+                in {"model_not_available_in_scope", "model_not_entitled"}
+            )
             upstream_error = _upstream_response_error(response) or "http error"
             error_event = _stream_error_event(response)
             await close_current()
             fallback = (
                 None
-                if input_too_large
+                if input_too_large or scope_rejected
                 else await try_remote_fallback(upstream_error)
             )
             if fallback is None:
@@ -4824,6 +4875,8 @@ async def _deferred_dispatch_stream(
         except (asyncio.CancelledError, GeneratorExit):
             raise
         except Exception as exc:
+            if isinstance(exc, raw_client.TraeCodeModelUnavailable):
+                raise
             if isinstance(exc, EmptyUpstreamResponse):
                 _track_usage_from_exception(exc, model)
                 # Native Trae endpoints may emit ``model_config`` and a
@@ -4893,10 +4946,28 @@ async def _deferred_dispatch_stream(
         stream_status = "error"
         _track_usage_from_exception(exc, model)
         logger.warning("deferred stream dispatch failed: %s", exc)
-        yield "data: " + json.dumps(
-            {"error": {"message": str(exc), "type": "api_error"}},
-            ensure_ascii=False,
-        ) + "\n\n"
+        if isinstance(exc, raw_client.TraeCodeModelUnavailable):
+            error_type = "model_not_available_in_scope"
+            message = str(exc)
+        elif (
+            isinstance(exc, trae_remote_client.RemoteModelNotEntitled)
+            or _is_native_model_not_entitled_error(exc)
+        ):
+            error_type = "model_not_entitled"
+            message = (
+                "This model is not included in the bound account's "
+                "Trae entitlement."
+            )
+        else:
+            error_type = "api_error"
+            message = str(exc)
+        yield _exception_stream_error_event(
+            exc,
+            request_id=request_id,
+            model=model,
+            message=message,
+            error_type=error_type,
+        )
         yield "data: [DONE]\n\n"
         saw_done = True
     finally:
@@ -6095,13 +6166,30 @@ def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
                     f"{param}.function.name",
                 )
             parameters = function.get("parameters")
-            if parameters is not None and not isinstance(parameters, dict):
+            if parameters is not None and not isinstance(parameters, (dict, str)):
                 return _openai_error(
                     400,
-                    f"{param}.function.parameters must be an object",
+                    f"{param}.function.parameters must be an object or JSON string",
                     "invalid_request_error",
                     f"{param}.function.parameters",
                 )
+            if isinstance(parameters, str):
+                try:
+                    decoded_parameters = json.loads(parameters)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return _openai_error(
+                        400,
+                        f"{param}.function.parameters must contain valid JSON",
+                        "invalid_request_error",
+                        f"{param}.function.parameters",
+                    )
+                if not isinstance(decoded_parameters, dict):
+                    return _openai_error(
+                        400,
+                        f"{param}.function.parameters must encode a JSON object",
+                        "invalid_request_error",
+                        f"{param}.function.parameters",
+                    )
             tool_names.add(name)
             normalized_tools.append({"type": "function", "function": dict(function)})
         if normalized_tools:
@@ -6530,6 +6618,14 @@ def _context_mode_metadata(
         requested_max = _option_flag(options["max_mode"])
     else:
         requested_max = bool(auth.get_max_mode_settings().get("enabled"))
+    if not requested_max:
+        requested_model = (
+            options.get("_requested_model")
+            or options.get("model")
+            or options.get("_task_model_effective")
+            or ""
+        )
+        requested_max = trae_client.is_max_model_name(requested_model)
     applied_marker = trace.get("max_mode_applied") if "max_mode_applied" in trace else None
     applied_max = _optional_bool(applied_marker)
     requested = "max_1m" if requested_max else "standard"
@@ -8243,6 +8339,11 @@ def _remote_client_tool_task_anchor(
 def _requires_remote_model(model: str) -> bool:
     """Return whether an explicit operator override forces remote routing."""
 
+    if trae_client.is_max_model_name(model):
+        # The public Max variant is the Agent Remote profile.  Keep it out of
+        # the native default path for text requests so the 1M wire fields are
+        # actually sent instead of silently degrading to the dev profile.
+        return True
     configured = _remote_only_models()
     if not configured:
         return False
@@ -8802,7 +8903,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         os.environ.get("TRAE_REMOTE_WORK_FALLBACK", "1").strip().lower()
         in {"1", "true", "yes", "on"}
     )
-    can_work_fallback = work_fallback_enabled and not explicit_work
+    # ``disable_fallback`` is the single-path diagnostic contract used by the
+    # console and support probes.  It must also suppress same-account
+    # Agent -> Work replay, not only executor and account changes.
+    can_work_fallback = (
+        work_fallback_enabled
+        and not explicit_work
+        and not bool(options.get("_disable_upstream_fallback"))
+    )
     can_work_fallback = can_work_fallback and (
         trae_remote_client.remote_agent_type(model, remote_options)
         == "solo_agent_remote"
@@ -8838,6 +8946,8 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         """
 
         text = str(error or "").lower()
+        if isinstance(error, trae_remote_client.RemoteModelNotEntitled):
+            return False
         if _is_remote_account_capacity_error(error):
             return False
         if any(
@@ -9016,6 +9126,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 stream_status = "completed"
                             yield chunk
                         stream_status = "completed"
+                    except trae_remote_client.RemoteModelNotEntitled:
+                        stream_status = "model_not_entitled"
+                        raise
                     except (
                         EmptyUpstreamResponse,
                         trae_remote_client.RemoteFirstEventTimeout,
@@ -9035,6 +9148,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             and not options.get(
                                 "_disable_remote_stream_account_retry"
                             )
+                            and not options.get("_disable_upstream_fallback")
                         )
                         if (
                             not exc_retryable
@@ -9263,6 +9377,8 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             )
             _track_usage_from_result(result, model)
             return JSONResponse(content=result)
+        except trae_remote_client.RemoteModelNotEntitled:
+            raise
         except EmptyUpstreamResponse as exc:
             _track_usage_from_exception(exc, model)
             if not (
@@ -9375,21 +9491,63 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
     upstream_metadata: dict[str, Any] = {}
 
     def _can_fallback(error: BaseException) -> bool:
+        # A model/function binding rejection is deterministic for this
+        # catalog envelope. Replaying the same model through llm_utils_chat
+        # produces a second 4023 and hides the first native diagnostic.
+        if isinstance(error, raw_client.TraeCodeModelUnavailable):
+            return False
+        if _is_native_model_not_entitled_error(error):
+            return False
+        if _is_native_model_unknown_error(error):
+            return False
         # Buffered native tools may not have reached the wire yet, but an
         # observed model turn is still billable and cannot be safely replayed.
-        if isinstance(error, EmptyUpstreamResponse) and (
-            not error.retryable
-            or error.observed_model_event
-            or error.usage is not None
+        if (
+            not getattr(error, "retryable", True)
+            or getattr(error, "observed_model_event", False)
+            or getattr(error, "usage", None) is not None
+            or getattr(error, "account_quota_exhausted", False)
         ):
             return False
         # Account throttling affects both native protocols. Let the outer
         # retry helper rotate credentials instead of replaying this account.
-        return not _is_native_rate_limit_error(error)
+        if _is_native_rate_limit_error(error):
+            return False
+        if isinstance(error, (raw_client.TraeCodeRequestError, UpstreamEventError)):
+            if getattr(error, "status_code", None) in {401, 403}:
+                return False
+            code = str(error.code or "").strip()
+            if code:
+                return code in {"4001", "1005"}
+            return (
+                isinstance(error, raw_client.TraeCodeRequestError)
+                and error.status_code in {400, 404, 405}
+            )
+        if isinstance(error, EmptyUpstreamResponse):
+            return True
+        # Older adapters expose the same business errors as plain RuntimeError.
+        # Do not treat arbitrary local/transport failures as envelope rejection.
+        return bool(
+            re.match(
+                r"^Trae upstream error (?:4001|1005)(?=[:\s]|$)",
+                str(error),
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _legacy_options() -> dict:
         legacy = dict(options)
-        legacy.pop("_traecode_raw_chat_function", None)
+        # Keep the exact native function scope selected for the Raw-v2
+        # request.  llm_utils_chat resolves a catalog entry by function, so
+        # dropping chat_v3/solo_agent here can silently bind solo_work_lite
+        # and turn a valid Raw-v2 parameter rejection into a misleading 4023.
+        function = str(
+            legacy.get("_traecode_raw_chat_function")
+            or legacy.get("raw_chat_function")
+            or ""
+        ).strip()
+        if function:
+            legacy["_traecode_raw_chat_function"] = function
         legacy.pop("_traecode_solo", None)
         legacy["_ide_endpoint"] = str(
             legacy.get("_legacy_ide_endpoint")
@@ -9439,7 +9597,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
             options=_legacy_options(),
         )
 
-    if not raw_requested:
+    if not raw_requested or options.get("_prefer_legacy_tools"):
         raw_kind = "legacy"
     else:
         raw_kind = "raw"
@@ -9885,6 +10043,34 @@ def _openai_error(status: int, message: str, error_type: str, param: Optional[st
     return JSONResponse(body, status_code=status)
 
 
+def _isolated_fallback_option(options: Optional[Mapping[str, Any]]) -> bool:
+    """Read the per-request single-endpoint diagnostic switch.
+
+    The public API and the console probe use the same spelling.  Accept a few
+    JSON encodings because terminal adapters sometimes send booleans as
+    strings, while keeping an absent value backward-compatible with normal
+    fallback routing.
+    """
+
+    if not isinstance(options, Mapping) or "disable_fallback" not in options:
+        return False
+    value = options.get("disable_fallback")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_fallback_option(options: dict, body: Optional[Mapping[str, Any]]) -> dict:
+    """Promote ``disable_fallback`` into the internal routing contract."""
+
+    result = dict(options or {})
+    if _isolated_fallback_option(body):
+        result["_disable_upstream_fallback"] = True
+    return result
+
+
 def _retry_account_key(options: Optional[Mapping[str, Any]], fallback_index: int) -> str:
     options = options or {}
     token = str(options.get("_auth_token") or "")
@@ -10133,6 +10319,10 @@ async def _run_remote_stream_with_retry(
     options = dict(options or {})
     if not auth.get_polling_status().get("enabled"):
         return await run_remote_session(messages, model, True, options)
+    if options.get("_disable_upstream_fallback"):
+        isolated = dict(options)
+        isolated["_disable_remote_stream_account_retry"] = True
+        return await run_remote_session(messages, model, True, isolated)
 
     attempts = _polling_retry_limit(options)
     attempted_accounts: set[str] = set()
@@ -10240,6 +10430,8 @@ async def _run_remote_stream_with_retry(
         except RuntimeError as exc:
             reason = _runtime_retry_reason(exc)
             if (
+                isinstance(exc, trae_remote_client.RemoteModelNotEntitled)
+                or
                 bool(getattr(exc, "observed_model_event", False))
                 or reason is None
                 or initial_attempt_index + 1 >= max(1, attempts)
@@ -10337,6 +10529,8 @@ async def _run_remote_stream_with_retry(
                 attempt_index += 1
                 continue
             except RuntimeError as exc:
+                if isinstance(exc, trae_remote_client.RemoteModelNotEntitled):
+                    raise
                 reason = _runtime_retry_reason(exc)
                 if (
                     observed_model_event
@@ -10386,12 +10580,16 @@ async def _run_remote_with_retry(
     tracker: Optional[_UsageTracker] = None,
 ):
     """Retry 9router-style remote sessions on the provider's parallel limit."""
+    options = dict(options or {})
     tracker = tracker or _USAGE_TRACKER.get()
     if stream and auth.get_polling_status().get("enabled"):
         return await _run_remote_stream_with_retry(
             messages, model, options, tracker=tracker
         )
-    if auth.get_polling_status().get("enabled"):
+    if (
+        auth.get_polling_status().get("enabled")
+        and not options.get("_disable_upstream_fallback")
+    ):
         attempts = _polling_retry_limit(options)
         attempted_accounts: set[str] = set()
 
@@ -10461,6 +10659,8 @@ async def _run_remote_with_retry(
                     raise
                 continue
             except RuntimeError as exc:
+                if isinstance(exc, trae_remote_client.RemoteModelNotEntitled):
+                    raise
                 if (
                     bool(getattr(exc, "observed_model_event", False))
                     or getattr(exc, "usage", None) is not None
@@ -10497,26 +10697,28 @@ async def _run_remote_with_retry(
 
 
 def _is_native_rate_limit_error(error: Any) -> bool:
-    """Return whether a native IDE/SOLO failure is a pre-output rate limit.
+    """Return whether a native IDE/SOLO failure is a pre-output account limit.
 
-    TraeCode reports account-level throttling as business codes ``3004`` and
-    ``4011`` while some gateway variants expose it as HTTP ``429`` or a
-    human-readable rate-limit message.  Parameter errors such as ``4001`` are
-    deliberately excluded: retrying those with another account cannot repair
-    an invalid request envelope.
+    TraeCode reports account-level quota exhaustion as ``4008`` and other
+    capacity limits as ``3004``/``4011``; gateways may also expose HTTP ``429``
+    or a human-readable message. Parameter errors such as ``4001`` are
+    deliberately excluded because another account cannot repair an invalid
+    request envelope.
     """
 
-    if isinstance(error, EmptyUpstreamResponse) and (
-        not error.retryable
-        or error.observed_model_event
-        or error.usage is not None
+    if (
+        not getattr(error, "retryable", True)
+        or getattr(error, "observed_model_event", False)
+        or getattr(error, "usage", None) is not None
     ):
         return False
-    code = str(getattr(error, "code", "") or "").strip()
-    if code in {"3004", "4011", "429"}:
-        return True
-    if code == "4001":
+    if _is_native_model_not_entitled_error(error):
         return False
+    if bool(getattr(error, "account_quota_exhausted", False)):
+        return True
+    code = str(getattr(error, "code", "") or "").strip()
+    if code:
+        return code in {"3004", "4008", "4011", "429"}
     detail = str(error or "").strip().lower()
     if not detail:
         return False
@@ -10531,8 +10733,104 @@ def _is_native_rate_limit_error(error: Any) -> bool:
             "rate-limit",
             "too many requests",
             "exceeded the rate",
+            "quota exceeded",
+            "exceeded the quota",
         )
     )
+
+
+def _is_native_model_not_entitled_error(error: Any) -> bool:
+    """Keep explicit entitlement denials distinct from recoverable 1005."""
+
+    return isinstance(error, raw_client.TraeCodeModelNotEntitled) or any(
+        str(getattr(error, field, "") or "").strip().casefold()
+        == "model_not_entitled"
+        for field in ("code", "error_type")
+    )
+
+
+def _is_native_model_unknown_error(error: Any) -> bool:
+    """Return whether Trae rejected the model binding as unknown.
+
+    ``4023`` is emitted after the gateway has parsed the request envelope, so
+    replaying it through the legacy Work Lite adapter or another polling
+    account only obscures the original catalog/function mismatch.  Keep this
+    classifier separate from the account-scoped rate-limit path.
+    """
+
+    code = str(getattr(error, "code", "") or "").strip()
+    if code == "4023":
+        return True
+    detail = str(error or "").strip().lower()
+    return any(
+        marker in detail
+        for marker in (
+            "trae upstream error 4023",
+            "the model is unknown",
+            "model is unknown",
+            "model unknown",
+        )
+    )
+
+
+def _effective_traecode_function(
+    model: Any,
+    options: Optional[Mapping[str, Any]],
+) -> str:
+    """Resolve the native function for a model without changing other models.
+
+    The desktop client uses function-qualified selectors such as
+    ``solo_agent_1__kimi-k3``.  In the IDE preset K3 must remain in that
+    catalog scope; forcing it through the generic ``chat_v3`` descriptor makes
+    the gateway report ``4023 model unknown`` even when K3 is enabled.
+    """
+
+    options = options or {}
+    requested = str(model or "").strip()
+    requested_base, _max_variant = trae_client.split_max_model_name(requested)
+    scope_match = re.match(
+        r"^(solo_agent(?:_lite|_remote)?|solo_work_lite|"
+        r"solo_work_remote|solo_coder)_\d+__",
+        requested,
+        flags=re.IGNORECASE,
+    )
+    scoped_function = scope_match.group(1).lower() if scope_match else ""
+    try:
+        public_model = str(
+            trae_client.convert_model_name(requested_base) or ""
+        ).strip().casefold()
+    except Exception:
+        public_model = requested.casefold()
+    # A TraeWork custom-model envelope can carry a stale picker function
+    # (normally ``chat_v3``).  These models are advertised by the native Solo
+    # catalog and are not addressable through the generic IDE chat_v3 scope.
+    # An explicit hint must not override their verified native function.
+    solo_only_models = {
+        "kimi-k3",
+        "kimi-k3.1-pro",
+        "kimi-k3.1-pro-auto",
+        "kimi-k2.6",
+        "kimi-k2.7-code",
+        "qwen-3.7-plus",
+        "sagitta",
+        "seed-code-pro-0430",
+    }
+    if public_model in solo_only_models:
+        return (
+            "solo_agent_remote"
+            if scoped_function in {"solo_agent_remote", "solo_work_remote"}
+            else "solo_agent"
+        )
+    explicit = str(
+        options.get("_traecode_raw_chat_function")
+        or options.get("raw_chat_function")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+    if scoped_function:
+        return scoped_function
+    return "chat_v3"
 
 
 async def _run_ide_stream_with_retry(
@@ -10555,7 +10853,7 @@ async def _run_ide_stream_with_retry(
     options = dict(options or {})
     tracker = tracker or _USAGE_TRACKER.get()
     polling = auth.get_polling_status()
-    if not polling.get("enabled"):
+    if not polling.get("enabled") or options.get("_disable_upstream_fallback"):
         return await run_ide_chat(messages, model, True, options)
 
     # A rate-limit response is account-scoped.  The old hard cap of two
@@ -10641,19 +10939,25 @@ async def _run_ide_stream_with_retry(
         return False
 
     def retryable_before_output(exc: Exception, saw_output: bool) -> bool:
-        if saw_output or (
-            isinstance(exc, EmptyUpstreamResponse)
-            and (
-                not exc.retryable
-                or exc.observed_model_event
-                or exc.usage is not None
-            )
+        if (
+            isinstance(exc, raw_client.TraeCodeModelUnavailable)
+            or _is_native_model_not_entitled_error(exc)
+        ):
+            return False
+        if _is_native_model_unknown_error(exc):
+            return False
+        if (
+            saw_output
+            or not getattr(exc, "retryable", True)
+            or getattr(exc, "observed_model_event", False)
+            or getattr(exc, "usage", None) is not None
         ):
             return False
         if _is_native_rate_limit_error(exc):
             return True
         return (
             isinstance(exc, EmptyUpstreamResponse)
+            and not isinstance(exc, UpstreamEventError)
             and bool(exc.retryable)
             and not bool(exc.observed_model_event)
         )
@@ -10745,7 +11049,7 @@ async def _run_ide_with_retry(
             options,
             tracker=tracker,
         )
-    if not polling.get("enabled"):
+    if not polling.get("enabled") or options.get("_disable_upstream_fallback"):
         return await run_ide_chat(messages, model, stream, options)
 
     # Keep non-stream and stream native requests consistent.  Both paths may
@@ -10763,6 +11067,10 @@ async def _run_ide_with_retry(
             return await run_ide_chat(messages, model, stream, attempt_options)
         except Exception as exc:
             if (
+                _is_native_model_unknown_error(exc)
+                or
+                _is_native_model_not_entitled_error(exc)
+                or
                 not _is_native_rate_limit_error(exc)
                 or attempt_index + 1 >= attempts
             ):
@@ -12008,7 +12316,14 @@ def _multimodal_catalog_scope(
         return agent, agent
     if endpoint == "solo":
         return "", "solo_agent"
-    if endpoint in {"ide", "raw"}:
+    if endpoint == "ide":
+        return "", _effective_traecode_function(
+            options.get("_requested_model")
+            or options.get("model")
+            or "",
+            options,
+        )
+    if endpoint == "raw":
         return "", "chat_v3"
     return "", ""
 
@@ -12385,6 +12700,23 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         # and JWT identity binding are preserved. Older custom-model calls do
         # not set this marker and retain the Remote compatibility default.
         if options.get("_traecode_raw_chat_function"):
+            # Native Work/Code requests can retain a stale picker function from
+            # an earlier model. Normalize it before this early branch bypasses
+            # the regular IDE/Solo function selection below.
+            options["_traecode_raw_chat_function"] = (
+                _effective_traecode_function(model, options)
+            )
+            # The shared raw-v2 ingress can carry caller-owned OpenAI tools.
+            # The legacy serializer used by this early branch drops the tool
+            # catalogue and tool history, so enable TraeCode's native message
+            # contract before run_ide_chat selects the transport.
+            if _tool_protocol_requested(options, messages):
+                options.setdefault("_traecode_native_tools", True)
+                # Caller tools use the native raw-v2 DTO. The legacy
+                # llm_utils_chat adapter does not preserve the complete native
+                # message/tool contract and must never pre-empt Raw for this
+                # ingress.
+                options.pop("_prefer_legacy_tools", None)
             if isinstance(trace, dict):
                 trace.update(
                     product="trae",
@@ -12399,7 +12731,14 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 model,
                 str(options.get("_traecode_raw_chat_function") or ""),
             )
-            return await run_ide_chat(messages, model, stream, options)
+            try:
+                return await _run_ide_with_retry(
+                    messages, model, stream, options, tracker=active_tracker
+                )
+            except raw_client.TraeCodeModelUnavailable as exc:
+                return _openai_error(
+                    403, str(exc), "model_not_available_in_scope", "model"
+                )
         custom_mode = str(
             options.get("_traework_upstream_mode")
             or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
@@ -12420,7 +12759,14 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 str(options.get("_relay_request_id") or ""),
                 model,
             )
-            return await run_raw_chat(messages, model, stream, options)
+            # This ingress explicitly selected the legacy six-field Raw
+            # diagnostic route. A StreamingResponse's body error is observed
+            # by `_deferred_dispatch_stream`, which cannot tell that a generic
+            # Remote fallback would re-enter this same custom-mode branch. Keep
+            # the original upstream diagnostic instead of replaying the turn.
+            raw_options = dict(options)
+            raw_options["_disable_cross_transport_fallback"] = True
+            return await run_raw_chat(messages, model, stream, raw_options)
         if custom_mode in {"remote", "web"}:
             logger.info(
                 "dispatch TraeWork custom-model ingress id=%s mode=%s model=%s",
@@ -12532,6 +12878,16 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     )
     if fallback_enabled and active_mode in ("raw", "direct"):
         modes.append("ide")
+    if (
+        tool_protocol_requested
+        and not bool(options.get("_enterprise_mode"))
+        and active_mode == "auto"
+    ):
+        # Caller-owned tools belong to the native Raw-v2 contract. Starting
+        # on legacy llm_utils_chat can parse the request yet silently drop or
+        # reject the tool catalogue. Keep Remote out of this first choice as
+        # well, because it owns server-side tools rather than the caller's.
+        modes = ["ide"]
     if (
         remote_fallback_allowed
         and active_mode in fallback_modes
@@ -12707,7 +13063,9 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     "/api/agent/v3/llm_utils_chat"
                 )
                 mode_options["_traecode_raw_chat_function"] = (
-                    "solo_agent" if mode == "solo" else "chat_v3"
+                    "solo_agent"
+                    if mode == "solo"
+                    else _effective_traecode_function(mode_model, mode_options)
                 )
                 # Caller-owned tools must use TraeCode's native tool-aware
                 # message/body contract.  Keep an explicit caller override
@@ -12715,6 +13073,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 # tools through instead of degrading to the legacy serializer.
                 if tool_protocol_requested:
                     mode_options.setdefault("_traecode_native_tools", True)
+                    mode_options.pop("_prefer_legacy_tools", None)
                 if isinstance(trace, dict):
                     trace["product"] = "trae"
             result = await _run_ide_with_retry(
@@ -12738,6 +13097,31 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
+            if isinstance(e, raw_client.TraeCodeModelUnavailable):
+                return _openai_error(
+                    403,
+                    str(e),
+                    "model_not_available_in_scope",
+                    "model",
+                )
+            if _is_native_model_not_entitled_error(e):
+                return _openai_error(
+                    403,
+                    "This model is not included in the bound account's "
+                    "Trae entitlement.",
+                    "model_not_entitled",
+                    "model",
+                )
+            if _is_native_model_unknown_error(e):
+                # Do not rotate accounts or other executors for a
+                # deterministic model/function rejection. Preserve the
+                # original upstream code and the exact native endpoint.
+                return _openai_error(
+                    502,
+                    str(e) or "Trae upstream model binding is unknown",
+                    "upstream_model_unknown",
+                    "model",
+                )
             # ``work-agent`` is the public endpoint identity while ``work``
             # is the internal dispatch branch. Keep the public label in
             # diagnostics so a failed Work request is not misreported as a
@@ -12774,6 +13158,14 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 )
             if isinstance(e, _ModelAccountUnavailable):
                 return _openai_error(503, str(e), "model_account_unavailable")
+            if isinstance(e, trae_remote_client.RemoteModelNotEntitled):
+                return _openai_error(
+                    403,
+                    "This model is not included in the bound account's "
+                    "Trae entitlement.",
+                    "model_not_entitled",
+                    "model",
+                )
             if isinstance(e, EmptyUpstreamResponse):
                 _track_usage_from_exception(e, model)
                 if not e.retryable or e.observed_model_event:
@@ -12843,6 +13235,7 @@ async def _handle_traework_custom(
         _normalize_chat_messages(descriptor.messages)
     )
     options = dict(descriptor.options)
+    options = _apply_fallback_option(options, options)
     options = _apply_tool_header_hints(req, options)
     options = _with_auto_client_context(req, body, messages, options)
     options = _bind_chat_session(
@@ -12978,6 +13371,7 @@ async def handle_chat(req: Request):
         if key in body
     }
     options.update(options_from_response)
+    options = _apply_fallback_option(options, options)
     options = _apply_tool_header_hints(req, options)
     requested_session_id = _request_session_hint(req, body)
     if requested_session_id and not options.get("session_id") and not options.get("sessionId"):
@@ -13056,6 +13450,7 @@ async def handle_responses(req: Request):
         return _openai_error(
             400, str(exc), "invalid_request_error", exc.param
         )
+    options = _apply_fallback_option(options, body)
 
     messages = cli_client.sanitize_assistant_history_messages(messages)
 
@@ -13170,6 +13565,7 @@ async def handle_anthropic_messages(req: Request):
                 "error": {"type": "invalid_request_error", "message": str(exc)},
             },
         )
+    options = _apply_fallback_option(options, body)
 
     messages = cli_client.sanitize_assistant_history_messages(messages)
     model = str(body.get("model") or "auto")
@@ -14051,6 +14447,7 @@ async def api_model_test(req: Request):
 
     started = time.monotonic()
     try:
+        options = _bind_chat_session(messages, options)
         result = await asyncio.wait_for(
             _dispatch_chat(messages, model, False, options),
             timeout=timeout,
@@ -14079,6 +14476,8 @@ async def api_model_test(req: Request):
                 "error": str(exc)[:400],
             }
         )
+    finally:
+        _cancel_unclaimed_account_slot(options)
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     payload: dict[str, Any] = {}

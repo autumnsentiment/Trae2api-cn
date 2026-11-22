@@ -284,7 +284,9 @@ curl -X POST http://127.0.0.1:8000/api/accounts/model-enabled \
 
 客户端收到 assistant 的 `tool_calls` 后，在自己的终端执行工具，再把原 assistant 消息和 `role: "tool"`、匹配的 `tool_call_id`（建议同时带 `name`）及执行结果一起发起下一轮请求。relay 本身不会执行请求中声明的外部工具，也不会自动拥有调用方文件系统；`client_context` 只是告诉模型真实环境，不能替代客户端工具实现。
 
-IDE Agent 使用原生工具协议：schema 放入上游 `tools`，`parameters` 按 SOLO 协议编码为 JSON 字符串；历史中的 `assistant.tool_calls`、调用 ID、`role: "tool"` 和 `tool_call_id` 保持关联。Remote / Work Agent 与 Raw 使用文本工具桥接，不代表上游原生支持 OpenAI `tools`。2026-10-03 的独立 IDE 实测中，`glm-5.3` 的流式和非流式两轮调用均完成 Windows 客户端本地读文件、结果回传及内容校验，实际 provider 为 `glm-5.3`，未启用回落。
+IDE Agent / Solo 使用原生工具协议：schema 放入上游 `tools`，`parameters` 编码为一次 JSON 字符串；Chat Completions、Responses 和 Messages 入口接受对象或合法的 JSON 对象字符串，非法 schema 在发送前报错，不会被替换成空对象。上游不发送 `function.strict` 和未确认支持的 `parallel_tool_calls`，但保留 schema 内的约束，调用方的并行策略仍由 relay 翻译层执行。历史中的 `assistant.tool_calls`、调用 ID、`role: "tool"` 和 `tool_call_id` 保持关联。Remote / Work Agent 与企业 Raw 使用文本工具桥接，不代表上游原生支持 OpenAI `tools`。
+
+Raw-v2 的 `4001` / 普通 `1005` 兼容拒绝，仅在没有模型输出、工具事件或 usage 时，才允许切换到同一账号、模型及 `chat_v3` / `solo_agent` 作用域的 `llm_utils_chat`；空流恢复也遵守此条件。`4023`、明确的 `model_not_entitled` 和未知业务错误不走该回落。`3004` / `4011` / `429` 不在同一账号反复尝试端点，仅在没有输出或 usage 且允许轮询时尝试其他账号。`disable_fallback: true` 可用于固定首个原生端点和账号的诊断，正常请求无需设置。
 
 第二轮请求需带回完整历史，例如：
 
@@ -330,7 +332,7 @@ IDE Agent 使用原生工具协议：schema 放入上游 `tools`，`parameters` 
 
 `remote` 模式复用了 9router Trae executor 的两步会话协议：先 `POST /chat_sessions` 创建回合，再 `GET /chat_sessions/{id}/events?reply_to_message_id=...` 读取 SSE。`plan_item.thought` 按累计快照计算增量，`token_usage`、`done` 和 `error` 会转换为现有 OpenAI Chat/Responses 输出。它只复用 9router 的转发逻辑，不切换到国际版；默认仍使用当前 CN remote 地址。
 
-`solo` 和 `ide` 模式都调用 TraeCode 的 `/api/ide/v2/llm_raw_chat`（失败回退 `/api/ide/v1/llm_raw_chat`），使用 `config_name`、`model_name`、`raw_chat_function`、`config_source`、结构化 `messages` 和 Cloud-IDE-JWT 请求头。`solo` 使用 `raw_chat_function=solo_agent`，`ide` 使用 `chat_v3`；两者共用账号绑定、SSE 心跳、消费记录和 Responses 会话缓存。旧 `llm_utils_chat` 仅保留给内部辅助/兼容调用。
+`solo` 和 `ide` 模式都优先调用 TraeCode 的 `/api/ide/v2/llm_raw_chat`，在允许兼容恢复时尝试 v1 或同作用域的 `llm_utils_chat`。请求体使用 `config_name`、`model_name`、`config_source` 和结构化 `messages`，函数作用域由 `X-Ide-Function` 请求头传递，不添加顶层 `raw_chat_function`。`solo` 使用 `solo_agent`，`ide` 默认使用 `chat_v3`；Kimi K3 / K3.1 Pro 保持其目录要求的 Solo 作用域。两者共用账号绑定、SSE 心跳、消费记录和 Responses 会话缓存，模型目录中存在配置并不代表账号具备该模型的调用权益。
 
 `work`（旧兼容名 `work-agent`）走 Remote `chat_sessions`，但在模型配置解析、会话 `agent_type` 和 `agent_id` 中都固定为 `solo_work_remote`，避免账号默认 provider 接管模型。Work 失败时会清除 Work 标记，再以普通 Agent 身份回落 Remote，不会表面回落、实际仍请求 Work。请求记录仍标识为 TraeWork；TraeCode 的 `solo`/`ide` 使用独立 raw v2 链路。
 

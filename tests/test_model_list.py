@@ -168,6 +168,45 @@ class ModelListTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("glm-5.3-flash", ids)
         self.assertIn("glm-5.3", ids)
 
+    async def test_live_max_profile_exposes_capabilities_and_max_variant(self):
+        async def fetch(**kwargs):
+            return {
+                "GLM-5.2": {
+                    "name": "GLM-5.2",
+                    "display_name": "GLM-5.2",
+                    "_trae_endpoints": ["remote"],
+                    "_trae_agent_type": "solo_agent_remote",
+                    "multimodal": False,
+                    "context_window_tokens": {"dev": 200000, "max": 1048576},
+                    "model_detail_list": [
+                        {"model_name": "glm-5.2__dev", "max_tokens": 32000},
+                        {"model_name": "glm-5.2__max", "max_tokens": 64000},
+                    ],
+                    "reasoning_effort_config": {
+                        "support_thinking": True,
+                        "options": ["low", "high"],
+                    },
+                }
+            }
+
+        p1, p2, p3, p4, p5 = self._patches(fetch)
+        with p1, p2, p3, p4, p5:
+            items = await trae_client.get_models(force=True)
+
+        base = next(item for item in items if item["id"] == "GLM-5.2")
+        max_item = next(item for item in items if item["id"] == "GLM-5.2-max")
+        alias = next(item for item in items if item["id"] == "glm-5.2-max")
+        self.assertEqual(base["limit"], {"context": 200000, "output": 32000})
+        self.assertEqual(base["capabilities"]["attachment"], False)
+        self.assertEqual(
+            base["capabilities"]["reasoning_effort"], ["light", "high"]
+        )
+        self.assertEqual(max_item["variant_of"], "GLM-5.2")
+        self.assertEqual(max_item["limit"], {"context": 1048576, "output": 64000})
+        self.assertEqual(max_item["max_prompt"], 984576)
+        self.assertEqual(max_item["endpoint"], "remote")
+        self.assertEqual(alias["alias_for"], "GLM-5.2-max")
+
     async def test_shared_model_merges_remote_work_and_traecode_groups(self):
         async def fetch(**kwargs):
             return {

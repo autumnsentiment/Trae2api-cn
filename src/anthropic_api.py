@@ -293,14 +293,16 @@ def normalize_request(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], di
             name = str(tool.get("name") or "")
             if not name:
                 continue
+            parameters = tool.get("input_schema")
             converted.append(
                 {
                     "type": "function",
                     "function": {
                         "name": name,
                         "description": str(tool.get("description") or ""),
-                        "parameters": tool.get("input_schema")
-                        or {"type": "object", "properties": {}},
+                        "parameters": parameters
+                        if parameters is not None
+                        else {"type": "object", "properties": {}},
                     },
                 }
             )

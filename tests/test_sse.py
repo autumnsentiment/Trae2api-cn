@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from src import sse
+from src import auth, sse
 from src.cli_client import CliEvent
 
 
@@ -1572,6 +1572,155 @@ class CollectNonstreamCliTests(unittest.TestCase):
 
 
 class CollectNonstreamIdeTests(unittest.TestCase):
+    def test_repeated_completed_call_with_reasoning_is_not_a_final_answer(self):
+        for include_reasoning in (False, True):
+            with self.subTest(include_reasoning=include_reasoning):
+                response = _LineResponse(
+                    [
+                        "event: output",
+                        "data: " + json.dumps(
+                            {
+                                "reasoning_content": "I should call the probe.",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-new-id",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "relay_probe",
+                                            "arguments": '{"token":"pong"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        ),
+                        "event: done",
+                        "data: " + json.dumps(
+                            {
+                                "finish_reason": "tool_calls",
+                                "usage": {
+                                    "input_tokens": 302,
+                                    "output_tokens": 74,
+                                    "total_tokens": 376,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                with self.assertRaises(
+                    sse.RepeatedCompletedToolResponse
+                ) as raised:
+                    asyncio.run(
+                        sse.collect_nonstream_ide(
+                            response,
+                            "m",
+                            tool_choice="auto",
+                            include_reasoning=include_reasoning,
+                            fail_on_empty=True,
+                            completed_tool_signatures={
+                                'relay_probe\x00{"token":"pong"}'
+                            },
+                        )
+                    )
+
+                self.assertFalse(raised.exception.retryable)
+                self.assertTrue(raised.exception.observed_model_event)
+                self.assertEqual(
+                    raised.exception.usage,
+                    {
+                        "prompt_tokens": 302,
+                        "completion_tokens": 74,
+                        "total_tokens": 376,
+                    },
+                )
+
+    def test_repeated_completed_call_with_final_answer_remains_successful(self):
+        for include_reasoning in (False, True):
+            with self.subTest(include_reasoning=include_reasoning):
+                response = _LineResponse(
+                    [
+                        "event: output",
+                        "data: " + json.dumps(
+                            {
+                                "response": "The probe completed successfully.",
+                                "reasoning_content": "The result is available.",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-new-id",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "relay_probe",
+                                            "arguments": '{"token":"pong"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        ),
+                        "event: done",
+                        'data: {"finish_reason":"stop"}',
+                    ]
+                )
+                result = asyncio.run(
+                    sse.collect_nonstream_ide(
+                        response,
+                        "m",
+                        tool_choice="auto",
+                        include_reasoning=include_reasoning,
+                        fail_on_empty=True,
+                        completed_tool_signatures={
+                            'relay_probe\x00{"token":"pong"}'
+                        },
+                    )
+                )
+
+                choice = result["choices"][0]
+                self.assertEqual(choice["finish_reason"], "stop")
+                self.assertEqual(
+                    choice["message"]["content"],
+                    "The probe completed successfully.",
+                )
+                self.assertNotIn("tool_calls", choice["message"])
+
+    def test_repeated_completed_call_does_not_hide_new_tool_call(self):
+        response = _LineResponse(
+            [
+                "event: output",
+                "data: " + json.dumps(
+                    {
+                        "reasoning_content": "A different probe is needed.",
+                        "tool_calls": [
+                            {
+                                "id": f"call-{token}",
+                                "type": "function",
+                                "function": {
+                                    "name": "relay_probe",
+                                    "arguments": json.dumps({"token": token}),
+                                },
+                            }
+                            for token in ("pong", "fresh")
+                        ],
+                    }
+                ),
+                "event: done",
+                'data: {"finish_reason":"tool_calls"}',
+            ]
+        )
+        result = asyncio.run(
+            sse.collect_nonstream_ide(
+                response,
+                "m",
+                tool_choice="auto",
+                include_reasoning=True,
+                fail_on_empty=True,
+                completed_tool_signatures={'relay_probe\x00{"token":"pong"}'},
+            )
+        )
+
+        choice = result["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"token": "fresh"})
+
     def test_usage_turn_id_variants_are_captured_privately(self):
         cases = [
             (
@@ -2145,32 +2294,37 @@ class WebEventTests(unittest.TestCase):
             }
             yield "done", {}
 
-        chunks = asyncio.run(
-            _collect(sse.translate_web_events(events(), "m", include_reasoning=True))
-        )
-        parsed, done = _parse_chunks(chunks)
-        content = "".join(
-            choice.get("delta", {}).get("content", "")
-            for event in parsed
-            for choice in event.get("choices", [])
-        )
-        reasoning = "".join(
-            choice.get("delta", {}).get("reasoning_content", "")
-            for event in parsed
-            for choice in event.get("choices", [])
-        )
-        self.assertTrue(done)
-        self.assertEqual(content, "final answer")
-        self.assertTrue(reasoning)
-        self.assertLessEqual(len(reasoning), 800)
-        self.assertLessEqual(len(reasoning.splitlines()), 6)
+        with patch.object(
+            auth,
+            "get_reasoning_output_settings",
+            return_value={"enabled": False, "source": "test"},
+        ):
+            chunks = asyncio.run(
+                _collect(sse.translate_web_events(events(), "m", include_reasoning=True))
+            )
+            parsed, done = _parse_chunks(chunks)
+            content = "".join(
+                choice.get("delta", {}).get("content", "")
+                for event in parsed
+                for choice in event.get("choices", [])
+            )
+            reasoning = "".join(
+                choice.get("delta", {}).get("reasoning_content", "")
+                for event in parsed
+                for choice in event.get("choices", [])
+            )
+            self.assertTrue(done)
+            self.assertEqual(content, "final answer")
+            self.assertTrue(reasoning)
+            self.assertLessEqual(len(reasoning), 800)
+            self.assertLessEqual(len(reasoning.splitlines()), 6)
 
-        result = asyncio.run(
-            sse.collect_nonstream_web(events(), "m", include_reasoning=True)
-        )
-        message = result["choices"][0]["message"]
-        self.assertEqual(message["content"], "final answer")
-        self.assertEqual(message["reasoning_content"], reasoning)
+            result = asyncio.run(
+                sse.collect_nonstream_web(events(), "m", include_reasoning=True)
+            )
+            message = result["choices"][0]["message"]
+            self.assertEqual(message["content"], "final answer")
+            self.assertEqual(message["reasoning_content"], reasoning)
 
     def test_web_thinking_is_not_exposed_by_default(self):
         async def events():
@@ -2254,20 +2408,25 @@ class WebEventTests(unittest.TestCase):
             }
             yield "done", {}
 
-        chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
-        parsed, _ = _parse_chunks(chunks)
-        streamed = "".join(
-            choice.get("delta", {}).get("content", "")
-            for event in parsed
-            for choice in event.get("choices", [])
-        )
-        self.assertEqual(streamed, "1, 2, 3")
-        self.assertNotIn("The user wants", streamed)
+        with patch.object(
+            auth,
+            "get_reasoning_output_settings",
+            return_value={"enabled": False, "source": "test"},
+        ):
+            chunks = asyncio.run(_collect(sse.translate_web_events(events(), "m")))
+            parsed, _ = _parse_chunks(chunks)
+            streamed = "".join(
+                choice.get("delta", {}).get("content", "")
+                for event in parsed
+                for choice in event.get("choices", [])
+            )
+            self.assertEqual(streamed, "1, 2, 3")
+            self.assertNotIn("The user wants", streamed)
 
-        result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
-        self.assertNotIn(
-            "The user wants", result["choices"][0]["message"]["content"]
-        )
+            result = asyncio.run(sse.collect_nonstream_web(events(), "m"))
+            self.assertNotIn(
+                "The user wants", result["choices"][0]["message"]["content"]
+            )
 
     def test_finish_plan_item_is_summary_not_tool_call(self):
         async def events():

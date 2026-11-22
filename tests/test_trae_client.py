@@ -176,6 +176,57 @@ class LegacyReasoningEffortTests(unittest.TestCase):
             self.assertNotIn("reasoning_effort_level", body)
         self.assertNotIn("reasoning_effort_applied", trace)
 
+    def test_legacy_request_uses_catalog_provider_id_for_native_tools(self):
+        descriptor = {
+            "config_name": "kimi-k3",
+            "model_name": "kimi-k3__dev",
+            "raw_chat_function": "solo_agent",
+        }
+        options = {
+            "_traecode_model_descriptor": descriptor,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        }
+
+        body = trae_client.build_llm_chat_body(
+            [{"role": "user", "content": "read a file"}],
+            "kimi-k3",
+            True,
+            options=options,
+        )
+        _, ide_body = asyncio.run(
+            trae_client.build_trae_ide_request(
+                [{"role": "user", "content": "read a file"}],
+                "kimi-k3",
+                options=options,
+            )
+        )
+
+        self.assertEqual(body["config_name"], "kimi-k3")
+        self.assertEqual(body["model"], "kimi-k3__dev")
+        self.assertEqual(body["model_name"], "kimi-k3__dev")
+        self.assertEqual(body["function"], "solo_agent")
+        self.assertNotEqual(body["model"], "kimi-k3")
+        self.assertEqual(ide_body["model_name"], "kimi-k3__dev")
+
+    def test_function_qualified_kimi_selector_strips_ui_prefix_and_index(self):
+        for selector in (
+            "solo_agent_1__kimi-k3",
+            "solo_agent_remote_1__kimi-k3",
+            "solo_work_lite_1__kimi-k3",
+        ):
+            with self.subTest(selector=selector):
+                self.assertEqual(
+                    trae_client.convert_model_name(selector), "kimi-k3"
+                )
+
 
 class ModelRequestParallelLimitTests(unittest.TestCase):
     def test_default_capacity_is_four(self):
@@ -423,6 +474,59 @@ class CheckinDeviceTests(unittest.TestCase):
 
 
 class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_empty_native_catalog_is_cached_with_status(self):
+        fetch = AsyncMock(
+            return_value=trae_client._ModelCatalog(fetch_succeeded=True)
+        )
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_solo_model_configs", new=fetch),
+        ):
+            first = await trae_client._cached_model_catalog(
+                "solo", "token-empty", provider_specific={},
+                raw_chat_function="chat_v3",
+            )
+            self.assertEqual(first, {})
+            self.assertTrue(first.fetch_succeeded)
+            first.fetch_succeeded = False
+            second = await trae_client._cached_model_catalog(
+                "solo", "token-empty", provider_specific={},
+                raw_chat_function="chat_v3",
+            )
+
+        self.assertEqual(second, {})
+        self.assertTrue(second.fetch_succeeded)
+        fetch.assert_awaited_once()
+
+    async def test_unsuccessful_native_catalog_is_not_cached_as_empty_scope(self):
+        fetch = AsyncMock(
+            side_effect=[
+                trae_client._ModelCatalog(fetch_succeeded=False),
+                trae_client._ModelCatalog(
+                    {"model": {"config_name": "model"}},
+                    fetch_succeeded=True,
+                ),
+            ]
+        )
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_fetch_solo_model_configs", new=fetch),
+        ):
+            first = await trae_client._cached_model_catalog(
+                "solo", "token-failed", provider_specific={},
+                raw_chat_function="chat_v3",
+            )
+            second = await trae_client._cached_model_catalog(
+                "solo", "token-failed", provider_specific={},
+                raw_chat_function="chat_v3",
+            )
+
+        self.assertFalse(first.fetch_succeeded)
+        self.assertIn("model", second)
+        self.assertEqual(fetch.await_count, 2)
+
     async def test_catalog_cache_isolates_gateway_and_provider_context(self):
         fetch = AsyncMock(side_effect=[
             {"model": {"config_name": name}}
@@ -1120,20 +1224,27 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
     def test_response_style_directive_reaches_plain_and_tool_requests(self):
         """The remote agent returns reasoning as the answer without this."""
 
-        plain = trae_client._messages_with_client_runtime(
-            [{"role": "user", "content": "why is TCP slower than UDP?"}], {}
-        )
-        self.assertEqual(plain[0]["role"], "system")
-        directive = raw_client.response_style_instruction()
-        self.assertTrue(directive)
-        self.assertIn(directive, plain[0]["content"])
-        self.assertIn("only the final answer", plain[0]["content"])
-        self.assertIn("only the final answer", trae_client.flatten_query(plain))
-
-        with_tools = trae_client._messages_with_client_runtime(
-            [{"role": "user", "content": "read the readme"}],
-            {"tools": TOOLS},
-        )
+        with (
+            patch.dict(os.environ, {"TRAE_VERBOSE_REASONING": "0"}, clear=False),
+            patch.object(
+                raw_client.auth,
+                "get_reasoning_output_settings",
+                return_value={"enabled": False, "source": "test"},
+            ),
+        ):
+            plain = trae_client._messages_with_client_runtime(
+                [{"role": "user", "content": "why is TCP slower than UDP?"}], {}
+            )
+            directive = raw_client.response_style_instruction()
+            self.assertEqual(plain[0]["role"], "system")
+            self.assertTrue(directive)
+            self.assertIn(directive, plain[0]["content"])
+            self.assertIn("only the final answer", plain[0]["content"])
+            self.assertIn("only the final answer", trae_client.flatten_query(plain))
+            with_tools = trae_client._messages_with_client_runtime(
+                [{"role": "user", "content": "read the readme"}],
+                {"tools": TOOLS},
+            )
         self.assertEqual(with_tools[0]["role"], "system")
         self.assertIn(directive, with_tools[0]["content"])
         # The tool runtime description must survive alongside the directive.
@@ -1269,6 +1380,77 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
 
 
 class IdeRequestContextTests(unittest.TestCase):
+    def test_legacy_transport_connection_failure_retries_once_before_request(self):
+        attempts = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                pass
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+
+            def build_request(self, *args, **kwargs):
+                return (args, kwargs)
+
+            def send(self, request, stream=True):
+                attempts.append(request)
+                if len(attempts) == 1:
+                    raise httpx.ConnectError(
+                        "SSL: UNEXPECTED_EOF_WHILE_READING",
+                        request=httpx.Request("POST", "https://example.test"),
+                    )
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        import httpx
+
+        with (
+            patch.object(trae_client, "_WEB_SLOTS", {}),
+            patch.object(trae_client, "_WEB_PARALLEL_LIMIT", 1),
+            patch(
+                "src.trae_client.auth.get_account_record",
+                return_value={"user_id": "acct"},
+            ),
+            patch(
+                "src.trae_client.auth.get_auth",
+                return_value=SimpleNamespace(host="https://example.test"),
+            ),
+            patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch.object(
+                trae_client,
+                "_resolve_request_model_name",
+                new=AsyncMock(side_effect=lambda model, **kwargs: model),
+            ),
+            patch.object(
+                trae_client,
+                "resolve_traecode_model_config",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            response = asyncio.run(
+                trae_client.send_chat_request(
+                    [{"role": "user", "content": "hello"}],
+                    "auto",
+                    True,
+                    {
+                        "_account_id": "acct",
+                        "_auth_token": "bound-token",
+                        "_ide_endpoint": "/api/agent/v3/llm_utils_chat",
+                    },
+                )
+            )
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(response.response.status_code, 200)
+        response.close()
+
     def test_legacy_ide_response_holds_shared_slot_until_close(self):
         class FakeResponse:
             status_code = 200
@@ -1719,6 +1901,104 @@ class IdeRequestContextTests(unittest.TestCase):
         self.assertEqual(body["session_id"], "caller-session")
         self.assertEqual(body["request_id"], "caller-session")
 
+    def test_kimi_k3_tool_request_sends_catalog_provider_id_to_native_ide(self):
+        """The first native attempt must never send the public model label."""
+
+        requests = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                pass
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+
+            def build_request(self, method, url, **kwargs):
+                requests.append((url, kwargs["json"]))
+                return object()
+
+            def send(self, request, stream=True):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        catalog = {
+            "kimi-k3": {
+                "name": "kimi-k3",
+                "config_name": "kimi-k3",
+                "display_name": "Kimi-K3",
+                "config_source": 1,
+                "model_detail_list": [
+                    {"model_name": "kimi-k3__dev"},
+                ],
+            }
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"filePath": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        messages = [
+            {"role": "user", "content": "Read README.md"},
+        ]
+        with (
+            patch.object(trae_client, "_WEB_SLOTS", {}),
+            patch.object(trae_client, "_MODEL_CATALOG_INFLIGHT", {}),
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(
+                trae_client,
+                "_fetch_solo_model_configs",
+                new=AsyncMock(return_value=catalog),
+            ),
+            patch(
+                "src.trae_client.auth.get_account_record",
+                return_value={},
+            ),
+            patch(
+                "src.trae_client.auth.get_auth",
+                return_value=SimpleNamespace(host="https://example.test"),
+            ),
+            patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch(
+                "src.trae_client._resolve_request_model_name",
+                new=AsyncMock(return_value="kimi-k3"),
+            ),
+        ):
+            response = asyncio.run(
+                trae_client.send_chat_request(
+                    messages,
+                    "solo_agent_1__kimi-k3",
+                    False,
+                    {
+                        "_account_id": "account-k3",
+                        "_auth_token": "bound-token",
+                        "tools": tools,
+                        "tool_choice": "auto",
+                    },
+                )
+            )
+            response.close()
+
+        self.assertEqual(len(requests), 1)
+        url, body = requests[0]
+        self.assertTrue(url.endswith("/api/ide/v1/chat"))
+        self.assertEqual(body["model_name"], "kimi-k3__dev")
+        self.assertNotEqual(body["model_name"], "kimi-k3")
+        self.assertEqual(body["provider"], "")
+        self.assertEqual(body["intent_name"], "general_qa_intent")
+
     def test_uses_caller_workspace_and_terminal_context(self):
         _, request = asyncio.run(
             trae_client.build_trae_ide_request(
@@ -1859,7 +2139,7 @@ class IdeRequestContextTests(unittest.TestCase):
 
         self.assertEqual(body["function"], "solo_work_lite")
         self.assertEqual(body["tool_choice"], "read_file")
-        self.assertFalse(body["parallel_tool_calls"])
+        self.assertNotIn("parallel_tool_calls", body)
         schema = body["tools"][0]["function"]["parameters"]
         self.assertIsInstance(schema, str)
         self.assertEqual(json.loads(schema)["required"], ["path"])
@@ -2243,6 +2523,44 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_catalog_distinguishes_empty_success_from_fetch_failure(self):
+        cases = (
+            ({"config_info_list": []}, 200, True),
+            ({"data": {"config_info_list": []}}, 200, True),
+            ({}, 200, False),
+            ([], 200, False),
+            ({"config_info_list": []}, 503, False),
+            (TimeoutError("catalog timed out"), None, False),
+        )
+        for payload, status, succeeded in cases:
+            with self.subTest(payload=payload, status=status):
+                client = AsyncMock()
+                client.__aenter__.return_value = client
+                if isinstance(payload, Exception):
+                    client.post.side_effect = payload
+                else:
+                    client.post.return_value = SimpleNamespace(
+                        status_code=status,
+                        json=lambda: payload,
+                    )
+                with (
+                    patch.object(
+                        trae_client.httpx, "AsyncClient", return_value=client
+                    ),
+                    patch.object(trae_client, "build_headers", return_value={}),
+                    patch.object(
+                        trae_client, "_model_gateway_base",
+                        return_value="https://gateway.example",
+                    ),
+                ):
+                    result = await trae_client._fetch_solo_model_configs(
+                        token_override="token-empty",
+                        raw_chat_function="chat_v3",
+                    )
+
+                self.assertEqual(result, {})
+                self.assertEqual(result.fetch_succeeded, succeeded)
+
     async def test_native_solo_catalog_parses_flash_and_filters_routing_profiles(self):
         calls = {}
 
@@ -2368,6 +2686,77 @@ class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dev["raw_model_name"], "glm-5.2__dev")
         self.assertEqual(max_cfg["raw_model_name"], "glm-5.2__max")
         self.assertEqual(seen_functions, ["solo_work_lite", "chat_v3"])
+
+    async def test_solo_agent_resolves_kimi_k31_to_auto_config(self):
+        # Keep each catalog test in its own synthetic account scope. The cache
+        # is process-wide by design, so reusing user-x here would let the K3
+        # test above supply its catalog to this lookup when the class runs as
+        # a suite.
+        async def fake_fetch(
+            *,
+            token_override="",
+            provider_specific=None,
+            user_id_override="",
+            raw_chat_function="",
+        ):
+            return {
+                "kimi-k3.1-pro": {
+                    "name": "kimi-k3.1-pro",
+                    "config_name": "kimi-k3.1-pro",
+                    "display_name": "Kimi-K3.1-Pro",
+                    "config_source": 1,
+                    "model_detail_list": [
+                        {"model_name": "kimi-k3.1-pro__dev"},
+                        {"model_name": "kimi-k3.1-pro__max"},
+                    ],
+                }
+            }
+
+        with patch.object(trae_client, "_fetch_solo_model_configs", fake_fetch):
+            config = await trae_client.resolve_traecode_model_config(
+                "kimi-k3.1-pro",
+                token_override="token-k31",
+                user_id_override="user-k31",
+                raw_chat_function="solo_agent",
+            )
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config["config_name"], "kimi-k3.1-pro-auto")
+        self.assertEqual(config["raw_model_name"], "kimi-k3.1-pro__dev")
+
+    async def test_kimi_k3_function_qualified_selector_resolves_catalog_entry(self):
+        async def fake_fetch(
+            *,
+            token_override="",
+            provider_specific=None,
+            user_id_override="",
+            raw_chat_function="",
+        ):
+            self.assertEqual(raw_chat_function, "solo_agent")
+            return {
+                "kimi-k3": {
+                    "name": "kimi-k3",
+                    "config_name": "kimi-k3",
+                    "display_name": "Kimi-K3",
+                    "config_source": 1,
+                    "model_detail_list": [
+                        {"model_name": "kimi-k3__dev"},
+                    ],
+                }
+            }
+
+        with patch.object(trae_client, "_fetch_solo_model_configs", fake_fetch):
+            config = await trae_client.resolve_traecode_model_config(
+                "solo_agent_1__kimi-k3",
+                token_override="token-k3",
+                user_id_override="user-k3",
+                raw_chat_function="solo_agent",
+            )
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config["config_name"], "kimi-k3")
+        self.assertEqual(config["raw_model_name"], "kimi-k3__dev")
+        self.assertEqual(config["raw_chat_function"], "solo_agent")
 
     async def test_model_cache_is_partitioned_by_tier_and_raw_function(self):
         fetch = AsyncMock(

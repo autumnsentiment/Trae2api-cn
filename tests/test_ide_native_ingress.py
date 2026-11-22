@@ -101,6 +101,29 @@ class IdeNativeIngressTests(unittest.TestCase):
         self.stack.enter_context(
             patch.object(main.auth, "get_polling_status", return_value={"enabled": False})
         )
+        # Exercise the same account-bound ingress a real API request uses.
+        # The transport below is still fully mocked, so this is a synthetic
+        # credential and never reaches the network.
+        self.stack.enter_context(
+            patch.object(
+                main.auth,
+                "get_active_account_snapshot",
+                return_value=("account-test", {"token": "synthetic-jwt"}),
+            )
+        )
+        self.stack.enter_context(
+            patch.object(
+                main.auth,
+                "get_model_account_snapshot",
+                return_value=("account-test", {"token": "synthetic-jwt"}),
+            )
+        )
+        self.stack.enter_context(
+            patch.object(main.auth, "get_accounts_raw", return_value=[])
+        )
+        self.stack.enter_context(
+            patch.object(main.auth, "is_account_model_enabled", return_value=True)
+        )
         self.stack.enter_context(patch.object(main, "_bind_usage_turn_from_metadata", Mock()))
         self.stack.enter_context(patch.object(main, "_track_usage_from_result", Mock()))
         self.stack.enter_context(patch.object(main, "_track_usage_from_chunk", Mock()))
@@ -115,8 +138,9 @@ class IdeNativeIngressTests(unittest.TestCase):
         self.client = self.stack.enter_context(TestClient(main.app))
         self.bodies = []
         self.closers = []
+        self.transport_calls = []
 
-        async def send(messages, model, stream, options=None):
+        async def replay(messages, model, stream, options=None):
             options = dict(options or {})
             self.bodies.append(
                 raw_client.build_traecode_chat_body(
@@ -137,12 +161,22 @@ class IdeNativeIngressTests(unittest.TestCase):
             )
             return SimpleNamespace(response=_ReplayResponse(payload), close=close)
 
-        # IDE/SOLO presets use the TraeCode native raw contract.  Keep the
-        # replay at that boundary so the public ingress exercises the real
-        # body builder, session/function binding, and SSE translator instead
-        # of the legacy TraeWork request adapter.
+        async def send_raw(messages, model, stream, options=None):
+            self.transport_calls.append("raw")
+            return await replay(messages, model, stream, options)
+
+        async def send_legacy(messages, model, stream, options=None):
+            self.transport_calls.append("legacy")
+            return await replay(messages, model, stream, options)
+
+        # Public ingress picks the transport.  Put the replay at both network
+        # boundaries and assert which one was selected; stubbing only raw
+        # would let a routing regression reach the real legacy host.
         self.stack.enter_context(
-            patch.object(raw_client, "send_traecode_chat_request", new=send)
+            patch.object(raw_client, "send_traecode_chat_request", new=send_raw)
+        )
+        self.stack.enter_context(
+            patch.object(main.trae_client, "send_chat_request", new=send_legacy)
         )
 
     def assert_native_second_round(self):
@@ -159,14 +193,18 @@ class IdeNativeIngressTests(unittest.TestCase):
         self.assertEqual(result["tool_call_id"], CALL["id"])
         self.assertIn("nonce-confirmed", result_text)
         for body in self.bodies:
-            self.assertEqual(body["raw_chat_function"], "chat_v3")
+            # 3.4.x carries the function in X-App-Function/X-Ide-Function;
+            # a body copy is rejected or ignored by the current gateway.
+            self.assertNotIn("raw_chat_function", body)
             self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
             self.assertEqual(
-                body["tools"][0]["function"]["parameters"], FUNCTION["parameters"]
+                json.loads(body["tools"][0]["function"]["parameters"]),
+                FUNCTION["parameters"],
             )
-            self.assertFalse(body["parallel_tool_calls"])
+            self.assertNotIn("parallel_tool_calls", body)
         for close in self.closers:
             close.assert_called_once()
+        self.assertEqual(self.transport_calls, ["raw", "raw"])
 
     def _chat_loop(self, stream):
         messages = [{"role": "user", "content": "Read nonce.txt and report its contents."}]

@@ -14,7 +14,12 @@ class RemoteFirstEventErrorGuardTests(unittest.IsolatedAsyncioTestCase):
             trae_remote_client,
             "_stream_events_unbounded",
             return_value=upstream(),
-        ), self.assertRaises(trae_remote_client.RemoteFirstEventError) as caught:
+        ), self.assertRaises(
+            (
+                trae_remote_client.RemoteFirstEventError,
+                trae_remote_client.RemoteModelNotEntitled,
+            )
+        ) as caught:
             _ = [
                 event
                 async for event in trae_remote_client.stream_events(
@@ -72,6 +77,28 @@ class RemoteFirstEventErrorGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(error.observed_model_event)
         self.assertIsNone(error.usage)
         self.assertFalse(error.account_quota_exhausted)
+
+    async def test_model_access_error_is_not_replayed_on_same_account(self):
+        error = await self._first_error(
+            {"code": 1005, "message": "model access denied"}
+        )
+
+        self.assertIsInstance(error, trae_remote_client.RemoteModelNotEntitled)
+        self.assertTrue(error.retryable)
+        self.assertFalse(error.observed_model_event)
+        self.assertIsNone(error.usage)
+        self.assertFalse(error.account_quota_exhausted)
+        self.assertEqual(error.upstream_code, 1005)
+        self.assertIsNotNone(error.__cause__)
+
+    async def test_string_model_access_error_is_terminal(self):
+        error = await self._first_error(
+            {"errorCode": "1005", "detail": "restricted model"}
+        )
+
+        self.assertIsInstance(error, trae_remote_client.RemoteModelNotEntitled)
+        self.assertEqual(error.upstream_code, "1005")
+        self.assertIsNone(error.usage)
 
 
 if __name__ == "__main__":

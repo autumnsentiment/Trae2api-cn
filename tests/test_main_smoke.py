@@ -3161,6 +3161,91 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(error["param"], "tool_choice")
         self.assertIn("undeclared tool", error["message"])
 
+    def test_chat_accepts_json_string_tool_schema(self):
+        captured = {}
+        schema = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        }
+
+        async def fake_ide(messages, model, stream=False, options=None):
+            captured["options"] = dict(options or {})
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                {
+                    "id": "chatcmpl-schema",
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            )
+
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "raw"),
+            patch("src.main.run_ide_chat", new=fake_ide),
+        ):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "read"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": json.dumps(schema),
+                            },
+                        }
+                    ],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "read_file"},
+                    },
+                },
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsInstance(
+            captured["options"]["tools"][0]["function"]["parameters"], str
+        )
+        self.assertEqual(
+            captured["options"]["tool_choice"],
+            {"type": "function", "function": {"name": "read_file"}},
+        )
+
+    def test_chat_rejects_invalid_json_string_tool_schema(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "glm-5.2",
+                "messages": [{"role": "user", "content": "read"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "parameters": "{not-json",
+                        },
+                    }
+                ],
+            },
+            headers=AUTH_HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        error = response.json()["error"]
+        self.assertEqual(error["param"], "tools.0.function.parameters")
+        self.assertIn("valid JSON", error["message"])
+
     def test_conflicting_session_aliases_are_rejected(self):
         response = self.client.post(
             "/v1/chat/completions",

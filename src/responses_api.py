@@ -443,12 +443,13 @@ def _unique_chat_name(base: str, used: set[str]) -> str:
 
 
 def _function_chat_tool(tool: Mapping[str, Any], chat_name: str) -> dict[str, Any]:
+    parameters = tool.get("parameters")
     function: dict[str, Any] = {
         "name": chat_name,
         "description": str(tool.get("description") or ""),
-        "parameters": tool.get("parameters")
-        if isinstance(tool.get("parameters"), Mapping)
-        else {},
+        # Keep native JSON strings and malformed values for the shared ingress
+        # validator; replacing either with {} silently changes the tool contract.
+        "parameters": copy.deepcopy(parameters) if parameters is not None else {},
     }
     if "strict" in tool:
         function["strict"] = tool.get("strict")

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from src import raw_client, sse
+from src import raw_client, sse, trae_client
 
 
 REAL_HTTPX_CLIENT = httpx.Client
@@ -88,7 +88,7 @@ class TraeCodeRawBodyTests(unittest.TestCase):
 
         self.assertEqual(body["config_name"], "glm-5.1")
         self.assertEqual(body["model_name"], "glm-5.1")
-        self.assertEqual(body["raw_chat_function"], "chat_v3")
+        self.assertNotIn("raw_chat_function", body)
         self.assertEqual(body["config_source"], 1)
         self.assertEqual(body["conversation_id"], "ide-session")
         self.assertEqual(body["session_id"], "ide-session")
@@ -123,7 +123,6 @@ class TraeCodeRawBodyTests(unittest.TestCase):
                 "conversation_id",
                 "session_id",
                 "stream",
-                "raw_chat_function",
                 "config_source",
                 "messages",
             },
@@ -186,17 +185,134 @@ class TraeCodeRawBodyTests(unittest.TestCase):
             session_id="solo-session",
         )
 
-        self.assertEqual(body["raw_chat_function"], "solo_agent")
         self.assertEqual(body["tool_choice"], "auto")
-        self.assertFalse(body["parallel_tool_calls"])
+        self.assertNotIn("parallel_tool_calls", body)
         self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
-        self.assertIsInstance(body["tools"][0]["function"]["parameters"], dict)
+        parameters = body["tools"][0]["function"]["parameters"]
+        self.assertIsInstance(parameters, str)
+        self.assertEqual(json.loads(parameters)["required"], ["path"])
         assistant = body["messages"][1]
         self.assertEqual(assistant["tool_calls"][0]["id"], "call_1")
         self.assertEqual(
             assistant["tool_calls"][0]["function"]["arguments"], '{"path":"x"}'
         )
         self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
+
+    def test_raw_v2_tool_choice_is_always_a_string(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": '{"type":"object"}',
+                },
+            }
+        ]
+        cases = (
+            ("auto", "auto"),
+            (" required ", "required"),
+            ({"type": "auto"}, "auto"),
+            ({"type": "function", "function": {"name": "read_file"}}, "read_file"),
+            ({"name": "read_file"}, "read_file"),
+            (True, "auto"),
+            (False, "none"),
+            (None, None),
+        )
+        for supplied, expected in cases:
+            with self.subTest(choice=supplied):
+                body = raw_client.build_traecode_chat_body(
+                    [{"role": "user", "content": "read"}],
+                    "glm-5.2",
+                    options={
+                        "_traecode_native_tools": True,
+                        "tools": tools,
+                        "tool_choice": supplied,
+                    },
+                    session_id="choice-session",
+                )
+                self.assertEqual(body.get("tool_choice"), expected)
+
+    def test_raw_v2_schema_string_is_encoded_exactly_once(self):
+        schema = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        body = raw_client.build_traecode_chat_body(
+            [{"role": "user", "content": "read"}],
+            "glm-5.2",
+            options={
+                "_traecode_native_tools": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "parameters": json.dumps(schema),
+                        },
+                    }
+                ],
+            },
+            session_id="schema-session",
+        )
+
+        encoded = body["tools"][0]["function"]["parameters"]
+        self.assertIsInstance(encoded, str)
+        self.assertEqual(json.loads(encoded), schema)
+
+    def test_raw_v2_invalid_schema_is_not_silently_replaced(self):
+        for parameters in ("{", '"object"', "true", "null", "[]", [], 7, True):
+            with self.subTest(parameters=parameters):
+                with self.assertRaisesRegex(ValueError, "tool parameters"):
+                    raw_client.build_traecode_chat_body(
+                        [{"role": "user", "content": "read"}],
+                        "glm-5.2",
+                        options={
+                            "_traecode_native_tools": True,
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "parameters": parameters,
+                                    },
+                                }
+                            ],
+                        },
+                        session_id="invalid-schema-session",
+                    )
+
+    def test_native_tool_definition_helpers_require_object_schemas(self):
+        for parameters in ("{", "[]", "false", "1", [], [1], 7, True):
+            tool = {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": parameters},
+            }
+            with self.subTest(parameters=parameters):
+                with self.assertRaisesRegex(ValueError, "tool parameters"):
+                    raw_client._traecode_tool_definitions([tool])
+                with self.assertRaisesRegex(ValueError, "tool parameters"):
+                    raw_client._native_tool_definition(tool)
+        for parameters in ({}, "{}"):
+            tool = {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": parameters},
+            }
+            with self.subTest(parameters=parameters):
+                self.assertEqual(
+                    json.loads(
+                        raw_client._traecode_tool_definitions([tool])[0]["function"][
+                            "parameters"
+                        ]
+                    ),
+                    {},
+                )
+                self.assertEqual(
+                    json.loads(
+                        raw_client._native_tool_definition(tool)["function"]["parameters"]
+                    ),
+                    {},
+                )
 
     def test_requested_effort_is_sent_in_expanded_raw_v2_body(self):
         body = raw_client.build_traecode_chat_body(
@@ -478,6 +594,457 @@ class TraeCodeRawBodyTests(unittest.TestCase):
 
 
 class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_kimi_catalog_miss_does_not_guess_provider_id(self):
+        with (
+            patch(
+                "src.trae_client.resolve_traecode_model_config",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.trae_client._cached_model_catalog",
+                new=AsyncMock(
+                    return_value={
+                        "kimi-k3": {
+                            "config_name": "kimi-k3",
+                            "model_name": "kimi-k3",
+                        }
+                    }
+                ),
+            ),
+            patch.object(
+                raw_client,
+                "resolve_raw_model_for_request",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "Kimi must not fall through to a legacy provider alias"
+                    )
+                ),
+            ),
+        ):
+            with self.assertRaises(raw_client.TraeCodeModelUnavailable) as raised:
+                await raw_client.resolve_traecode_model_for_request(
+                    "kimi-k3",
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "token-x",
+                        "_auth_user_id": "user-1",
+                        "_traecode_raw_chat_function": "solo_agent",
+                    },
+                )
+
+        self.assertEqual(raised.exception.model, "kimi-k3")
+        self.assertEqual(raised.exception.raw_chat_function, "solo_agent")
+
+    async def test_kimi_catalog_miss_skips_legacy_gateway_replay(self):
+        main_module = __import__("src.main", fromlist=["main"])
+        with (
+            patch(
+                "src.trae_client.resolve_traecode_model_config",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.trae_client._cached_model_catalog",
+                new=AsyncMock(
+                    return_value={
+                        "kimi-k3": {
+                            "config_name": "kimi-k3",
+                            "model_name": "kimi-k3",
+                        }
+                    }
+                ),
+            ),
+            patch.object(
+                main_module.trae_client,
+                "send_chat_request",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "A missing Kimi catalog scope must not replay legacy"
+                    )
+                ),
+            ) as legacy,
+        ):
+            with self.assertRaises(raw_client.TraeCodeModelUnavailable):
+                await main_module.run_ide_chat(
+                    [{"role": "user", "content": "hello"}],
+                    "kimi-k3",
+                    True,
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "token-x",
+                        "_auth_user_id": "user-1",
+                        "_traecode_raw_chat_function": "solo_agent",
+                    },
+                )
+
+        legacy.assert_not_awaited()
+
+    async def test_kimi_catalog_transport_failure_does_not_become_scope_denial(self):
+        provider_model = raw_client.RawModel(
+            config_name="kimi-k3",
+            raw_model_name="kimi-k3__dev",
+            display_name="Kimi-K3",
+        )
+        with (
+            patch(
+                "src.trae_client.resolve_traecode_model_config",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.trae_client._cached_model_catalog",
+                new=AsyncMock(
+                    return_value=trae_client._ModelCatalog(fetch_succeeded=False)
+                ),
+            ),
+            patch.object(
+                raw_client,
+                "resolve_raw_model_for_request",
+                new=AsyncMock(return_value=provider_model),
+            ),
+        ):
+            resolved = await raw_client.resolve_traecode_model_for_request(
+                "kimi-k3",
+                {
+                    "_account_id": "account-1",
+                    "_auth_token": "token-x",
+                    "_auth_user_id": "user-1",
+                    "_traecode_raw_chat_function": "solo_agent",
+                },
+            )
+
+        self.assertEqual(resolved.raw_model_name, "kimi-k3__dev")
+
+    async def test_catalog_success_without_model_fails_closed(self):
+        with (
+            patch(
+                "src.trae_client.resolve_traecode_model_config",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.trae_client._cached_model_catalog",
+                new=AsyncMock(
+                    return_value={
+                        "some-other-model": {
+                            "config_name": "some-other-model",
+                            "model_name": "some-other-model__dev",
+                        }
+                    }
+                ),
+            ),
+            patch.object(
+                raw_client,
+                "resolve_raw_model_for_request",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "A successful catalog miss must not synthesize provider ids"
+                    )
+                ),
+            ),
+        ):
+            with self.assertRaises(raw_client.TraeCodeModelUnavailable):
+                await raw_client.resolve_traecode_model_for_request(
+                    "Doubao-Seed-2.0-Code",
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "token-x",
+                        "_auth_user_id": "user-1",
+                        "_traecode_raw_chat_function": "chat_v3",
+                    },
+                )
+
+    async def test_successful_empty_catalog_does_not_guess_provider_id(self):
+        with (
+            patch(
+                "src.trae_client.resolve_traecode_model_config",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.trae_client._cached_model_catalog",
+                new=AsyncMock(
+                    return_value=trae_client._ModelCatalog(fetch_succeeded=True)
+                ),
+            ),
+            patch.object(
+                raw_client,
+                "resolve_raw_model_for_request",
+                new=AsyncMock(),
+            ) as legacy_lookup,
+        ):
+            with self.assertRaises(raw_client.TraeCodeModelUnavailable):
+                await raw_client.resolve_traecode_model_for_request(
+                    "missing-model",
+                    {
+                        "_auth_token": "token-x",
+                        "_account_id": "account-1",
+                        "_traecode_raw_chat_function": "chat_v3",
+                    },
+                )
+
+        legacy_lookup.assert_not_awaited()
+
+    async def test_custom_provider_without_binding_fails_before_wire(self):
+        catalog = {
+            "mimo-v2.5": {
+                "config_name": "mimo-v2.5",
+                "model_name": "mimo-v2.5",
+                "provider": "custom_openai_compatible",
+                "base_url": "",
+                "ak": "",
+            }
+        }
+        with (
+            patch(
+                "src.trae_client.resolve_traecode_model_config",
+                new=AsyncMock(return_value=catalog["mimo-v2.5"]),
+            ),
+            patch.object(
+                raw_client,
+                "send_traecode_chat_request",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "unbound custom provider must not reach the wire"
+                    )
+                ),
+            ) as send,
+        ):
+            with self.assertRaises(
+                raw_client.TraeCodeModelUnavailable
+            ) as raised:
+                await raw_client.resolve_traecode_model_for_request(
+                    "mimo-v2.5",
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "token-x",
+                        "_auth_user_id": "user-1",
+                        "_traecode_raw_chat_function": "chat_v3",
+                    },
+                )
+
+        self.assertEqual(
+            raised.exception.reason, "custom_provider_requires_client_direct"
+        )
+        send.assert_not_awaited()
+
+    async def test_custom_provider_nested_binding_requires_client_direct(self):
+        catalog = {
+            "mimo-v2.5": {
+                "config_name": "mimo-v2.5",
+                "model_name": "mimo-v2.5",
+                "_traecode_model_detail_list": [
+                    {
+                        "model_name": "mimo-v2.5",
+                        "provider": "custom_openai_compatible",
+                        "custom_config": {
+                            "base_url": "https://upstream.example/v1/chat/completions",
+                            "ak": "x",
+                            "client_connect": True,
+                        },
+                    }
+                ],
+            }
+        }
+        with patch(
+            "src.trae_client.resolve_traecode_model_config",
+            new=AsyncMock(return_value=catalog["mimo-v2.5"]),
+        ):
+            with self.assertRaises(
+                raw_client.TraeCodeModelUnavailable
+            ) as raised:
+                await raw_client.resolve_traecode_model_for_request(
+                    "mimo-v2.5",
+                    {
+                        "_account_id": "account-1",
+                        "_auth_token": "token-x",
+                        "_auth_user_id": "user-1",
+                        "_traecode_raw_chat_function": "chat_v3",
+                    },
+                )
+
+        self.assertEqual(
+            raised.exception.reason, "custom_provider_requires_client_direct"
+        )
+
+    async def test_custom_provider_guard_uses_selected_detail_only(self):
+        native = {
+            "model_name": "mixed-model__dev",
+            "provider": "native-provider",
+        }
+        custom = {
+            "model_name": "mixed-model__max",
+            "provider": "custom_openai_compatible",
+            "custom_config": {"client_connect": True},
+        }
+        for details in ([custom, native], [native, custom]):
+            for selected, denied in (
+                ("mixed-model__dev", False),
+                ("mixed-model__max", True),
+            ):
+                with self.subTest(details=details, selected=selected):
+                    descriptor = {
+                        "config_name": "mixed-model",
+                        "raw_model_name": selected,
+                        "provider": "custom_openai_compatible",
+                        "_traecode_model_detail_list": details,
+                    }
+                    with patch(
+                        "src.trae_client.resolve_traecode_model_config",
+                        new=AsyncMock(return_value=descriptor),
+                    ):
+                        options = {
+                            "_auth_token": "token-x",
+                            "_account_id": "account-1",
+                            "_traecode_raw_chat_function": "chat_v3",
+                        }
+                        if denied:
+                            with self.assertRaises(
+                                raw_client.TraeCodeModelUnavailable
+                            ) as raised:
+                                await raw_client.resolve_traecode_model_for_request(
+                                    "mixed-model", options
+                                )
+                            self.assertEqual(
+                                raised.exception.reason,
+                                "custom_provider_requires_client_direct",
+                            )
+                        else:
+                            resolved = (
+                                await raw_client.resolve_traecode_model_for_request(
+                                    "mixed-model", options
+                                )
+                            )
+                            self.assertEqual(resolved.raw_model_name, selected)
+
+    async def test_kimi_k3_uses_solo_scope_in_body_and_headers(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"event: done\ndata: {}\n\n",
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+        live_model = raw_client.RawModel(
+            config_name="kimi-k3",
+            raw_model_name="kimi-k3__dev",
+            display_name="Kimi-K3",
+            descriptor={"raw_chat_function": "solo_agent"},
+        )
+        with (
+            patch.object(
+                raw_client,
+                "resolve_traecode_model_for_request",
+                new=AsyncMock(return_value=live_model),
+            ),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch("src.raw_client.httpx.Client", side_effect=client_factory),
+        ):
+            response = await raw_client.send_traecode_chat_request(
+                [{"role": "user", "content": "Read README.md"}],
+                "kimi-k3",
+                options={
+                    "_account_id": "account-1",
+                    "_auth_token": "jwt",
+                    "_auth_user_id": "user-1",
+                    "_traecode_raw_chat_function": "solo_agent",
+                    "_traecode_native_tools": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        body = json.loads(request.content)
+        self.assertEqual(body["config_name"], "kimi-k3")
+        self.assertEqual(body["model_name"], "kimi-k3__dev")
+        self.assertEqual(request.headers["X-App-Function"], "solo_agent")
+        self.assertEqual(request.headers["X-Ide-Function"], "solo_agent")
+        self.assertTrue(body["stream"])
+        response.close()
+
+    async def test_normalized_k3_hint_uses_solo_scope_on_wire(self):
+        """The raw transport must honor the dispatcher's K3 override."""
+
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"event: done\ndata: {}\n\n",
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+        live_model = raw_client.RawModel(
+            config_name="kimi-k3",
+            raw_model_name="kimi-k3__dev",
+            display_name="Kimi-K3",
+            descriptor={"raw_chat_function": "solo_agent"},
+        )
+        function = __import__("src.main", fromlist=["main"])._effective_traecode_function(
+            "kimi-k3", {"_traecode_raw_chat_function": "chat_v3"}
+        )
+        with (
+            patch.object(
+                raw_client,
+                "resolve_traecode_model_for_request",
+                new=AsyncMock(return_value=live_model),
+            ),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch("src.raw_client.httpx.Client", side_effect=client_factory),
+        ):
+            response = await raw_client.send_traecode_chat_request(
+                [{"role": "user", "content": "Read README.md"}],
+                "kimi-k3",
+                options={
+                    "_account_id": "account-1",
+                    "_auth_token": "jwt",
+                    "_auth_user_id": "user-1",
+                    "_traecode_raw_chat_function": function,
+                    "_traecode_native_tools": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(function, "solo_agent")
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        body = json.loads(request.content)
+        self.assertEqual(
+            request.url.path, "/api/ide/v2/llm_raw_chat"
+        )
+        self.assertEqual(body["config_name"], "kimi-k3")
+        self.assertEqual(body["model_name"], "kimi-k3__dev")
+        self.assertEqual(request.headers["X-App-Function"], "solo_agent")
+        self.assertEqual(request.headers["X-Ide-Function"], "solo_agent")
+        response.close()
+
     async def test_native_text_delta_events_are_translated(self):
         class Stream:
             def iter_lines(self):
@@ -557,7 +1124,7 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(requests[-1].headers["X-App-Id"], raw_client.TRAECODE_APP_ID)
         body = json.loads(requests[-1].content)
-        self.assertEqual(body["raw_chat_function"], "chat_v3")
+        self.assertNotIn("raw_chat_function", body)
         self.assertEqual(body["model_name"], "glm-5.2")
         self.assertNotIn("Extra", requests[-1].headers)
         response.close()
@@ -573,6 +1140,9 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
             (503, {"error": {"code": 3004}}, 3004),
             (400, {"error": {"error_code": "3004"}}, "3004"),
             (403, {"error": {"errorCode": 3004}}, 3004),
+            (400, {"code": 4011, "message": "busy"}, 4011),
+            (403, {"error": {"error_code": "4011"}}, "4011"),
+            (400, {"error": {"errorCode": 429}}, 429),
         ]
         for status_code, payload, expected_code in cases:
             with self.subTest(status_code=status_code, payload=payload):
@@ -639,6 +1209,161 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(responses[0].is_closed)
                 with raw_client._RAW_SESSION_GATES_LOCK:
                     self.assertNotIn(session_id, raw_client._RAW_SESSION_GATES)
+
+    async def test_http_failures_preserve_metadata_and_stop_fatal_model_retries(self):
+        cases = [
+            (400, {"code": 4023}, 4023, 1),
+            (403, {"error": {"errorCode": "4023"}}, "4023", 1),
+            (403, {"code": 0, "error": {"code": 4023}}, 4023, 1),
+            (403, {"code": "model_not_entitled"}, "model_not_entitled", 1),
+            (
+                403,
+                {"code": 1005, "error": {"type": "model_not_entitled"}},
+                "model_not_entitled",
+                1,
+            ),
+            (403, {"error": "model_not_entitled"}, "model_not_entitled", 1),
+            (400, {"code": 4001}, 4001, 4),
+            (400, {"code": 0, "error": {"code": 4001}}, 4001, 4),
+            (403, {"error": {"error_code": "1005"}}, "1005", 4),
+            (403, {"code": 1, "error": {"code": "1005"}}, "1005", 4),
+            (502, {"code": 9876}, 9876, 4),
+            (404, "missing endpoint", None, 4),
+            (503, "x" * 1200, None, 4),
+        ]
+        for status_code, payload, expected_code, expected_attempts in cases:
+            with self.subTest(status_code=status_code, payload=payload):
+                requests = []
+                clients = []
+                responses = []
+                session_id = "http-failure-metadata-test"
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    response = (
+                        httpx.Response(status_code, text=payload)
+                        if isinstance(payload, str)
+                        else httpx.Response(status_code, json=payload)
+                    )
+                    responses.append(response)
+                    return response
+
+                transport = httpx.MockTransport(handler)
+
+                def client_factory(**kwargs):
+                    client = REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+                    clients.append(client)
+                    return client
+
+                with (
+                    patch("src.trae_client.build_headers", return_value={}),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_base_urls",
+                        return_value=[
+                            "https://trae-api-cn.mchost.guru",
+                            "https://api5-normal.mchost.guru",
+                        ],
+                    ),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_model_for_request",
+                        new=AsyncMock(
+                            return_value=raw_client.resolve_traecode_model("glm-5.2")
+                        ),
+                    ),
+                    patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                ):
+                    with self.assertRaises(raw_client.TraeCodeRequestError) as raised:
+                        await raw_client.send_traecode_chat_request(
+                            [{"role": "user", "content": "hello"}],
+                            "glm-5.2",
+                            options={
+                                "_account_id": "account-1",
+                                "_auth_token": "jwt",
+                                "_auth_user_id": "user-1",
+                                "_traecode_session_id": session_id,
+                            },
+                        )
+
+                error = raised.exception
+                self.assertNotIsInstance(error, raw_client.TraeCodeRateLimitError)
+                self.assertEqual(error.status_code, status_code)
+                self.assertEqual(error.code, expected_code)
+                self.assertLessEqual(len(error.detail), 800)
+                self.assertEqual(len(requests), expected_attempts)
+                self.assertTrue(all(response.is_closed for response in responses))
+                self.assertTrue(clients[0].is_closed)
+                with raw_client._RAW_SESSION_GATES_LOCK:
+                    self.assertNotIn(session_id, raw_client._RAW_SESSION_GATES)
+
+    async def test_later_transport_error_does_not_reuse_prior_http_metadata(self):
+        for disable_fallback in (False, True):
+            with self.subTest(disable_fallback=disable_fallback):
+                requests = []
+                clients = []
+                responses = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    if len(requests) > 1:
+                        raise httpx.ReadError("synthetic transport failure", request=request)
+                    response = httpx.Response(400, json={"code": 4001})
+                    responses.append(response)
+                    return response
+
+                transport = httpx.MockTransport(handler)
+
+                def client_factory(**kwargs):
+                    client = REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+                    clients.append(client)
+                    return client
+
+                with (
+                    patch("src.trae_client.build_headers", return_value={}),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_base_urls",
+                        return_value=[
+                            "https://trae-api-cn.mchost.guru",
+                            "https://api5-normal.mchost.guru",
+                        ],
+                    ),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_model_for_request",
+                        new=AsyncMock(
+                            return_value=raw_client.resolve_traecode_model("glm-5.2")
+                        ),
+                    ),
+                    patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                ):
+                    with self.assertRaises(RuntimeError) as raised:
+                        await raw_client.send_traecode_chat_request(
+                            [{"role": "user", "content": "hello"}],
+                            "glm-5.2",
+                            options={
+                                "_auth_token": "jwt",
+                                "_disable_upstream_fallback": disable_fallback,
+                            },
+                        )
+
+                if disable_fallback:
+                    self.assertIsInstance(raised.exception, raw_client.TraeCodeRequestError)
+                    self.assertEqual(raised.exception.code, 4001)
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(
+                        str(requests[0].url),
+                        "https://trae-api-cn.mchost.guru/api/ide/v2/llm_raw_chat",
+                    )
+                else:
+                    self.assertNotIsInstance(
+                        raised.exception, raw_client.TraeCodeRequestError
+                    )
+                    self.assertIn("synthetic transport failure", str(raised.exception))
+                    self.assertEqual(len(requests), 4)
+                self.assertTrue(clients[0].is_closed)
+                self.assertTrue(all(response.is_closed for response in responses))
 
     async def test_http_429_body_read_error_preserves_rate_limit_and_releases_slot(self):
         for stream in (False, True):
@@ -964,6 +1689,35 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved.raw_model_name, "glm-5.2__max")
         self.assertEqual(lookup.await_args.kwargs["max_mode"], True)
+        self.assertEqual(
+            lookup.await_args.kwargs["raw_chat_function"], "solo_agent"
+        )
+
+    async def test_max_model_suffix_selects_live_max_provider_model_id(self):
+        with patch(
+            "src.trae_client.resolve_traecode_model_config",
+            new=AsyncMock(
+                return_value={
+                    "config_name": "glm-5.2",
+                    "model_name": "glm-5.2__max",
+                    "display_name": "GLM-5.2",
+                    "config_source": 1,
+                }
+            ),
+        ) as lookup:
+            resolved = await raw_client.resolve_traecode_model_for_request(
+                "glm-5.2-max",
+                {
+                    "_traecode_raw_chat_function": "solo_agent",
+                    "_auth_token": "token-x",
+                    "_auth_user_id": "user-x",
+                },
+            )
+
+        self.assertEqual(resolved.config_name, "glm-5.2")
+        self.assertEqual(resolved.raw_model_name, "glm-5.2__max")
+        self.assertEqual(lookup.await_args.args[0], "glm-5.2")
+        self.assertTrue(lookup.await_args.kwargs["max_mode"])
         self.assertEqual(
             lookup.await_args.kwargs["raw_chat_function"], "solo_agent"
         )

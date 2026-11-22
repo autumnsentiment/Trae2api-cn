@@ -299,7 +299,10 @@ class AutoRouteDispatchTests(unittest.IsolatedAsyncioTestCase):
                 body = main_module.raw_client.build_traecode_chat_body(
                     messages, "glm-5.3", options=options
                 )
-                self.assertEqual(body["tools"][0]["function"]["parameters"], TOOLS[0]["function"]["parameters"])
+                self.assertEqual(
+                    json.loads(body["tools"][0]["function"]["parameters"]),
+                    TOOLS[0]["function"]["parameters"],
+                )
                 self.assertEqual(body["messages"][1]["tool_calls"][0]["id"], "call-readme")
                 self.assertEqual(body["messages"][2]["role"], "tool")
                 self.assertEqual(body["messages"][2]["tool_call_id"], "call-readme")

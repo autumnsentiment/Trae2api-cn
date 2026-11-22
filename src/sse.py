@@ -129,12 +129,14 @@ class UpstreamEventError(EmptyUpstreamResponse):
         message: str,
         *,
         code: Any = None,
+        error_type: Optional[str] = None,
         retryable: bool = True,
         usage: Optional[dict] = None,
         observed_model_event: bool = False,
         account_quota_exhausted: bool = False,
     ):
         self.code = code
+        self.error_type = str(error_type).strip()[:128] if error_type is not None else None
         self.upstream_message = str(message or "Trae upstream returned an error event")
         code_text = str(code).strip() if code not in (None, "") else ""
         rendered = (
@@ -364,6 +366,22 @@ def _upstream_error_details(payload: Mapping[str, Any]) -> tuple[Any, str]:
     return code, message or "Trae raw upstream returned an error event"
 
 
+def _upstream_error_type(payload: Mapping[str, Any]) -> Optional[str]:
+    nested = payload.get("error")
+    sources = [payload]
+    if isinstance(nested, Mapping):
+        sources.append(nested)
+    for source in sources:
+        if str(source.get("type") or "").strip().casefold() == "model_not_entitled":
+            return "model_not_entitled"
+        for key in ("message", "detail", "reason"):
+            if re.search(r"\bmodel_not_entitled\b", str(source.get(key) or ""), re.I):
+                return "model_not_entitled"
+    if isinstance(nested, str) and re.search(r"\bmodel_not_entitled\b", nested, re.I):
+        return "model_not_entitled"
+    return None
+
+
 def _raise_upstream_event_error(
     payload: Mapping[str, Any],
     *,
@@ -399,6 +417,7 @@ def _raise_upstream_event_error(
     raise UpstreamEventError(
         message,
         code=code,
+        error_type=_upstream_error_type(payload),
         retryable=not observed_model_event,
         usage=error_usage,
         observed_model_event=observed_model_event,
@@ -478,6 +497,13 @@ def _check_provider_model(requested: str, actual: str) -> None:
         return
     actual_family = _model_family(actual)
     if requested_family == actual_family:
+        return
+    # Some catalogs spell the same provider family with a punctuation variant,
+    # for example ``qwen-3.7-plus`` versus ``qwen3.7-plus``.  Compare an
+    # alphanumeric-only form before treating the response as a different model.
+    requested_compact = re.sub(r"[^a-z0-9]+", "", requested_family.casefold())
+    actual_compact = re.sub(r"[^a-z0-9]+", "", actual_family.casefold())
+    if requested_compact and requested_compact == actual_compact:
         return
     raise ModelProviderMismatch(
         f"Trae selected provider model {actual!r} for requested model {requested!r}"
@@ -1214,13 +1240,44 @@ class ToolCallAccumulator:
                     )
                     continue
                 if closed_state == "conflict":
-                    logger.warning(
-                        "dropping conflicting complete tool call id=%s",
-                        existing.get("id"),
+                    existing_function = existing.get("function") or {}
+                    previous_args = str(existing_function.get("arguments") or "")
+                    current_args = str(function.get("arguments") or "")
+                    try:
+                        previous_value = json.loads(previous_args)
+                        current_value = json.loads(current_args)
+                    except Exception:
+                        previous_value = current_value = None
+                    same_complete_payload = (
+                        previous_value is not None
+                        and current_value is not None
+                        and previous_value == current_value
                     )
-                    continue
+                    reused_transport_index = (
+                        not (
+                            existing.get("_explicit_id") is True
+                            and call.get("_explicit_id") is True
+                        )
+                        and existing.get("_explicit_index") is True
+                        and call.get("_explicit_index") is True
+                        and existing.get("index") == call.get("index")
+                    )
+                    if same_complete_payload or not reused_transport_index:
+                        logger.warning(
+                            "dropping conflicting complete tool call id=%s",
+                            existing.get("id"),
+                        )
+                        continue
+                    # A native model may close call A and reuse the same
+                    # transport index for call B.  The index is a correlation
+                    # slot in this shape, not a logical-call identity.
+                    existing = None
+                    key = self._new_storage_key(call)
             requested_index = call.get("index")
-            if key not in self._calls and call.get("_synthetic_id"):
+            if key not in self._calls and (
+                call.get("_synthetic_id")
+                or isinstance(requested_index, int)
+            ):
                 current_signature = self._complete_signature(call)
                 if (
                     current_signature
@@ -1309,29 +1366,57 @@ class ToolCallAccumulator:
                 # 当前 key 的 arguments 已是合法 JSON 时，新片段属于【新调用】，
                 # 不是续片——闭合后新开，避免 `{"a":1}{"b":2}` 拼接。
                 try:
-                    json.loads(previous_args)
+                    previous_value = json.loads(previous_args)
                     prev_closed = True
                 except Exception:
+                    previous_value = None
                     prev_closed = False
                 if prev_closed and current_args:
+                    try:
+                        current_value = json.loads(current_args)
+                    except Exception:
+                        current_value = None
+                    # A complete replay of the same payload is a duplicate
+                    # snapshot, not a second invocation.  Upstreams that reuse
+                    # index 0 for separate calls can do so with different
+                    # complete arguments; those must become distinct public
+                    # calls for the client to execute both.
+                    repeated_payload = (
+                        current_value is not None
+                        and previous_value == current_value
+                    )
+                    if repeated_payload and not (
+                        existing.get("_explicit_id") is True
+                        or call.get("_explicit_id") is True
+                    ):
+                        logger.debug(
+                            "dropping repeated complete delta object id=%s",
+                            existing.get("id"),
+                        )
+                        continue
                     # 只有新片段以 { 或 [ 开头才是真正的新调用起点；
                     # 孤立的 } / ] / 空帧是上游遗留的闭合帧，忽略不拼。
                     first = current_args.lstrip()[:1]
                     if first in ("{", "["):
                         if (
                             existing.get("_explicit_id") is True
-                            or call.get("_explicit_id") is True
-                            or (
-                                existing.get("_explicit_index") is True
-                                and call.get("_explicit_index") is True
-                                and existing.get("index") == call.get("index")
-                            )
+                            and call.get("_explicit_id") is True
                         ):
-                            logger.warning(
-                                "dropping new delta object for closed logical call id=%s",
-                                existing.get("id"),
-                            )
-                            continue
+                            # An explicit upstream index is only a fragment
+                            # correlation key.  Some native models reuse it
+                            # after closing a call and then start a different
+                            # complete object.  Preserve that new call with a
+                            # unique public index/id.  Exact explicit-id
+                            # conflicts remain suppressed below as replays.
+                            if (
+                                existing.get("_explicit_id") is True
+                                and call.get("_explicit_id") is True
+                            ) and repeated_payload:
+                                logger.warning(
+                                    "dropping repeated explicit-id call id=%s",
+                                    existing.get("id"),
+                                )
+                                continue
                         new_key = call_id + ":" + str(len(self._order))
                         public_id = self._unique_public_id(new_key)
                         self._calls[new_key] = {
@@ -1920,6 +2005,8 @@ def _hold_incomplete_tool_block(
     """Keep a split XML tool block out of visible text until it is complete."""
     lowered = text.lower()
     pairs = (
+        ("<|tool_calls_section_begin|>", "<|tool_calls_section_end|>"),
+        ("<|tool_call_begin|>", "<|tool_call_end|>"),
         ("<opencode_tool_call>", "</opencode_tool_call>"),
         ("<tool_use>", "</tool_use>"),
         ("<tool_call", "</tool_call>"),
@@ -3670,7 +3757,7 @@ async def collect_nonstream_ide(
     tool_calls.set_calls(
         _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
     )
-    if not full.strip() and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
+    if not full.strip() and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
             retryable=False,
@@ -3680,7 +3767,12 @@ async def collect_nonstream_ide(
     _ensure_required_tool_call(
         tool_choice, tool_calls.has_calls, tool_calls.calls()
     )
-    if fail_on_empty and not full.strip() and not reasoning_summary and not tool_calls.has_calls:
+    if (
+        fail_on_empty
+        and not full.strip()
+        and not reasoning_summary
+        and not tool_calls.has_calls
+    ):
         observed_model_event = bool(
             usage is not None
             or reasoning_text.raw
@@ -3943,6 +4035,7 @@ async def collect_nonstream_web(
         raise UpstreamEventError(
             message,
             code=code,
+            error_type=_upstream_error_type(error_event),
             retryable=not observed_model_event,
             usage=usage,
             observed_model_event=observed_model_event,

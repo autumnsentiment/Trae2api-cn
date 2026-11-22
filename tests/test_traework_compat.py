@@ -458,6 +458,109 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertTrue(request.options["thinking"])
         self.assertEqual(request.options["max_tokens"], 321)
 
+    def test_nested_request_wrappers_keep_tool_catalog(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a workspace file",
+                    # The desktop bundle serializes FunctionDefinition
+                    # parameters once before handing them to the transport.
+                    "parameters": json.dumps(
+                        {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        ]
+        wrappers = {
+            "Request": {
+                "Request": {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "read"}],
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                }
+            },
+            "request": {
+                "request": {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "read"}],
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                }
+            },
+            "nested_messages": {
+                "model": "glm-5.2",
+                "messages": {
+                    "messages": [{"role": "user", "content": "read"}],
+                    "tools": tools,
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "read_file"},
+                    },
+                    "parallel_tool_calls": False,
+                },
+            },
+        }
+
+        for label, body in wrappers.items():
+            with self.subTest(wrapper=label):
+                request = traework_compat.normalize_inbound_request(
+                    body,
+                    headers={"x-ide-function": "chat_v3"},
+                    path="/api/ide/v2/llm_raw_chat",
+                )
+
+                self.assertEqual(len(request.messages), 1)
+                self.assertEqual(len(request.options["tools"]), 1)
+                self.assertIsInstance(
+                    request.options["tools"][0]["function"]["parameters"],
+                    str,
+                )
+                self.assertFalse(request.options["parallel_tool_calls"])
+                self.assertTrue(request.options["_tool_protocol_requested"])
+                self.assertEqual(
+                    request.options["_traecode_raw_chat_function"], "chat_v3"
+                )
+
+    def test_inner_explicit_empty_tool_catalog_wins_over_outer_catalog(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        body = {
+            "request": {
+                "model": "glm-5.2",
+                "tools": tools,
+                "messages": {
+                    "messages": [{"role": "user", "content": "answer directly"}],
+                    "tools": [],
+                },
+            }
+        }
+
+        request = traework_compat.normalize_inbound_request(
+            body,
+            headers={"x-ide-function": "chat_v3"},
+            path="/api/ide/v2/llm_raw_chat",
+        )
+
+        self.assertEqual(request.options["tools"], [])
+        self.assertEqual(len(request.messages), 1)
+
     def test_translate_openai_stream_to_traework_emits_cumulative_tool_call(self):
         async def source():
             yield 'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'

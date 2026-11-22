@@ -588,6 +588,53 @@ class RemoteClientTests(unittest.TestCase):
             ),
         )
 
+    def test_max_model_variant_selects_live_max_detail_and_base_config(self):
+        async def run():
+            client = _Client()
+            custom = {
+                "name": "glm-5.3",
+                "config_name": "glm-5.3",
+                "model_name": "glm-5.3",
+                "config_source": 1,
+                "is_preset": True,
+                "provider": "",
+                "context_window_tokens": {"dev": 200000, "max": 1048576},
+                "model_detail_list": [
+                    {"model_name": "glm-5.3__dev", "max_tokens": 32000},
+                    {"model_name": "glm-5.3__max", "max_tokens": 64000},
+                ],
+            }
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=AsyncMock(return_value=custom),
+            ) as resolve:
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3-max",
+                    [{"role": "user", "content": "hello"}],
+                    options={
+                        "_account_id": "1329782626198720",
+                        "_auth_token": "jwt-token",
+                        "provider_specific": {},
+                    },
+                )
+            return client.posts[0], resolve
+
+        (_url, request), resolve = asyncio.run(run())
+        resolve.assert_awaited_once()
+        self.assertEqual(resolve.await_args.args[0], "glm-5.3")
+        initial = request["json"]["initial_message"]
+        self.assertEqual(initial["model_name"], "glm-5.3")
+        self.assertEqual(initial["model_selection_strategy"], "max")
+        self.assertEqual(initial["context_window_size"], 1048576)
+        self.assertEqual(initial["max_tokens"], 64000)
+        self.assertEqual(initial["prompt_max_tokens"], 984576)
+        self.assertEqual(
+            initial["custom_model"]["model_name"], "glm-5.3__max"
+        )
+
     def test_max_mode_does_not_enrich_incomplete_account_config(self):
         async def run():
             client = _Client()

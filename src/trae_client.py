@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import random
+import re
 import string
 import threading
 import time
@@ -42,7 +43,10 @@ from .cli_client import (
 from .model_limits import (
     clamp_max_completion_tokens,
     descriptor_max_context,
+    descriptor_context_window,
+    descriptor_max_profile,
     descriptor_multimodal,
+    descriptor_output_tokens,
     descriptor_reasoning_config,
     descriptor_supports_max_mode,
 )
@@ -176,6 +180,22 @@ MODEL_ALIASES = {
 }
 
 _ALIAS_LOOKUP = {k.lower(): v for k, v in MODEL_ALIASES.items()}
+MAX_MODEL_SUFFIX = "-max"
+
+
+def split_max_model_name(model: Any) -> tuple[str, bool]:
+    """Split the public ``<model>-max`` variant without guessing a model."""
+
+    value = str(model or "").strip()
+    if value.casefold().endswith(MAX_MODEL_SUFFIX) and len(value) > len(
+        MAX_MODEL_SUFFIX
+    ):
+        return value[: -len(MAX_MODEL_SUFFIX)], True
+    return value, False
+
+
+def is_max_model_name(model: Any) -> bool:
+    return split_max_model_name(model)[1]
 
 # /v1/models 返回的模型 ID
 SUPPORTED_MODELS = set(_ALIAS_LOOKUP.keys()) | set(_ALIAS_LOOKUP.values())
@@ -346,6 +366,14 @@ def _model_catalog_cache_key(
 _MODEL_CATALOG_INFLIGHT: dict[tuple[Any, str], asyncio.Task] = {}
 
 
+class _ModelCatalog(dict[str, dict]):
+    """Keep a successful empty catalog distinct from an unsuccessful fetch."""
+
+    def __init__(self, *args, fetch_succeeded: bool, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fetch_succeeded = fetch_succeeded
+
+
 async def _cached_model_catalog(
     source: str,
     token: str,
@@ -392,7 +420,7 @@ async def _cached_model_catalog(
                 if raw_chat_function:
                     kwargs["raw_chat_function"] = raw_chat_function
                 configs = await _fetch_web_model_configs(token, **kwargs)
-            if configs:
+            if configs or getattr(configs, "fetch_succeeded", False):
                 _WEB_MODEL_CACHE[cache_key] = (time.time(), copy.deepcopy(configs))
             else:
                 _WEB_MODEL_CACHE.pop(cache_key, None)
@@ -516,8 +544,20 @@ def convert_model_name(model: str) -> str:
     matches custom_model.config_name precisely)."""
     if not model:
         return model
-    m = model.strip().lower()
-    return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or model
+    value = model.strip()
+    # The client's model picker stores the function-qualified catalog key, for
+    # example ``solo_agent_1__kimi-k3`` or
+    # ``solo_agent_remote_1__kimi-k3``. The API-facing id is the suffix after
+    # the selector index. Keep it only in the public lookup, never on the wire.
+    value = re.sub(
+        r"^(?:solo_agent(?:_lite|_remote)?|solo_work_lite|"
+        r"solo_work_remote|solo_coder)_\d+__",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    m = value.lower()
+    return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or value
 
 
 async def _resolve_request_model_name(
@@ -1679,13 +1719,14 @@ def _messages_with_client_runtime(
 
 
 def _resolve_mode(model: str) -> tuple[str, str, str]:
-    m = (model or "").strip().lower()
+    base_model, _max_variant = split_max_model_name(model)
+    m = (base_model or "").strip().lower()
     if m in ("work", "auto-work", "solo-work"):
         return ("work", "auto", "")
     auto = not m or m == "auto"
     if auto:
         return ("code", "auto", "")
-    return ("code", "manual", convert_model_name(model))
+    return ("code", "manual", convert_model_name(base_model))
 
 
 def _web_account_key() -> str:
@@ -2026,11 +2067,11 @@ def _descriptor_capabilities(descriptor: Mapping[str, Any]) -> dict[str, Any]:
             capabilities["reasoning_effort"] = supported_levels(descriptor)
 
     max_mode = descriptor.get("max_mode")
-    if max_mode is False:
-        capabilities["max_mode"] = False
-    elif max_mode is True and descriptor_supports_max_mode(descriptor):
+    if descriptor_supports_max_mode(descriptor):
         capabilities["max_mode"] = True
         capabilities["max_context"] = descriptor_max_context(descriptor)
+    elif max_mode is False:
+        capabilities["max_mode"] = False
     return capabilities
 
 
@@ -2147,6 +2188,61 @@ async def _fetch_web_model_configs(
             # downstream request binding.
             current.setdefault("raw_chat_function", entry_function)
             current.setdefault("_trae_agent_type", group_function)
+            # A model can carry its __dev detail in the preferred Agent entry
+            # and its __max/context window in another function's entry.  The
+            # upstream client evaluates those entries together, so retain
+            # every non-conflicting live limit/detail instead of dropping the
+            # sibling evidence when the public config is deduplicated.
+            for field in (
+                "context_window_tokens",
+                "context_window_size",
+                "context_window_sizes",
+                "prompt_max_tokens",
+                "max_tokens",
+                "max_mode",
+            ):
+                incoming_value = config.get(field)
+                if incoming_value in (None, ""):
+                    continue
+                current_value = current.get(field)
+                if current_value in (None, ""):
+                    current[field] = copy.deepcopy(incoming_value)
+                elif isinstance(current_value, Mapping) and isinstance(
+                    incoming_value, Mapping
+                ):
+                    merged_value = dict(current_value)
+                    for key, value in incoming_value.items():
+                        if key not in merged_value or merged_value[key] in (None, ""):
+                            merged_value[key] = copy.deepcopy(value)
+                    current[field] = merged_value
+            detail_field = "_traecode_model_detail_list"
+            current_details = current.get(detail_field)
+            incoming_details = config.get(detail_field)
+            if not isinstance(current_details, list):
+                current_details = current.get("model_detail_list")
+            if not isinstance(incoming_details, list):
+                incoming_details = config.get("model_detail_list")
+            if isinstance(incoming_details, list):
+                existing_names = {
+                    str(item.get("model_name") or "").strip().casefold()
+                    for item in (current_details or [])
+                    if isinstance(item, Mapping)
+                }
+                merged_details = [
+                    copy.deepcopy(item)
+                    for item in (current_details or [])
+                    if isinstance(item, Mapping)
+                ]
+                for item in incoming_details:
+                    if not isinstance(item, Mapping):
+                        continue
+                    item_name = str(item.get("model_name") or "").strip().casefold()
+                    if item_name and item_name not in existing_names:
+                        merged_details.append(copy.deepcopy(dict(item)))
+                        existing_names.add(item_name)
+                if merged_details:
+                    current[detail_field] = merged_details
+                    current["model_detail_list"] = copy.deepcopy(merged_details)
             current_scopes = current.setdefault("_trae_capabilities_by_scope", {})
             incoming_scopes = config.get("_trae_capabilities_by_scope")
             if isinstance(current_scopes, dict) and isinstance(incoming_scopes, Mapping):
@@ -2239,7 +2335,7 @@ async def _fetch_solo_model_configs(
 
     token = token_override or auth.get_token()
     if not token:
-        return {}
+        return _ModelCatalog(fetch_succeeded=False)
     base = _model_gateway_base()
     url = f"{base}/api/ide/v1/get_detail_param"
     requested_function = (
@@ -2297,24 +2393,24 @@ async def _fetch_solo_model_configs(
                 logger.warning(
                     "trae-client: solo model list returned %s", resp.status_code
                 )
-                return {}
+                return _ModelCatalog(fetch_succeeded=False)
             data = resp.json()
     except Exception as exc:
         logger.warning("trae-client: solo model list failed: %s", exc)
-        return {}
+        return _ModelCatalog(fetch_succeeded=False)
 
     if not isinstance(data, Mapping):
-        return {}
+        return _ModelCatalog(fetch_succeeded=False)
     raw_list = data.get("config_info_list")
     if not isinstance(raw_list, list):
         nested = data.get("data")
         raw_list = (
             nested.get("config_info_list")
             if isinstance(nested, Mapping)
-            else []
+            else None
         )
     if not isinstance(raw_list, list):
-        return {}
+        return _ModelCatalog(fetch_succeeded=False)
 
     out: dict[str, dict] = {}
     for raw in raw_list:
@@ -2382,7 +2478,7 @@ async def _fetch_solo_model_configs(
         # can group the model without duplicating the upstream config.
         config["_trae_endpoints"] = ["solo", "ide"]
         out[config_name] = config
-    return out
+    return _ModelCatalog(out, fetch_succeeded=True)
 
 
 def _select_traecode_detail(
@@ -2415,16 +2511,26 @@ def _select_traecode_detail(
 
 
 def _traecode_model_match(
-    configs: Mapping[str, Mapping[str, Any]],
+    configs: Mapping[str, Any],
     model_name: str,
 ) -> Optional[dict[str, Any]]:
     """Find a config by exact name, display name, or known public alias."""
 
     requested = str(model_name or "").strip()
-    lowered = requested.casefold()
+    requested_values = [requested]
+    stripped_requested = re.sub(
+        r"^(?:solo_agent(?:_lite|_remote)?|solo_work_lite|"
+        r"solo_work_remote|solo_coder)_\d+__",
+        "",
+        requested,
+        flags=re.IGNORECASE,
+    )
+    requested_values.append(stripped_requested)
+    lowered = requested_values[0].casefold()
+    lowered_values = {value.casefold() for value in requested_values if value}
     for name, config in configs.items():
         if any(
-            value.casefold() == lowered
+            value.casefold() in lowered_values
             for value in _model_descriptor_values(name, config)
         ):
             return dict(config)
@@ -2470,13 +2576,15 @@ async def resolve_traecode_model_config(
     token = str(token_override or auth.get_token() or "").strip()
     if not token:
         return None
+    base_model_name, max_variant = split_max_model_name(model_name)
+    max_mode = bool(max_mode or max_variant)
     configs = await _cached_model_catalog(
         "solo", token,
         provider_specific=provider_specific,
         user_id_override=str(user_id_override or ""),
         raw_chat_function=raw_chat_function,
     )
-    config = _traecode_model_match(configs, model_name)
+    config = _traecode_model_match(configs, base_model_name)
     if not config:
         return None
     detail = _select_traecode_detail(config, max_mode=max_mode)
@@ -2490,8 +2598,24 @@ async def resolve_traecode_model_config(
     config_name = str(
         config.get("config_name")
         or config.get("name")
-        or model_name
+        or base_model_name
     ).strip()
+    config_name = re.sub(
+        r"^(?:solo_agent(?:_lite|_remote)?|solo_work_lite|"
+        r"solo_work_remote|solo_coder)_\d+__",
+        "",
+        config_name,
+        flags=re.IGNORECASE,
+    )
+    # Solo's ADE choice for K3.1 Pro is exposed as a distinct ``-auto`` config
+    # even though its provider id remains ``kimi-k3.1-pro__dev``.  The plain
+    # config belongs to the remote tier; collapsing this scope to the family
+    # name makes the native endpoint bind the wrong/default configuration.
+    if (
+        raw_chat_function in {"solo_agent", "solo_agent_lite"}
+        and config_name.casefold() == "kimi-k3.1-pro"
+    ):
+        config_name = "kimi-k3.1-pro-auto"
     if not selected_model or not config_name:
         return None
     result = dict(config)
@@ -2546,6 +2670,70 @@ def _model_descriptor_values(
             "displayModelName",
         ):
             add(candidate.get(field))
+        config_value = str(
+            candidate.get("config_name")
+            or candidate.get("configName")
+            or candidate.get("name")
+            or ""
+        ).strip()
+        qualified_prefix = re.match(
+            r"^(solo_agent(?:_lite|_remote)?|solo_work_lite|"
+            r"solo_work_remote|solo_coder)_\d+__",
+            config_value,
+            flags=re.IGNORECASE,
+        )
+        function = str(
+            candidate.get("raw_chat_function")
+            or candidate.get("_trae_raw_chat_function")
+            or (qualified_prefix.group(1) if qualified_prefix else "")
+            or ""
+        ).strip()
+        if function or qualified_prefix:
+            # Native ``model_list_by_function`` can label entries with the
+            # function scope while get_detail_param returns the short config.
+            # Accept ``solo_agent_1__kimi-k3`` as a lookup key without ever
+            # writing that UI-only composite into the wire request.
+            configs: list[str] = []
+            for field in (
+                "config_name",
+                "configName",
+                "name",
+                "model_name",
+                "modelName",
+                "raw_model_name",
+                "rawModelName",
+            ):
+                value = str(candidate.get(field) or "").strip()
+                if not value:
+                    continue
+                add(value)
+                configs.append(value)
+            if config_value:
+                stripped_config = re.sub(
+                    r"^(?:solo_agent(?:_lite|_remote)?|solo_work_lite|"
+                    r"solo_work_remote|solo_coder)_\d+__",
+                    "",
+                    config_value,
+                    flags=re.IGNORECASE,
+                )
+                add(stripped_config)
+                if stripped_config and function:
+                    add(f"{function}_1__{stripped_config}")
+                    add(f"{function}__{stripped_config}")
+            for value in configs:
+                # Preserve both the short selector and the indexed UI
+                # composite. K3 arrives as ``solo_agent_1__kimi-k3`` while
+                # get_detail_param may return only ``kimi-k3``.
+                stripped = re.sub(
+                    r"^(?:solo_agent(?:_lite|_remote)?|solo_work_lite|"
+                    r"solo_work_remote|solo_coder)_\d+__",
+                    "",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+                add(stripped)
+                if function:
+                    add(f"{function}_1__{stripped}")
     return tuple(values)
 
 
@@ -2632,6 +2820,7 @@ async def resolve_model_config(
 ) -> Optional[dict]:
     """Resolve a public/display model label to Trae's exact config object."""
 
+    base_model_name, _max_variant = split_max_model_name(model_name)
     kwargs: dict[str, Any] = {
         "token_override": token_override,
         "user_id_override": user_id_override,
@@ -2642,7 +2831,7 @@ async def resolve_model_config(
         kwargs["agent_type"] = agent_type
     if raw_chat_function:
         kwargs["raw_chat_function"] = raw_chat_function
-    return await _get_web_custom_model(model_name, **kwargs)
+    return await _get_web_custom_model(base_model_name, **kwargs)
 
 
 async def get_scoped_model_configs(
@@ -3065,29 +3254,56 @@ def build_llm_chat_body(
         or _requested_session_id(options)
         or str(uuid.uuid4())
     )
-    config_name = convert_model_name(model) or model or "glm-5.2"
+    descriptor = options.get("_traecode_model_descriptor")
+    descriptor = descriptor if isinstance(descriptor, Mapping) else {}
+    catalog_config = str(
+        descriptor.get("config_name")
+        or descriptor.get("name")
+        or ""
+    ).strip()
+    catalog_model = str(
+        descriptor.get("raw_model_name")
+        or descriptor.get("model_name")
+        or ""
+    ).strip()
+    config_name = catalog_config or convert_model_name(model) or model or "glm-5.2"
+    raw_chat_function = str(
+        options.get("_traecode_raw_chat_function")
+        or descriptor.get("raw_chat_function")
+        or "solo_work_lite"
+    ).strip() or "solo_work_lite"
     body = {
         "messages": converted,
         "config_name": config_name,
-        "model": config_name,
-        "function": "solo_work_lite",
+        "model": catalog_model or config_name,
+        "function": raw_chat_function,
         "stream": True,
         "request_id": session_id,
         "session_id": session_id,
     }
+    if catalog_model and catalog_model != config_name:
+        # The legacy adapter accepts the provider id beside the catalog
+        # config. Sending the public display name (``kimi-k3``) here is what
+        # current gateways reject as ``4023 model unknown``.
+        body["model_name"] = catalog_model
     max_tokens = clamp_max_completion_tokens(max_tokens, model)
     if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens > 0:
         body["max_tokens"] = int(max_tokens)
     tools = options["tools"] if "tools" in options else options.get("_inherited_tools")
     choice = _ide_native_tool_choice(options.get("tool_choice"))
     if isinstance(tools, list) and tools and str(choice or "").lower() != "none":
-        native_tools = raw_client._native_tool_definitions(tools)
+        # The llm_utils_chat adapter consumes the same FunctionDefinition DTO
+        # as raw-v2: parameters must be one serialized JSON schema string.
+        # Forwarding the OpenAI object shape is rejected before model dispatch.
+        native_tools = raw_client._traecode_tool_definitions(tools)
         if native_tools:
             body["tools"] = native_tools
             if choice is not None:
                 body["tool_choice"] = choice
-            if options.get("parallel_tool_calls") is not None:
-                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+            # ``llm_utils_chat`` does not expose the native parallel-tool
+            # switch. Sending it can make an otherwise valid tool request fail
+            # before model dispatch, while the translator already enforces the
+            # caller's serial policy locally.
     return _apply_legacy_reasoning_effort(body, options)
 
 
@@ -3182,7 +3398,14 @@ async def build_trae_ide_request(
     session_id = _requested_session_id(options) or generate_session_id_from_messages(
         messages
     )
-    trae_model = convert_model_name(model)
+    descriptor = (options or {}).get("_traecode_model_descriptor")
+    descriptor = descriptor if isinstance(descriptor, Mapping) else {}
+    trae_model = str(
+        descriptor.get("raw_model_name")
+        or descriptor.get("model_name")
+        or convert_model_name(model)
+        or model
+    ).strip()
 
     messages_len = len(converted)
     if messages_len == 0:
@@ -3395,7 +3618,19 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             candidate = options.get(key)
             if isinstance(candidate, Mapping):
                 return dict(candidate)
-        if not requested_level(options):
+        native_function = str(
+            options.get("_traecode_raw_chat_function")
+            or options.get("raw_chat_function")
+            or ""
+        ).strip()
+        if (
+            not requested_level(options)
+            and not native_function
+            and not _tool_protocol_requested(options, messages)
+        ):
+            # Preserve the historical lightweight adapter for plain legacy
+            # callers. Native tools and explicit TraeCode functions require a
+            # scoped catalog binding even without a reasoning request.
             return None
         lookup_kwargs: dict[str, Any] = {
             "token_override": bound_token,
@@ -3414,6 +3649,12 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                 or options.get("raw_chat_function")
                 or "solo_work_lite"
             ).strip() or "solo_work_lite"
+            if endpoint == "/api/ide/v1/chat" and raw_function == "solo_work_lite":
+                # ide-v1 is the native Agent route.  A model catalog entry
+                # resolved here must come from the same function scope used by
+                # the request, otherwise a valid K3 selector can bind the
+                # Work Lite default and surface as 4023 model unknown.
+                raw_function = "solo_agent"
             lookup_kwargs["raw_chat_function"] = raw_function
             return await resolve_traecode_model_config(model_name, **lookup_kwargs)
         except Exception as exc:
@@ -3432,6 +3673,18 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
     if requested_endpoint and requested_endpoint not in IDE_ENDPOINTS:
         raise ValueError(f"Unsupported IDE endpoint: {requested_endpoint}")
     endpoints = [requested_endpoint] if requested_endpoint else IDE_ENDPOINTS
+    if not requested_endpoint and _tool_protocol_requested(options, messages):
+        # ``llm_utils_chat`` is a legacy Work Lite adapter. It does not expose
+        # the native model function / provider binding required by tool calls,
+        # and replaying a tool turn there can produce a misleading 4023 for a
+        # model that is valid under the caller's native function scope. Start
+        # at native ide-v1 and keep the remaining endpoints as fallback.
+        endpoints = [
+            "/api/ide/v1/chat",
+            *[endpoint for endpoint in endpoints if endpoint != "/api/ide/v1/chat"],
+        ]
+    if options.get("_disable_upstream_fallback"):
+        endpoints = endpoints[:1]
     # Legacy IDE/Work requests must consume the same per-account model-request
     # capacity as Remote/Web sessions. Hold the slot from the first upstream
     # connection attempt until the response wrapper is closed.
@@ -3604,30 +3857,52 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                 # request needs its own id while relay conversation ownership
                 # and the replayed message/tool history remain unchanged.
                 endpoint_options["_legacy_usage_turn_id"] = str(uuid.uuid4())
-            if requested_level(options):
-                descriptor = await resolve_legacy_descriptor(endpoint)
-                if descriptor is not None:
-                    endpoint_options["_traecode_model_descriptor"] = descriptor
-                elif not any(
-                    isinstance(options.get(key), Mapping)
-                    for key in (
-                        "_traecode_model_descriptor",
-                        "traecode_model_descriptor",
-                        "model_descriptor",
-                        "custom_model",
-                        "customModel",
-                    )
-                ):
-                    # An unavailable catalog is not evidence of support.
-                    # Keep the request valid by removing effort fields from
-                    # this legacy attempt until a scoped descriptor exists.
-                    endpoint_options.pop("_traecode_model_descriptor", None)
+            descriptor = endpoint_options.get("_traecode_model_descriptor")
+            if isinstance(descriptor, Mapping):
+                resolved_function = str(
+                    descriptor.get("raw_chat_function")
+                    or endpoint_options.get("_traecode_raw_chat_function")
+                    or ""
+                ).strip()
+                if resolved_function:
+                    endpoint_options["_traecode_raw_chat_function"] = resolved_function
+            # Always bind the exact account catalog entry. The old adapter
+            # sent a public label when callers did not request reasoning, which
+            # the current gateway rejects with ``4023 model unknown`` even
+            # though the model is enabled for that account. Catalog lookup is
+            # cached and scoped by account, function, and gateway.
+            descriptor = await resolve_legacy_descriptor(endpoint)
+            if descriptor is not None:
+                endpoint_options["_traecode_model_descriptor"] = descriptor
+                resolved_function = str(
+                    descriptor.get("raw_chat_function")
+                    or endpoint_options.get("_traecode_raw_chat_function")
+                    or ""
+                ).strip()
+                if resolved_function:
+                    endpoint_options["_traecode_raw_chat_function"] = resolved_function
+            elif requested_level(options) and not any(
+                isinstance(options.get(key), Mapping)
+                for key in (
+                    "_traecode_model_descriptor",
+                    "traecode_model_descriptor",
+                    "model_descriptor",
+                    "custom_model",
+                    "customModel",
+                )
+            ):
+                # An unavailable catalog is not evidence of support.
+                # Keep the request valid by removing effort fields from this
+                # legacy attempt until a scoped descriptor exists.
+                endpoint_options.pop("_traecode_model_descriptor", None)
             client = httpx.Client(
                 headers=endpoint_headers,
                 timeout=timeout,
                 http2=False,
             )
             returned_response = False
+            response_received = False
+            stop_endpoint_fallback = False
             try:
                 if endpoint == "/api/ide/v1/chat":
                     _, trae_req = await build_trae_ide_request(
@@ -3665,10 +3940,57 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
                     model_name,
                     _tool_protocol_requested(options, messages),
                 )
-                request = client.build_request(
-                    "POST", request_base + endpoint, json=trae_req
-                )
-                resp = await send_stream(client, request)
+                for send_attempt in range(2):
+                    trace_state = {
+                        "request_started": False,
+                        "connection_failed": False,
+                    }
+
+                    def trace_send(event: str, _info: dict[str, Any]) -> None:
+                        if ".send_request_" in event or ".receive_response_" in event:
+                            trace_state["request_started"] = True
+                        if event in {
+                            "connection.connect_tcp.failed",
+                            "connection.connect_unix_socket.failed",
+                            "connection.start_tls.failed",
+                        }:
+                            trace_state["connection_failed"] = True
+
+                    request = client.build_request(
+                        "POST",
+                        request_base + endpoint,
+                        json=trae_req,
+                        extensions={"trace": trace_send},
+                    )
+                    try:
+                        resp = await send_stream(client, request)
+                    except Exception as exc:
+                        # A missing response does not prove the POST was not
+                        # processed. Read/protocol failures need positive
+                        # connection-phase evidence before replay is safe.
+                        before_send = not trace_state["request_started"]
+                        connection_failure = isinstance(exc, httpx.ConnectError) or (
+                            isinstance(exc, (httpx.ReadError, httpx.RemoteProtocolError))
+                            and trace_state["connection_failed"]
+                        )
+                        if (
+                            send_attempt == 0
+                            and endpoint == "/api/agent/v3/llm_utils_chat"
+                            and not options.get("_disable_upstream_fallback")
+                            and before_send
+                            and connection_failure
+                        ):
+                            logger.warning(
+                                "trae-client: %s connection failed before request "
+                                "headers; retrying once: %s",
+                                endpoint,
+                                exc,
+                            )
+                            continue
+                        stop_endpoint_fallback = True
+                        raise
+                    response_received = True
+                    break
                 if resp.status_code == 200:
                     returned_response = True
                     slot_handed_off = True
@@ -3696,6 +4018,8 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             except Exception as e:
                 logger.warning("trae-client: %s error: %s", endpoint, e)
                 errors.append(f"{endpoint}: {e}")
+                if stop_endpoint_fallback or response_received:
+                    break
             finally:
                 if not returned_response and not cancel_cleanup_pending:
                     try:
@@ -3770,6 +4094,146 @@ def _endpoint_groups(endpoints: list[str]) -> list[str]:
     return groups or ["fallback"]
 
 
+def _descriptor_bool(descriptor: Mapping[str, Any], *keys: str) -> Optional[bool]:
+    """Read a boolean capability without treating an absent field as false."""
+
+    for key in keys:
+        if key not in descriptor:
+            continue
+        value = descriptor.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        text = str(value or "").strip().casefold()
+        if text in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return None
+
+
+def _public_model_metadata(
+    descriptor: Any,
+    *,
+    max_variant: bool = False,
+) -> dict[str, Any]:
+    """Convert live Trae fields to additive OpenAI model metadata.
+
+    The relay historically returned only endpoint information.  Keep that
+    contract intact while exposing the evidence the account's live catalog
+    actually supplied.  Unknown limits/capabilities are omitted rather than
+    guessed from a model name.
+    """
+
+    if not isinstance(descriptor, Mapping):
+        return {}
+    metadata: dict[str, Any] = {}
+    display_name = str(
+        descriptor.get("display_name")
+        or descriptor.get("display_model_name")
+        or descriptor.get("name")
+        or descriptor.get("config_name")
+        or ""
+    ).strip()
+    if display_name:
+        metadata["name"] = display_name + (" (Max)" if max_variant else "")
+
+    profile = (
+        descriptor_max_profile(descriptor)
+        if max_variant
+        else {}
+    )
+    if max_variant and not profile:
+        return {}
+    context = (
+        profile.get("context")
+        if max_variant
+        else descriptor_context_window(descriptor, "dev")
+    )
+    if context is None and not max_variant:
+        # A few older web descriptors expose only ``context_window_size.max``
+        # while also explicitly marking Max mode.  It is still live evidence,
+        # so use it as the base limit when no dev/default value exists.
+        context = descriptor_max_context(descriptor)
+    output = (
+        profile.get("output")
+        if max_variant
+        else descriptor_output_tokens(descriptor, "dev")
+    )
+    limit: dict[str, int] = {}
+    if isinstance(context, int) and context > 0:
+        limit["context"] = context
+    if isinstance(output, int) and output > 0:
+        limit["output"] = output
+    if not max_variant:
+        prompt = descriptor.get("prompt_max_tokens")
+        try:
+            prompt_int = int(prompt)
+        except (TypeError, ValueError):
+            prompt_int = 0
+        if prompt_int > 0:
+            limit["input"] = prompt_int
+    if limit:
+        metadata["limit"] = limit
+
+    capabilities: dict[str, Any] = {}
+    multimodal = descriptor_multimodal(descriptor)
+    if multimodal is not None:
+        capabilities["attachment"] = multimodal
+        capabilities["input"] = {
+            "text": True,
+            "image": multimodal,
+            "audio": False,
+            "video": False,
+            "pdf": multimodal,
+        }
+    reasoning = descriptor_reasoning_config(descriptor)
+    if reasoning is not None:
+        support_thinking = reasoning.get("support_thinking")
+        if isinstance(support_thinking, bool):
+            capabilities["reasoning"] = support_thinking
+        if support_thinking is True:
+            levels = supported_levels(descriptor)
+            if levels:
+                capabilities["reasoning_effort"] = levels
+    toolcall = _descriptor_bool(
+        descriptor,
+        "toolcall",
+        "tool_call",
+        "support_tool_call",
+        "support_toolcall",
+        "native_function_call",
+    )
+    if toolcall is None:
+        details = descriptor.get("_traecode_model_detail_list")
+        if not isinstance(details, list):
+            details = descriptor.get("model_detail_list")
+        if isinstance(details, list) and details:
+            # Trae's chat-completion catalog uses the same caller-tool
+            # envelope for its live provider details.  Keep this additive
+            # capability aligned with the upstream plugin's true default.
+            toolcall = True
+    if toolcall is not None:
+        capabilities["tools"] = toolcall
+    temperature = _descriptor_bool(
+        descriptor,
+        "temperature",
+        "support_temperature",
+    )
+    if temperature is not None:
+        capabilities["temperature"] = temperature
+    if capabilities:
+        metadata["capabilities"] = capabilities
+    if profile:
+        metadata["max_context"] = int(profile["context"])
+        metadata["max_output"] = int(profile["output"])
+        if profile.get("prompt"):
+            metadata["max_prompt"] = int(profile["prompt"])
+        metadata["variant"] = "max"
+    return metadata
+
+
 def _model_item(
     model_id: str,
     created: int,
@@ -3778,6 +4242,8 @@ def _model_item(
     endpoints: Optional[list[str]] = None,
     alias_for: str = "",
     capabilities_by_scope: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    variant_of: str = "",
 ) -> dict:
     """Build an OpenAI model object with relay discovery metadata.
 
@@ -3809,6 +4275,15 @@ def _model_item(
     }
     if alias_for:
         item["alias_for"] = alias_for
+    if variant_of:
+        item["variant_of"] = variant_of
+    if isinstance(metadata, Mapping):
+        for key in ("name", "limit", "capabilities", "max_context", "max_output", "max_prompt", "variant"):
+            value = metadata.get(key)
+            if isinstance(value, Mapping):
+                item[key] = dict(value)
+            elif value not in (None, ""):
+                item[key] = value
     if isinstance(capabilities_by_scope, Mapping) and capabilities_by_scope:
         item["capabilities_by_scope"] = {
             str(scope): dict(capabilities)
@@ -3857,6 +4332,28 @@ def _catalog_endpoints(config: Mapping[str, Any]) -> list[str]:
     return result
 
 
+def _max_variant_endpoints(
+    config: Mapping[str, Any], endpoints: list[str]
+) -> list[str]:
+    """Return the endpoint(s) that can actually serve the Agent Max profile."""
+
+    normalized = {
+        str(value or "").strip().lower()
+        for value in endpoints
+        if str(value or "").strip()
+    }
+    agent_type = str(config.get("_trae_agent_type") or "").strip().lower()
+    if "remote" in normalized:
+        return ["remote"]
+    if agent_type in {"solo_agent_remote", "solo_agent_lite"}:
+        return ["remote"]
+    # Native Solo descriptors may carry a __max detail for IDE internals, but
+    # their raw-v2 envelope has no verified 1M user-message context field.
+    # Keep those descriptors available as ordinary models; expose -max only
+    # when the account also advertises the Agent Remote executor.
+    return []
+
+
 def _merge_model_item(
     target: dict[str, dict],
     model_id: str,
@@ -3865,6 +4362,8 @@ def _merge_model_item(
     endpoints: list[str],
     alias_for: str = "",
     capabilities_by_scope: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    variant_of: str = "",
 ) -> None:
     """Insert/merge one exact or alias id while retaining endpoint metadata."""
 
@@ -3879,6 +4378,8 @@ def _merge_model_item(
             endpoints=endpoints,
             alias_for=alias_for,
             capabilities_by_scope=capabilities_by_scope,
+            metadata=metadata,
+            variant_of=variant_of,
         )
         return
     merged = list(current.get("endpoints") or [])
@@ -3893,6 +4394,28 @@ def _merge_model_item(
     current["endpoint_groups"] = groups
     if alias_for and not current.get("alias_for"):
         current["alias_for"] = alias_for
+    if variant_of and not current.get("variant_of"):
+        current["variant_of"] = variant_of
+    if isinstance(metadata, Mapping):
+        for key in (
+            "name",
+            "max_context",
+            "max_output",
+            "max_prompt",
+            "variant",
+        ):
+            value = metadata.get(key)
+            if value not in (None, "") and key not in current:
+                current[key] = value
+        for key in ("limit", "capabilities"):
+            value = metadata.get(key)
+            if not isinstance(value, Mapping):
+                continue
+            existing_value = current.setdefault(key, {})
+            if isinstance(existing_value, dict):
+                for name, item in value.items():
+                    if name not in existing_value:
+                        existing_value[name] = copy.deepcopy(item)
     if isinstance(capabilities_by_scope, Mapping) and capabilities_by_scope:
         existing = current.setdefault("capabilities_by_scope", {})
         if isinstance(existing, dict):
@@ -3967,12 +4490,14 @@ async def get_models(force: bool = False) -> list[dict]:
             capabilities_by_scope = config.get("_trae_capabilities_by_scope")
             if not isinstance(capabilities_by_scope, Mapping):
                 capabilities_by_scope = None
+            metadata = _public_model_metadata(config)
             _merge_model_item(
                 items_by_id,
                 exact,
                 created,
                 endpoints=endpoints,
                 capabilities_by_scope=capabilities_by_scope,
+                metadata=metadata,
             )
             lowered = exact.lower()
             if lowered != exact:
@@ -3984,7 +4509,35 @@ async def get_models(force: bool = False) -> list[dict]:
                     endpoints=endpoints,
                     alias_for=exact,
                     capabilities_by_scope=capabilities_by_scope,
+                    metadata=metadata,
                 )
+            max_profile = descriptor_max_profile(config)
+            max_endpoints = _max_variant_endpoints(config, endpoints)
+            if max_profile and max_endpoints and not exact.lower().endswith("-max"):
+                max_metadata = _public_model_metadata(config, max_variant=True)
+                max_exact = exact + "-max"
+                _merge_model_item(
+                    items_by_id,
+                    max_exact,
+                    created,
+                    endpoints=max_endpoints,
+                    capabilities_by_scope=capabilities_by_scope,
+                    metadata=max_metadata,
+                    variant_of=exact,
+                )
+                if lowered != exact:
+                    max_lowered = lowered + "-max"
+                    _UPSTREAM_MODEL_CASE[max_lowered] = max_exact
+                    _merge_model_item(
+                        items_by_id,
+                        max_lowered,
+                        created,
+                        endpoints=max_endpoints,
+                        alias_for=max_exact,
+                        capabilities_by_scope=capabilities_by_scope,
+                        metadata=max_metadata,
+                        variant_of=exact,
+                    )
     if not items_by_id:
         # Not cached, so the next request retries the upstream list.
         logger.warning("trae-client: upstream model list empty, using built-in list")

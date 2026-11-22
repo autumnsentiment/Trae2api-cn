@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 from src.model_limits import (
     clamp_max_completion_tokens,
+    descriptor_denies_pay_identity,
+    descriptor_max_profile,
     descriptor_supports_max_mode,
 )
 
@@ -61,6 +63,81 @@ class ModelDescriptorLimitTests(unittest.TestCase):
                 {**descriptor, "prompt_max_tokens": 936000}
             )
         )
+
+    def test_max_mode_can_derive_prompt_budget_from_live_detail(self):
+        descriptor = {
+            "context_window_tokens": {"dev": 200000, "max": 1048576},
+            "model_detail_list": [
+                {"model_name": "glm-5.2__dev", "max_tokens": 32000},
+                {"model_name": "glm-5.2__max", "max_tokens": 64000},
+            ],
+        }
+        profile = descriptor_max_profile(descriptor)
+        self.assertTrue(descriptor_supports_max_mode(descriptor))
+        self.assertEqual(profile["model_name"], "glm-5.2__max")
+        self.assertEqual(profile["context"], 1048576)
+        self.assertEqual(profile["output"], 64000)
+        self.assertEqual(profile["prompt"], 984576)
+        self.assertEqual(profile["base_context"], 200000)
+
+    def test_access_identity_requires_explicit_integer_list(self):
+        descriptor = {
+            "features": {
+                "access": {
+                    "data": {
+                        "identity_list": [5, 1, 2, 3, 100],
+                    }
+                }
+            }
+        }
+        self.assertTrue(descriptor_denies_pay_identity(descriptor, 0))
+        self.assertFalse(descriptor_denies_pay_identity(descriptor, 1))
+        self.assertFalse(descriptor_denies_pay_identity(descriptor, None))
+        self.assertFalse(descriptor_denies_pay_identity({}, 0))
+        self.assertFalse(
+            descriptor_denies_pay_identity(
+                {"features": {"access": {"data": {"identity_list": []}}}},
+                0,
+            )
+        )
+
+    def test_access_identity_accepts_serialized_catalog_list(self):
+        descriptor = {
+            "features": {
+                "access": {
+                    "data": {
+                        "identity_list": "[5,1,2,3,100]",
+                    }
+                }
+            }
+        }
+        self.assertTrue(descriptor_denies_pay_identity(descriptor, 0))
+        self.assertTrue(descriptor_denies_pay_identity(descriptor, "Free"))
+
+    def test_invalid_access_identity_values_do_not_deny_an_account(self):
+        for value in (True, None, 1.5, float("inf"), float("nan"), {}, "1.5"):
+            with self.subTest(value=value):
+                descriptor = {"identity_list": [5, value]}
+                self.assertFalse(descriptor_denies_pay_identity(descriptor, 0))
+
+    def test_access_identity_reads_flat_and_feature_nested_catalogs(self):
+        cases = (
+            {"identity_list": [5, 1, 2, 3, 100]},
+            {"features": {"identity_list": [5, 1, 2, 3, 100]}},
+            {
+                "feature": {
+                    "access": {
+                        "data": {
+                            "identityList": [5, 1, 2, 3, 100],
+                        }
+                    }
+                }
+            },
+        )
+        for descriptor in cases:
+            with self.subTest(descriptor=descriptor):
+                self.assertTrue(descriptor_denies_pay_identity(descriptor, 0))
+                self.assertFalse(descriptor_denies_pay_identity(descriptor, 5))
 
 
 if __name__ == "__main__":

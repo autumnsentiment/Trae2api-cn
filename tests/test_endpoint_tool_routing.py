@@ -12,6 +12,7 @@ from src.sse import (
     EmptyUpstreamResponse,
     InvalidNativeToolArguments,
     RepeatedCompletedToolResponse,
+    UpstreamEventError,
 )
 
 
@@ -88,6 +89,44 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(called_options["_traecode_native_tools"])
                 remote.assert_not_awaited()
 
+    async def test_kimi_k3_tools_select_their_native_solo_agent_scope(self):
+        """IDE remains chat_v3 for other models but not for Kimi K3."""
+
+        for mode, model, expected in (
+            ("ide", "kimi-k3", "solo_agent"),
+            ("ide", "solo_agent_1__kimi-k3", "solo_agent"),
+            ("ide", "kimi-k3.1-pro", "solo_agent"),
+            ("ide", "kimi-k2.6", "solo_agent"),
+            ("ide", "kimi-k2.7-code", "solo_agent"),
+            ("ide", "qwen-3.7-plus", "solo_agent"),
+            ("ide", "sagitta", "solo_agent"),
+            ("ide", "seed-code-pro-0430", "solo_agent"),
+            ("ide", "glm-5.3", "chat_v3"),
+            ("solo", "glm-5.3", "solo_agent"),
+        ):
+            with self.subTest(mode=mode, model=model):
+                selected = AsyncMock(return_value={"route": mode})
+                options = _request_options()
+                options["_upstream_mode"] = mode
+                with (
+                    patch.object(main_module, "UPSTREAM_MODE", mode),
+                    patch.object(
+                        main_module, "_remote_only_models", return_value=set()
+                    ),
+                    patch.object(main_module, "run_ide_chat", selected),
+                ):
+                    await main_module._dispatch_chat(
+                        [{"role": "user", "content": "Read README.md"}],
+                        model,
+                        False,
+                        options,
+                    )
+
+                selected_options = selected.await_args.args[3]
+                self.assertEqual(
+                    selected_options["_traecode_raw_chat_function"], expected
+                )
+
     async def test_ide_and_solo_dispatch_preserve_native_tool_round_trip(self):
         messages = [
             {"role": "user", "content": "Read README.md"},
@@ -120,7 +159,11 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
                 self.assertEqual(body["tool_choice"], "auto")
-                self.assertFalse(body["parallel_tool_calls"])
+                self.assertNotIn("parallel_tool_calls", body)
+                self.assertNotIn("raw_chat_function", body)
+                self.assertIsInstance(
+                    body["tools"][0]["function"]["parameters"], str
+                )
                 self.assertEqual(body["messages"][1]["tool_calls"][0]["id"], "call-readme")
                 self.assertEqual(body["messages"][2]["tool_call_id"], "call-readme")
                 self.assertEqual(body["messages"][2]["role"], "tool")
@@ -979,6 +1022,37 @@ class NativeEndpointRetryTests(unittest.IsolatedAsyncioTestCase):
         selected.assert_awaited_once()
         next_account.assert_not_called()
 
+    async def test_kimi_catalog_miss_is_not_retried_on_another_account(self):
+        selected = AsyncMock(
+            side_effect=main_module.raw_client.TraeCodeModelUnavailable(
+                "kimi-k3", "solo_agent"
+            )
+        )
+        with (
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(
+                main_module.auth,
+                "get_polling_status",
+                return_value={"enabled": True},
+            ),
+            patch.object(main_module, "_polling_retry_limit", return_value=3),
+            patch.object(
+                main_module, "_next_retry_account_snapshot"
+            ) as next_account,
+        ):
+            with self.assertRaises(
+                main_module.raw_client.TraeCodeModelUnavailable
+            ):
+                await main_module._run_ide_with_retry(
+                    [{"role": "user", "content": "Read README.md"}],
+                    "kimi-k3",
+                    False,
+                    {"_account_id": "account-a", "_auth_token": "token-a"},
+                )
+
+        selected.assert_awaited_once()
+        next_account.assert_not_called()
+
 
 class IdeRawLegacyFallbackTests(unittest.IsolatedAsyncioTestCase):
     class _ReplayResponse:
@@ -1040,7 +1114,9 @@ class IdeRawLegacyFallbackTests(unittest.IsolatedAsyncioTestCase):
         raw.assert_awaited_once()
         legacy_send.assert_awaited_once()
         legacy_options = legacy_send.await_args.kwargs["options"]
-        self.assertNotIn("_traecode_raw_chat_function", legacy_options)
+        self.assertEqual(
+            legacy_options["_traecode_raw_chat_function"], "chat_v3"
+        )
         self.assertEqual(
             legacy_options["_ide_endpoint"], "/api/agent/v3/llm_utils_chat"
         )
@@ -1090,6 +1166,98 @@ class IdeRawLegacyFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("data: [DONE]", joined)
         raw.assert_awaited_once()
         legacy_send.assert_awaited_once()
+
+    async def test_stream_raw_1005_before_output_reopens_legacy_with_scope_and_tools(
+        self,
+    ):
+        raw = AsyncMock(
+            return_value=self._wrapper(
+                self._ReplayResponse(
+                    [
+                        "event: error",
+                        'data: {"code":1005,"message":"model access denied"}',
+                        "",
+                    ]
+                )
+            )
+        )
+        legacy = self._wrapper(
+            self._ReplayResponse(
+                [
+                    "event: output",
+                    'data: {"response":"pong"}',
+                    "",
+                    "event: done",
+                    'data: {"finish_reason":"stop"}',
+                    "",
+                ]
+            )
+        )
+        legacy_send = AsyncMock(return_value=legacy)
+        trace = {}
+
+        with (
+            patch.object(main_module.raw_client, "send_traecode_chat_request", raw),
+            patch.object(main_module.trae_client, "send_chat_request", legacy_send),
+        ):
+            response = await main_module.run_ide_chat(
+                [{"role": "user", "content": "Reply pong"}],
+                "glm-5.3",
+                True,
+                {
+                    **self._options(),
+                    "_upstream_trace": trace,
+                },
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        joined = "".join(chunks)
+        self.assertIn('"content": "pong"', joined)
+        self.assertIn("data: [DONE]", joined)
+        raw.assert_awaited_once()
+        legacy_send.assert_awaited_once()
+        legacy_options = legacy_send.await_args.kwargs["options"]
+        self.assertEqual(
+            legacy_options["_traecode_raw_chat_function"], "chat_v3"
+        )
+        self.assertEqual(legacy_options["tools"], TOOLS)
+        self.assertEqual(legacy_options["tool_choice"], "auto")
+        self.assertTrue(trace["fallback_used"])
+        self.assertEqual(trace["fallback_target"], "legacy-ide")
+
+    async def test_stream_raw_4001_with_usage_is_not_replayed(self):
+        native_wrapper = self._wrapper(
+            self._ReplayResponse(
+                [
+                    "event: token_usage",
+                    'data: {"input_token":3,"output_token":5}',
+                    "",
+                    "event: error",
+                    'data: {"code":4001,"message":"param invalid"}',
+                    "",
+                ]
+            )
+        )
+        raw = AsyncMock(return_value=native_wrapper)
+        legacy_send = AsyncMock()
+
+        with (
+            patch.object(main_module.raw_client, "send_traecode_chat_request", raw),
+            patch.object(main_module.trae_client, "send_chat_request", legacy_send),
+        ):
+            response = await main_module.run_ide_chat(
+                [{"role": "user", "content": "Read a.txt"}],
+                "glm-5.3",
+                True,
+                self._options(),
+            )
+            with self.assertRaises(UpstreamEventError):
+                async for _ in response.body_iterator:
+                    pass
+
+        raw.assert_awaited_once()
+        legacy_send.assert_not_awaited()
+        native_wrapper.close.assert_called_once()
 
     async def test_invalid_native_tool_json_does_not_replay_through_legacy(self):
         for stream in (False, True):
@@ -1198,6 +1366,372 @@ class IdeRawLegacyFallbackTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(error.exception, native_error)
                     raw.assert_awaited_once()
                     legacy_send.assert_not_awaited()
+
+    async def test_native_model_unknown_never_replays_through_legacy(self):
+        for stream in (False, True):
+            for error in (
+                RuntimeError(
+                    "Trae upstream error 4023: We're sorry, the model is unknown."
+                ),
+                UpstreamEventError(
+                    "We're sorry, the model is unknown.",
+                    code=4023,
+                ),
+            ):
+                with self.subTest(stream=stream, error=type(error).__name__):
+                    raw = AsyncMock(side_effect=error)
+                    legacy_send = AsyncMock()
+                    trace = {}
+                    with (
+                        patch.object(
+                            main_module.raw_client,
+                            "send_traecode_chat_request",
+                            raw,
+                        ),
+                        patch.object(
+                            main_module.trae_client,
+                            "send_chat_request",
+                            legacy_send,
+                        ),
+                    ):
+                        with self.assertRaises(type(error)) as caught:
+                            await main_module.run_ide_chat(
+                                [{"role": "user", "content": "Read a.txt"}],
+                                "kimi-k3",
+                                stream,
+                                {
+                                    **self._options(),
+                                    "_upstream_trace": trace,
+                                },
+                            )
+                    self.assertIs(caught.exception, error)
+                    self.assertIn("4023", str(caught.exception))
+                    raw.assert_awaited_once()
+                    legacy_send.assert_not_awaited()
+                    self.assertNotIn("fallback_used", trace)
+
+    async def test_native_model_unknown_stream_frame_never_replays(self):
+        native_wrapper = self._wrapper(
+            self._ReplayResponse(
+                [
+                    "event: error",
+                    'data: {"code":4023,"message":"We\'re sorry, the model is unknown."}',
+                    "",
+                ]
+            )
+        )
+        legacy_send = AsyncMock()
+        raw = AsyncMock(return_value=native_wrapper)
+        with (
+            patch.object(
+                main_module.raw_client, "send_traecode_chat_request", raw
+            ),
+            patch.object(
+                main_module.trae_client, "send_chat_request", legacy_send
+            ),
+        ):
+            response = await main_module.run_ide_chat(
+                [{"role": "user", "content": "Read a.txt"}],
+                "kimi-k3",
+                True,
+                self._options(),
+            )
+            with self.assertRaises(UpstreamEventError) as caught:
+                async for _ in response.body_iterator:
+                    pass
+
+        self.assertEqual(str(caught.exception.code), "4023")
+        raw.assert_awaited_once()
+        legacy_send.assert_not_awaited()
+        native_wrapper.close.assert_called_once()
+
+    async def test_dispatcher_maps_4023_without_other_executor_retry(self):
+        error = RuntimeError(
+            "Trae upstream error 4023: We're sorry, the model is unknown."
+        )
+        ide = AsyncMock(side_effect=error)
+        remote = AsyncMock()
+        trace = {}
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(
+                main_module, "_remote_only_models", return_value=set()
+            ),
+            patch.object(main_module, "run_ide_chat", ide),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            response = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "kimi-k3",
+                False,
+                {**_request_options(), "_upstream_trace": trace},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        payload = json.loads(response.body)
+        self.assertEqual(
+            payload["error"]["type"], "upstream_model_unknown"
+        )
+        self.assertEqual(payload["error"]["param"], "model")
+        self.assertIn("4023", payload["error"]["message"])
+        ide.assert_awaited_once()
+        remote.assert_not_awaited()
+
+    async def test_kimi_catalog_miss_returns_scope_error_without_retry(self):
+        error = main_module.raw_client.TraeCodeModelUnavailable(
+            "kimi-k3", "solo_agent"
+        )
+        ide = AsyncMock(side_effect=error)
+        remote = AsyncMock()
+        trace = {}
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(
+                main_module, "_remote_only_models", return_value=set()
+            ),
+            patch.object(main_module, "run_ide_chat", ide),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            response = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "kimi-k3",
+                False,
+                {**_request_options(), "_upstream_trace": trace},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        payload = json.loads(response.body)
+        self.assertEqual(
+            payload["error"]["type"], "model_not_available_in_scope"
+        )
+        self.assertEqual(payload["error"]["param"], "model")
+        self.assertIn("kimi-k3", payload["error"]["message"])
+        self.assertIn("solo_agent", payload["error"]["message"])
+        ide.assert_awaited_once()
+        remote.assert_not_awaited()
+
+    async def test_kimi_k3_overrides_stale_traework_chat_v3_hint(self):
+        """A stale picker function must not move K3 out of solo_agent."""
+
+        response = SimpleNamespace(status_code=200, body=b"{}")
+        ide = AsyncMock(return_value=response)
+        options = {
+            **_request_options(),
+            "_upstream_mode": "ide",
+            "_disable_upstream_fallback": True,
+            "_traework_custom_model": True,
+            "_traecode_raw_chat_function": "chat_v3",
+            "tools": TOOLS,
+            "tool_choice": "auto",
+        }
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "run_ide_chat", new=ide),
+        ):
+            result = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "kimi-k3",
+                False,
+                options,
+            )
+
+        self.assertIs(result, response)
+        selected_options = ide.await_args.args[3]
+        self.assertEqual(
+            selected_options["_traecode_raw_chat_function"], "solo_agent"
+        )
+
+    async def test_traework_raw_v2_ingress_preserves_tools_for_every_client_model(self):
+        """The raw-v2 early branch must not fall back to the text serializer."""
+
+        response = SimpleNamespace(status_code=200, body=b"{}")
+        models = (
+            "glm-5.3",
+            "solo_agent_1__DeepSeek-V4-Pro-Official",
+            "solo_agent_1__kimi-k3.1-pro",
+            "solo_agent_1__kimi-k3",
+        )
+        history = [
+            {"role": "user", "content": "Read README.md"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-readme",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"README.md"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-readme",
+                "name": "read_file",
+                "content": "relay",
+            },
+        ]
+
+        for model in models:
+            with self.subTest(model=model):
+                ide = AsyncMock(return_value=response)
+                options = {
+                    **_request_options(),
+                    "_upstream_mode": "ide",
+                    "_disable_upstream_fallback": True,
+                    "_traework_custom_model": True,
+                    "_traecode_raw_chat_function": "chat_v3",
+                    "_tool_protocol_requested": True,
+                }
+                with (
+                    patch.object(main_module, "UPSTREAM_MODE", "ide"),
+                    patch.object(main_module, "_remote_only_models", return_value=set()),
+                    patch.object(main_module, "run_ide_chat", new=ide),
+                ):
+                    result = await main_module._dispatch_chat(
+                        history,
+                        model,
+                        False,
+                        options,
+                    )
+
+                self.assertIs(result, response)
+                selected_options = ide.await_args.args[3]
+                self.assertTrue(selected_options["_traecode_native_tools"])
+                body = main_module.raw_client.build_traecode_chat_body(
+                    history, model, options=selected_options
+                )
+                self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
+                self.assertEqual(body["tool_choice"], "auto")
+                self.assertNotIn("parallel_tool_calls", body)
+                self.assertNotIn("raw_chat_function", body)
+                self.assertEqual(
+                    json.loads(
+                        body["tools"][0]["function"]["parameters"]
+                    )["required"],
+                    ["path"],
+                )
+                self.assertEqual(body["messages"][1]["tool_calls"][0]["id"], "call-readme")
+                self.assertEqual(body["messages"][2]["role"], "tool")
+                self.assertEqual(body["messages"][2]["tool_call_id"], "call-readme")
+                if "kimi-k3" in model.casefold():
+                    self.assertEqual(
+                        selected_options["_traecode_raw_chat_function"], "solo_agent"
+                    )
+
+    async def test_traework_remote_scoped_kimi_keeps_remote_function(self):
+        response = SimpleNamespace(status_code=200, body=b"{}")
+        ide = AsyncMock(return_value=response)
+        options = {
+            **_request_options(),
+            "_upstream_mode": "ide",
+            "_disable_upstream_fallback": True,
+            "_traework_custom_model": True,
+            "_traecode_raw_chat_function": "chat_v3",
+            "_tool_protocol_requested": True,
+        }
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "run_ide_chat", new=ide),
+        ):
+            await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "solo_agent_remote_1__kimi-k3",
+                False,
+                options,
+            )
+
+        selected_options = ide.await_args.args[3]
+        self.assertEqual(
+            selected_options["_traecode_raw_chat_function"], "solo_agent_remote"
+        )
+        self.assertTrue(selected_options["_traecode_native_tools"])
+
+    async def test_public_ide_tools_use_raw_v2_before_legacy(self):
+        """Caller tools must retain the native Raw-v2 DTO on personal accounts."""
+
+        response = self._wrapper(
+            self._ReplayResponse(
+                [
+                    "event: output",
+                    'data: {"response":"pong"}',
+                    "",
+                    "event: done",
+                    'data: {"finish_reason":"stop"}',
+                    "",
+                ]
+            )
+        )
+        legacy = AsyncMock()
+        raw = AsyncMock(return_value=response)
+        options = {
+            **_request_options(),
+            "_upstream_mode": "ide",
+            "_disable_upstream_fallback": True,
+            "_traecode_raw_chat_function": "chat_v3",
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module.trae_client, "send_chat_request", new=legacy),
+            patch.object(main_module.raw_client, "send_traecode_chat_request", new=raw),
+        ):
+            result = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "glm-5.3",
+                False,
+                options,
+            )
+
+        self.assertEqual(result.status_code, 200)
+        raw.assert_awaited_once()
+        legacy.assert_not_awaited()
+        selected = raw.await_args.kwargs["options"]
+        self.assertTrue(selected["_traecode_native_tools"])
+        self.assertNotIn("_prefer_legacy_tools", selected)
+        body = main_module.raw_client.build_traecode_chat_body(
+            [{"role": "user", "content": "Read README.md"}],
+            "glm-5.3",
+            False,
+            options=selected,
+        )
+        self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
+        self.assertIsInstance(body["tools"][0]["function"]["parameters"], str)
+        self.assertEqual(
+            json.loads(body["tools"][0]["function"]["parameters"])["required"],
+            ["path"],
+        )
+
+    async def test_explicit_enterprise_raw_tools_keep_raw_first(self):
+        selected = AsyncMock(return_value={"route": "raw"})
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "raw"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "run_raw_chat", new=selected),
+        ):
+            result = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Read README.md"}],
+                "glm-5.3",
+                False,
+                {
+                    **_request_options(),
+                    "_upstream_mode": "raw",
+                    "_enterprise_mode": True,
+                    "_traecode_raw_chat_function": "chat_v3",
+                },
+            )
+
+        self.assertEqual(result, {"route": "raw"})
+        selected.assert_awaited_once()
+        self.assertNotIn("_prefer_legacy_tools", selected.await_args.args[3])
 
 
 if __name__ == "__main__":

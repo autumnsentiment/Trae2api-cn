@@ -23,8 +23,10 @@ import httpx
 
 from . import auth, trae_client
 from .model_limits import (
+    descriptor_denies_pay_identity,
     descriptor_context_limits,
     descriptor_max_context,
+    descriptor_max_profile,
     descriptor_supports_max_mode,
 )
 from .sse import (
@@ -134,6 +136,8 @@ class RemoteStreamIncomplete(EmptyUpstreamResponse):
 class RemoteFirstEventError(EmptyUpstreamResponse):
     """The remote session failed before the selected model produced output."""
 
+    ENTITLEMENT_CODES = {"1005"}
+
     def __init__(
         self,
         message: str,
@@ -145,6 +149,8 @@ class RemoteFirstEventError(EmptyUpstreamResponse):
         self.code = code
         mapped_usage = _map_usage(usage)
         self.upstream_message = str(message or "remote session setup failed")
+        code_text = str(code or "").strip()
+        self.model_not_entitled = code_text in self.ENTITLEMENT_CODES
         super().__init__(
             self.upstream_message,
             retryable=mapped_usage is None,
@@ -152,6 +158,35 @@ class RemoteFirstEventError(EmptyUpstreamResponse):
             observed_model_event=mapped_usage is not None,
             account_quota_exhausted=account_quota_exhausted,
         )
+
+
+class RemoteModelNotEntitled(RuntimeError):
+    """The model exists in the catalog but the bound account cannot use it."""
+
+    code = "model_not_entitled"
+
+
+def attach_model_entitlement(error: RemoteFirstEventError) -> RuntimeError:
+    """Return an entitlement error while preserving retry/usage metadata."""
+
+    if not bool(getattr(error, "model_not_entitled", False)):
+        return error
+    wrapped = RemoteModelNotEntitled(
+        "Trae remote model_not_entitled: the selected model is restricted "
+        "for the bound account"
+    )
+    wrapped.__cause__ = error
+    # Model access is an account entitlement decision.  Preserve the
+    # no-billing metadata for diagnostics, but main.py treats this error as
+    # terminal so it cannot replay Work or rotate through unrelated accounts.
+    wrapped.retryable = bool(getattr(error, "retryable", True))
+    wrapped.observed_model_event = bool(
+        getattr(error, "observed_model_event", False)
+    )
+    wrapped.usage = getattr(error, "usage", None)
+    wrapped.account_quota_exhausted = False
+    wrapped.upstream_code = getattr(error, "code", None)
+    return wrapped
 
 
 def base_url(options: Optional[Mapping[str, Any]] = None) -> str:
@@ -419,7 +454,8 @@ def _work_billing_overlay(
 
 
 def resolve_mode(model: str) -> tuple[str, str, str]:
-    value = (model or "").strip()
+    value, _max_variant = trae_client.split_max_model_name(model)
+    value = value.strip()
     lowered = value.lower()
     if lowered in {"work", "auto-work", "solo-work"}:
         return "work", "auto", ""
@@ -754,6 +790,80 @@ def _bound_model_name(
     return selected
 
 
+def _bound_pay_identity(
+    options: Optional[Mapping[str, Any]],
+    custom_model: Mapping[str, Any],
+) -> Any:
+    """Read the account identity used by the client's access gate."""
+
+    options = options or {}
+    # A dispatcher-bound account is authoritative.  ``provider_specific`` can
+    # contain mutable/global account metadata, so reading it first can compare
+    # a model against another account's identity during concurrent rotation.
+    bound_account = str(
+        options.get("_auth_user_id")
+        or options.get("_billing_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if bound_account:
+        canonical_account = (
+            auth.resolve_model_account_id(bound_account) or bound_account
+        )
+        record = auth.get_account_record(canonical_account)
+        for value in (
+            record.get("user_pay_identity"),
+            record.get("pay_identity"),
+            record.get("user_identity"),
+            record.get("userIdentity"),
+        ):
+            if value is not None and value != "":
+                return value
+        record_provider = record.get("provider_specific")
+        if isinstance(record_provider, Mapping):
+            for value in (
+                record_provider.get("userPayIdentity"),
+                record_provider.get("payIdentity"),
+                record_provider.get("userIdentity"),
+                record_provider.get("user_identity"),
+            ):
+                if value is not None and value != "":
+                    return value
+    for value in (
+        options.get("_auth_pay_identity"),
+        options.get("_pay_identity"),
+    ):
+        if value is not None and value != "":
+            return value
+    provider = _provider_specific(options)
+    for value in (
+        provider.get("userPayIdentity"),
+        provider.get("payIdentity"),
+        provider.get("userIdentity"),
+        provider.get("user_identity"),
+        custom_model.get("_account_pay_identity"),
+    ):
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _enforce_descriptor_access(
+    model_name: str,
+    custom_model: Mapping[str, Any],
+    options: Optional[Mapping[str, Any]],
+) -> None:
+    """Fail before session creation when the live descriptor denies access."""
+
+    identity = _bound_pay_identity(options, custom_model)
+    if descriptor_denies_pay_identity(custom_model, identity):
+        raise RemoteModelNotEntitled(
+            "Trae model_not_entitled: "
+            f"{model_name} is present in the catalog but is not available "
+            f"for this account's pay identity ({identity})"
+        )
+
+
 def _max_mode_requested(
     model_name: str,
     custom_model: Optional[Mapping[str, Any]],
@@ -764,12 +874,13 @@ def _max_mode_requested(
     options = options or {}
     if remote_agent_type(model_name, options) != "solo_agent_remote":
         return False
+    base_model, variant_requested = trae_client.split_max_model_name(model_name)
     raw_flag = options.get("trae_max_mode") or options.get("max_mode")
     if isinstance(raw_flag, str):
         enabled = raw_flag.strip().lower() in ("1", "true", "yes", "on")
     else:
         enabled = bool(raw_flag)
-    enabled = enabled or _env_flag("TRAE_REMOTE_MAX_MODE")
+    enabled = variant_requested or enabled or _env_flag("TRAE_REMOTE_MAX_MODE")
     if not enabled:
         return False
     configured = {
@@ -778,8 +889,11 @@ def _max_mode_requested(
         if item.strip()
     }
     if configured and "*" not in configured:
-        value = str(model_name or "").strip().lower()
-        if value not in configured:
+        values = {
+            str(model_name or "").strip().lower(),
+            str(base_model or "").strip().lower(),
+        }
+        if not values.intersection(configured):
             return False
     # Never fabricate max limits for a model the account config does not mark.
     return descriptor_supports_max_mode(custom_model)
@@ -788,7 +902,16 @@ def _max_mode_requested(
 def _max_mode_custom_model(custom_model: Mapping[str, Any]) -> dict[str, Any]:
     """Copy the account/function descriptor without inventing limits."""
 
-    return dict(custom_model)
+    result = dict(custom_model)
+    profile = descriptor_max_profile(custom_model)
+    selected_model = str(profile.get("model_name") or "").strip()
+    if selected_model:
+        # The Max request must name the provider's real __max detail.  Keep
+        # config_name/display_name unchanged so entitlement and billing stay
+        # bound to the public model selected by the caller.
+        result["model_name"] = selected_model
+        result["raw_model_name"] = selected_model
+    return result
 
 
 def _max_mode_fields(
@@ -809,6 +932,9 @@ def _max_mode_fields(
     max_context = descriptor_max_context(custom_model)
     if max_context is not None:
         fields["context_window_size"] = max_context
+    profile = descriptor_max_profile(custom_model)
+    if profile.get("context"):
+        max_context = int(profile["context"])
     for key in ("prompt_max_tokens", "max_tokens"):
         try:
             value = int(limits.get(key))
@@ -816,6 +942,10 @@ def _max_mode_fields(
             continue
         if value > 0:
             fields[key] = value
+    if "prompt_max_tokens" not in fields and profile.get("prompt"):
+        fields["prompt_max_tokens"] = int(profile["prompt"])
+    if "max_tokens" not in fields and profile.get("output"):
+        fields["max_tokens"] = int(profile["output"])
     mode_value = (options or {}).get("mode_type")
     if mode_value in (None, ""):
         mode_value = os.environ.get("TRAE_REMOTE_MAX_MODE_TYPE", "")
@@ -882,8 +1012,9 @@ async def create_session(
             raise RuntimeError(
                 f"Trae remote model is not available for the bound account: {model_name}"
             )
+        _enforce_descriptor_access(model_name, custom_model, options)
         bound_model_name = _bound_model_name(model_name, custom_model)
-    max_requested = _max_mode_requested(model_name, custom_model, options)
+    max_requested = _max_mode_requested(model, custom_model, options)
     effective_strategy = "max" if max_requested else strategy
     session_options = dict(options or {})
     if max_requested:
@@ -1209,12 +1340,13 @@ async def stream_events(
                 quota_exhausted = _is_account_quota_error(payload) or (
                     "parallel" in message.lower()
                 )
-                raise RemoteFirstEventError(
+                error = RemoteFirstEventError(
                     f"Trae remote upstream error{suffix}: {message}",
                     code=code,
                     usage=dict(raw_usage) if isinstance(raw_usage, Mapping) else None,
                     account_quota_exhausted=quota_exhausted,
                 )
+                raise attach_model_entitlement(error)
             yield current
             observed_model_event = normalized in model_events
 

@@ -597,6 +597,26 @@ _KIMI_TOOL_PARAMETER_RE = re.compile(
     r"<parameter(?:\s+[^>]*)?>\s*(?P<body>[\s\S]*?)\s*</parameter>",
     flags=re.IGNORECASE,
 )
+_KIMI_NATIVE_TOOL_BLOCK_RE = re.compile(
+    r"<\|tool_call_begin\|>\s*(?P<identity>[\s\S]*?)\s*"
+    r"<\|tool_call_argument_begin\|>\s*(?P<arguments>[\s\S]*?)\s*"
+    r"<\|tool_call_end\|>",
+    flags=re.IGNORECASE,
+)
+_KIMI_NATIVE_TOOL_SECTION_RE = re.compile(
+    r"<\|tool_calls_section_begin\|>[\s\S]*?"
+    r"<\|tool_calls_section_end\|>",
+    flags=re.IGNORECASE,
+)
+_KIMI_NATIVE_TOOL_MARKER_RE = re.compile(
+    r"<\|(?:tool_calls_section_begin|tool_calls_section_end|"
+    r"tool_call_begin|tool_call_argument_begin|tool_call_end)\|>",
+    flags=re.IGNORECASE,
+)
+_KIMI_NATIVE_TOOL_INCOMPLETE_START_RE = re.compile(
+    r"<\|(?:tool_calls_section_begin|tool_call_begin)\|>",
+    flags=re.IGNORECASE,
+)
 
 # Some context-compaction paths escape the internal tool protocol one or more
 # times before replaying it as assistant text. A projection that ignores those
@@ -1916,6 +1936,46 @@ def _inside_unclosed_text_tool_block(text: str, index: int) -> bool:
     return False
 
 
+def _parse_kimi_native_tool_call(
+    match: re.Match[str], index: int
+) -> Optional[dict]:
+    """Parse Kimi's native special-token tool-call envelope.
+
+    K3 can emit ``functions.name:0`` followed by a JSON argument object even
+    when the request uses the text tool protocol. The colon suffix is the
+    upstream call ordinal, not a stable client-facing tool id.
+    """
+
+    identity = match.group("identity").strip()
+    if identity.casefold().startswith("functions."):
+        identity = identity[len("functions.") :].strip()
+    identity = re.sub(r":\d+\s*$", "", identity).strip()
+    if not identity:
+        return None
+
+    raw_arguments = match.group("arguments").strip()
+    if not raw_arguments:
+        arguments = "{}"
+    else:
+        try:
+            json.loads(raw_arguments)
+            arguments = raw_arguments
+        except (TypeError, ValueError):
+            candidates = _tool_json_candidates(raw_arguments)
+            if not candidates:
+                return None
+            arguments = json.dumps(
+                candidates[0],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=_json_default,
+            )
+    return normalize_tool_call(
+        {"name": identity, "arguments": arguments},
+        index=index,
+    )
+
+
 def extract_text_tool_calls(content: Any) -> list[dict]:
     """Extract tool calls encoded in Trae's text/XML fallback formats."""
     text = _strip_internal_wait_residue(_content_to_text(content))
@@ -1985,6 +2045,14 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         if call:
             calls.append(call)
             occupied.append((match.start(), match.end()))
+    for match in _KIMI_NATIVE_TOOL_BLOCK_RE.finditer(text):
+        call = _parse_kimi_native_tool_call(match, len(calls))
+        # Even an invalid native block is protocol residue. Reserve its full
+        # span so its argument JSON cannot be mistaken for a fresh call by the
+        # generic mixed-text fallback below.
+        occupied.append((match.start(), match.end()))
+        if call:
+            calls.append(call)
 
     for match in _SELF_CLOSING_TOOL_BLOCK_RE.finditer(text):
         attr_name, attr_fields = _tool_attribute_values(match.group("attrs") or "")
@@ -2201,6 +2269,12 @@ def strip_tool_call_blocks(content: Any) -> str:
     if not text:
         return ""
     text = _strip_internal_wait_residue(text)
+    text = _KIMI_NATIVE_TOOL_SECTION_RE.sub("", text)
+    text = _KIMI_NATIVE_TOOL_BLOCK_RE.sub("", text)
+    incomplete_native = _KIMI_NATIVE_TOOL_INCOMPLETE_START_RE.search(text)
+    if incomplete_native is not None:
+        text = text[: incomplete_native.start()]
+    text = _KIMI_NATIVE_TOOL_MARKER_RE.sub("", text)
     text = _TEXT_TOOL_BLOCK_RE.sub("", text)
     text = _NAMED_TOOL_BLOCK_RE.sub("", text)
     text = _SELF_CLOSING_TOOL_BLOCK_RE.sub("", text)

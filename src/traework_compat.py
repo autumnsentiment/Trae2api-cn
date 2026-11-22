@@ -430,7 +430,47 @@ def remote_events_path(session_id: str, message_id: str) -> str:
 # TraeWork custom-model ingress
 # ---------------------------------------------------------------------------
 
-_NESTED_BODY_KEYS = ("data", "params", "request", "payload", "body", "input")
+_NESTED_BODY_KEYS = (
+    "data",
+    "params",
+    "request",
+    "Request",
+    "payload",
+    "body",
+    "input",
+)
+
+
+def _wrapper_layer(value: Any) -> Optional[Mapping[str, Any]]:
+    """Return a request wrapper even when it also carries message metadata.
+
+    The 3.4.x client sends ``messages`` as either an array or an object with a
+    ``messages`` child. In the latter shape the object is both a message
+    wrapper and an option container (it also carries ``tools`` and
+    ``tool_choice``). ``_body_layers`` used to skip that object while
+    normalizing messages, leaving the request with a valid prompt but an empty
+    tool catalog. Include it as a bounded request layer without treating a
+    bare message item as a top-level body.
+    """
+
+    value = _jsonish(value)
+    if not isinstance(value, Mapping):
+        return None
+    nested_messages = value.get("messages")
+    if isinstance(nested_messages, (Mapping, list)):
+        return value
+    if any(
+        key in value
+        for key in (
+            "tools",
+            "tool_choice",
+            "toolChoice",
+            "parallel_tool_calls",
+            "parallelToolCalls",
+        )
+    ):
+        return value
+    return None
 _MESSAGE_KEYS = (
     "messages",
     "chat_messages",
@@ -493,6 +533,9 @@ def _body_layers(body: Mapping[str, Any]) -> list[Mapping[str, Any]]:
             nested = _jsonish(current.get(key))
             if isinstance(nested, Mapping):
                 pending.append(nested)
+        wrapper = _wrapper_layer(current.get("messages"))
+        if wrapper is not None:
+            pending.append(wrapper)
     return layers
 
 
@@ -514,6 +557,19 @@ def _specific_layer_value(layers: Iterable[Mapping[str, Any]], *keys: str) -> An
             value = layer.get(key)
             if value not in (None, "", [], {}):
                 return value
+    return None
+
+
+def _specific_option_value(
+    layers: Iterable[Mapping[str, Any]], *keys: str
+) -> Any:
+    """Return the most specific declared option, including false/empty values."""
+
+    materialized = list(layers)
+    for layer in reversed(materialized):
+        for key in keys:
+            if key in layer:
+                return _jsonish(layer[key])
     return None
 
 
@@ -771,6 +827,8 @@ def normalize_inbound_request(
         "toolChoice",
         "parallel_tool_calls",
         "parallelToolCalls",
+        "disable_fallback",
+        "disableFallback",
         "thinking",
         "include_reasoning",
         "reasoning_effort",
@@ -866,12 +924,21 @@ def normalize_inbound_request(
         "traeCodeRawChatFunction",
     )
     # Inner payload values win, but copy every layer so wrappers from different
-    # Trae versions remain usable.  ``layers`` is outer-to-inner; walking it in
-    # reverse and using ``setdefault`` keeps the most specific value.
+    # Trae versions remain usable. Explicit empty/false values are meaningful.
     for layer in reversed(layers):
         for key in option_keys:
-            if key in layer and layer[key] is not None and key not in options:
-                options[key] = _jsonish(layer[key])
+            if key in layer and key not in options:
+                value = _jsonish(layer[key])
+                if value is not None:
+                    options[key] = value
+    # If a nested message wrapper only carries the prompt, retain a sibling or
+    # outer tool catalogue. An explicitly empty nested value already won above.
+    for key in option_keys:
+        if key in options:
+            continue
+        value = _first_layer_value(layers, key)
+        if value is not None:
+            options[key] = _jsonish(value)
     request_config_name = _specific_layer_value(
         layers,
         "config_name",
@@ -922,6 +989,11 @@ def normalize_inbound_request(
         options["tool_choice"] = options["toolChoice"]
     if options.get("parallelToolCalls") is not None and options.get("parallel_tool_calls") is None:
         options["parallel_tool_calls"] = options["parallelToolCalls"]
+    if (
+        options.get("disableFallback") is not None
+        and options.get("disable_fallback") is None
+    ):
+        options["disable_fallback"] = options["disableFallback"]
     # The 3.4.4 client advertises the shared raw-v2 function in the body or
     # IDE function header. Mark only those explicit requests for the native
     # Code/Work raw chain; ordinary custom-model requests retain Remote as the
